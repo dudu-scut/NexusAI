@@ -16,6 +16,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 // Forward declarations for MCP RAG types (embedding routing)
@@ -33,6 +34,7 @@ class LLMClient;
 namespace agent_rpc {
 namespace common {
 class RedisClient;
+class LoadBalancerManager;  // P8: optional load-balancing tier
 }
 namespace orchestrator {
 
@@ -323,8 +325,32 @@ public:
      */
     void setRedisClient(agent_rpc::common::RedisClient* redis) { redis_ = redis; }
 
-private:
+    /**
+     * @brief Enable (or disable) the embedding routing tier.
+     *
+     * Public since P7: the service bootstrap reads NEXUSAI_EMBEDDING_ROUTER
+     * and wires the tier here. Builds compiled without AGENT_RPC_ENABLE_MCP
+     * keep the stub implementation (always reports disabled).
+     */
     bool enableEmbedding(const EmbeddingRouterConfig& config);
+
+    /**
+     * @brief P10: high-confidence embedding skill hit with its similarity.
+     *
+     * Returns the best-matching skill plus its similarity when the
+     * embedding tier is enabled and the match reaches the configured
+     * high threshold; nullopt otherwise (tier disabled, no hit, or below
+     * threshold). Shares the embedding cache with
+     * analyzeRequiredSkillEmbedding(), so a later routing pass does not
+     * pay a second embed call for the same question.
+     */
+    struct HighConfidenceSkill {
+        std::string skill;
+        double confidence = 0.0;
+    };
+    std::optional<HighConfidenceSkill> resolveHighConfidenceSkill(const std::string& question);
+
+private:
 
     /**
      * @brief High-confidence embedding-only skill matching.
@@ -386,6 +412,23 @@ private:
     AgentInfo selectWeightedByQualityWithFallback(const std::vector<AgentInfo>& candidates);
 
     /**
+     * @brief P8: lazily read NEXUSAI_ROUTER_LB_STRATEGY and construct the
+     * optional LoadBalancerManager (once per router instance).
+     *
+     * Unset variable or an invalid value leaves lb_manager_ null, and the
+     * legacy quality-weighted path stays in effect byte-for-byte.
+     */
+    void ensureLbInitialized();
+
+    /**
+     * @brief P8: decide among candidates through the load balancer tier.
+     *
+     * Returns nullopt when the tier is unavailable or fails, in which case
+     * the caller falls back to the legacy quality-weighted logic.
+     */
+    std::optional<AgentInfo> selectViaLoadBalancer(const std::vector<AgentInfo>& candidates);
+
+    /**
      * @brief Rebuild the skill keyword index from current agents
      * 
      * Extracts keywords from healthy agents' skill names and descriptions.
@@ -411,6 +454,16 @@ private:
      * Called from rebuildSkillKeywordIndex() when embedding is enabled.
      */
     void buildSkillEmbeddingIndex();
+
+    /**
+     * @brief P10: cache-first embed + best-skill search.
+     *
+     * Must be called while holding embedding_mutex_. Shared by
+     * analyzeRequiredSkillEmbedding() and resolveHighConfidenceSkill() so
+     * both tiers reuse the same embedding cache.
+     */
+    std::optional<std::pair<std::string, double>>
+    searchBestSkillEmbeddingLocked(const std::string& question);
 
     mutable std::mutex agents_mutex_;
     std::unordered_map<std::string, AgentInfo> agents_;
@@ -453,6 +506,23 @@ private:
     // agents_mutex_.
     mutable std::mutex quality_provider_mutex_;
     QualityProvider quality_provider_;
+
+    // P8: optional load-balancing tier (NEXUSAI_ROUTER_LB_STRATEGY, default
+    // off). Lazily constructed on first use by ensureLbInitialized(); when
+    // the switch is unset/invalid these stay null/empty and routing keeps
+    // the legacy behavior unchanged.
+    std::string lb_strategy_name_;
+    std::unique_ptr<common::LoadBalancerManager> lb_manager_;
+    std::once_flag lb_init_flag_;
+    // P8: fingerprint of the last endpoint set pushed into the load
+    // balancer. selectViaLoadBalancer() only calls updateEndpoints() when
+    // the candidate set actually changed — repeated calls on an unchanged
+    // set must NOT reset strategy state (round-robin cursor, weighted
+    // accumulators), otherwise round_robin would always pick the first
+    // candidate and weighted_round_robin would always pick the highest
+    // weight.
+    std::mutex lb_fingerprint_mutex_;
+    std::string lb_endpoint_fingerprint_;
 };
 
 } // namespace orchestrator

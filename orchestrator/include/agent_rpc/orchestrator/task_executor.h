@@ -11,6 +11,7 @@
 
 #include "agent_rpc/orchestrator/task_planner.h"
 #include "agent_rpc/orchestrator/agent_router.h"
+#include "agent_rpc/common/trace_context.h"
 #include <a2a/llm_client.hpp>
 #include <chrono>
 #include <functional>
@@ -30,6 +31,10 @@ struct SubTaskResult {
     bool success = false;
     int64_t duration_ms = 0;
     std::string error_message;
+    // Spans captured in the subtask worker thread (P5: merged back into the
+    // parent TraceContext after all futures of a layer are collected).
+    // Empty for timed-out/abandoned tasks and when trace propagation is off.
+    std::vector<agent_rpc::common::Span> child_spans;
 };
 
 // ── Configuration ──────────────────────────────────────────────────────────

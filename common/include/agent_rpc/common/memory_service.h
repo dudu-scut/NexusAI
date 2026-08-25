@@ -65,6 +65,17 @@ public:
     /** Gets the cross-agent switch summary */
     std::string getCrossAgentSummary(const std::string& context_id) const;
 
+    /** Sets the cross-agent summary specialized for the taking-over agent.
+     *  Stored under nexusai:summary:<ctx>:<agent> with a TTL (SETEX). */
+    void setCrossAgentSummaryFor(const std::string& context_id,
+                                  const std::string& agent_id,
+                                  const std::string& summary,
+                                  int ttl_seconds = kCrossAgentSummaryTtlSeconds);
+
+    /** Gets the agent-specialized cross-agent summary ("" when absent) */
+    std::string getCrossAgentSummaryFor(const std::string& context_id,
+                                         const std::string& agent_id) const;
+
     /** Builds the full SystemContext for injection into AIQueryRequest */
     agent_communication::SystemContext buildSystemContext(
         const std::string& user_id,
@@ -102,11 +113,16 @@ private:
     static std::string summaryKey(const std::string& ctx) {
         return "nexusai:summary:" + sanitizeKeyComponent(ctx);
     }
+    static std::string summaryKeyFor(const std::string& ctx, const std::string& agent) {
+        return "nexusai:summary:" + sanitizeKeyComponent(ctx) + ":" + sanitizeKeyComponent(agent);
+    }
     static std::string profileKey(const std::string& uid) {
         return "user_profile:" + sanitizeKeyComponent(uid);
     }
 
     static constexpr int kMaxHistoryPerAgent = 50;
+    // Agent-specialized cross-agent summaries expire after 7 days.
+    static constexpr int kCrossAgentSummaryTtlSeconds = 7 * 24 * 3600;
 
     std::shared_ptr<RedisClient> redis_;  // shared ownership prevents use-after-free
 

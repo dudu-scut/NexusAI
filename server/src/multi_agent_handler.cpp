@@ -36,6 +36,18 @@ namespace {
 struct StreamResultSlot {
     std::string answer;
     std::string error;
+    // Acting agent of the streamed run: the single-agent path records the
+    // executed agent, the multi-agent path records the last executed
+    // subtask's agent. The service layer uses it for the agent-switch
+    // memory pipeline (last_agent + cross-agent summary) on the streaming
+    // path, which otherwise has no agent identity surface.
+    std::string agent_id;
+    std::string agent_name;
+    // True once any non-terminal event reached writer->Write(). Guards the
+    // P10 fast-path fallback: retrying is only safe when nothing was
+    // delivered to the client (a status event may have been sent before the
+    // agent reported an error).
+    bool any_written = false;
 };
 
 thread_local StreamResultSlot tls_stream_result;
@@ -52,6 +64,18 @@ std::string takeMultiAgentStreamError() {
     std::string error = std::move(tls_stream_result.error);
     tls_stream_result.error.clear();
     return error;
+}
+
+std::string takeMultiAgentStreamedAgentId() {
+    std::string agent_id = std::move(tls_stream_result.agent_id);
+    tls_stream_result.agent_id.clear();
+    return agent_id;
+}
+
+std::string takeMultiAgentStreamedAgentName() {
+    std::string agent_name = std::move(tls_stream_result.agent_name);
+    tls_stream_result.agent_name.clear();
+    return agent_name;
 }
 
 MultiAgentHandler::MultiAgentHandler(
@@ -77,6 +101,137 @@ void MultiAgentHandler::setCallbacks(StatusUpdateFn status_fn, MetricsRecordFn m
 void MultiAgentHandler::setInvocationRepository(
     common::AgentRuntimeRepository* repository) {
     invocation_repository_ = repository;
+}
+
+// ── P10: single-intent fast path ───────────────────────────────────────────
+
+bool MultiAgentHandler::hasMultiIntentSignals(const std::string& text) {
+    // Strict-by-design veto: any parallel/sequence signal sends the query
+    // back to full planning. Missing a signal (wrong fast-path shortcut) is
+    // worse than an extra planning call, so the detector errs wide.
+    static const char* const kSignals[] = {
+        // Chinese sequence/parallel connectors
+        "然后", "并且", "接着", "以及", "其次", "另外", "此外",
+        "同时", "还要", "还需", "一方面", "第一步", "第二步",
+        // English sequence/parallel connectors
+        "and then", "after that", "as well as", "in addition",
+        "furthermore", "moreover", "firstly", "secondly",
+    };
+
+    // ASCII-lowercased copy for case-insensitive English matching.
+    std::string lower;
+    lower.reserve(text.size());
+    for (const unsigned char c : text) {
+        lower.push_back(static_cast<char>(c >= 'A' && c <= 'Z' ? c + 32 : c));
+    }
+    for (const char* signal : kSignals) {
+        if (lower.find(signal) != std::string::npos) {
+            return true;
+        }
+    }
+
+    // Paired connectors: 先…再 and first…then.
+    if (text.find("先") != std::string::npos &&
+        text.find("再") != std::string::npos) {
+        return true;
+    }
+    if (lower.find("first") != std::string::npos &&
+        lower.find("then") != std::string::npos) {
+        return true;
+    }
+
+    // Numbered list markers ("1." / "2)" / "1、" ...) appearing at least
+    // twice strongly indicate parallel subtasks. The boundary is "previous
+    // byte is not ASCII alphanumeric" rather than whitespace-only: Chinese
+    // punctuation is multi-byte UTF-8, so "1.写代码，2.写文档" would
+    // otherwise miss the second marker (previous byte is a CJK byte) and
+    // take the fast path. The relaxed check can only add vetoes, which
+    // matches the strict-by-design goal.
+    int numbered = 0;
+    for (size_t i = 0; i < text.size(); ++i) {
+        // Short-circuit keeps text[i - 1] untouched when i == 0. char may be
+        // signed, but any negative byte (CJK UTF-8 continuation) fails all
+        // three ASCII-alphanumeric comparisons, which is exactly the intent.
+        const bool at_boundary = (i == 0) ||
+            !((text[i - 1] >= '0' && text[i - 1] <= '9') ||
+              (text[i - 1] >= 'A' && text[i - 1] <= 'Z') ||
+              (text[i - 1] >= 'a' && text[i - 1] <= 'z'));
+        if (!at_boundary || text[i] < '0' || text[i] > '9') {
+            continue;
+        }
+        size_t j = i;
+        while (j < text.size() && text[j] >= '0' && text[j] <= '9') {
+            ++j;
+        }
+        if (j >= text.size()) {
+            continue;
+        }
+        const bool marker = text[j] == '.' || text[j] == ')' ||
+                            text.compare(j, 3, "\xE3\x80\x81") == 0 ||  // 、
+                            text.compare(j, 3, "\xEF\xBC\x89") == 0;    // ）
+        if (marker && ++numbered >= 2) {
+            return true;
+        }
+    }
+
+    // Clause separators commonly join parallel intents; veto them too.
+    if (text.find(';') != std::string::npos ||
+        text.find("；") != std::string::npos) {
+        return true;
+    }
+
+    return false;
+}
+
+void MultiAgentHandler::setFastPathSkillResolver(FastPathSkillFn fn) {
+    fast_path_skill_resolver_ = std::move(fn);
+}
+
+bool MultiAgentHandler::tryBuildFastPathPlan(const std::string& question,
+                                             orchestrator::ExecutionPlan& plan) {
+    // P10: default off; only an explicit opt-in enables the fast path.
+    if (common::envOrDefault("NEXUSAI_SINGLE_INTENT_FAST_PATH", "0") != "1") {
+        return false;
+    }
+
+    std::optional<orchestrator::AgentRouter::HighConfidenceSkill> hit;
+    if (fast_path_skill_resolver_) {
+        hit = fast_path_skill_resolver_(question);
+    } else if (agent_router_) {
+        hit = agent_router_->resolveHighConfidenceSkill(question);
+    }
+    if (!hit || hit->skill.empty()) {
+        return false;  // low confidence or tier unavailable → full planning
+    }
+    if (hasMultiIntentSignals(question)) {
+        return false;  // conservative veto → full planning
+    }
+
+    // Only the plan is constructed here; no stream event is emitted.
+    plan.original_query = question;
+    plan.is_single_agent = true;
+    plan.single_agent_skill = hit->skill;
+    LOG_INFO("P10 single-intent fast path: skill=" + hit->skill +
+             " confidence=" + std::to_string(hit->confidence) +
+             ", planning LLM skipped");
+    return true;
+}
+
+bool MultiAgentHandler::executeSingleAgentSync(
+    const orchestrator::ExecutionPlan& plan,
+    const agent_communication::AIQueryRequest& request,
+    agent_communication::AIQueryResponse* response) {
+    std::string agent_url;
+    if (!plan.single_agent_id.empty()) {
+        auto agent = agent_router_->getAgent(plan.single_agent_id);
+        if (agent.has_value() && agent->is_healthy) {
+            agent_url = agent->url;
+        }
+    }
+    if (!agent_url.empty()) {
+        return a2a_adapter_->processQueryDirect(request, response, agent_url);
+    }
+    return a2a_adapter_->processQuery(request, response);
 }
 
 // agent_invocations producer for the orchestrator path. The owner is read
@@ -186,36 +341,28 @@ grpc::Status MultiAgentHandler::handleQuery(
     auto start_time = std::chrono::steady_clock::now();
     std::string question = request->question();
 
-    // Step 1: Plan — decide single vs multi-agent
+    // Step 1: Plan — decide single vs multi-agent. The P10 fast path may
+    // skip the planning LLM entirely for high-confidence single intents.
     orchestrator::ExecutionPlan plan;
-    try {
-        plan = task_planner_->plan(question, agent_router_->getAllSkillDescriptions());
-    } catch (const std::exception& e) {
-        LOG_ERROR("Planning failed for sync query: " + request_id + " - " + e.what());
-        plan.is_single_agent = true;
+    bool fast_path_active = tryBuildFastPathPlan(question, plan);
+    if (!fast_path_active) {
+        try {
+            plan = task_planner_->plan(question, agent_router_->getAllSkillDescriptions());
+        } catch (const std::exception& e) {
+            LOG_ERROR("Planning failed for sync query: " + request_id + " - " + e.what());
+            plan.is_single_agent = true;
+        }
     }
 
     // Pre-resolve agents for all subtasks
     task_planner_->resolveAgents(plan, *agent_router_);
 
-    // Single-agent fast path
+    // Single-agent fast path. Metrics/invocation facts are recorded ONLY at
+    // the final terminal state: a failed fast-path attempt is an internal
+    // probe that gets retried below, and recording it would double-count
+    // the request (two entries for one query).
     if (plan.is_single_agent) {
-        bool success = false;
-
-        std::string agent_url;
-        if (!plan.single_agent_id.empty()) {
-            auto agent = agent_router_->getAgent(plan.single_agent_id);
-            if (agent.has_value() && agent->is_healthy) {
-                agent_url = agent->url;
-            }
-        }
-
-        if (!agent_url.empty()) {
-            success = a2a_adapter_->processQueryDirect(*request, response, agent_url);
-        } else {
-            success = a2a_adapter_->processQuery(*request, response);
-        }
-
+        bool success = executeSingleAgentSync(plan, *request, response);
         if (success) {
             update_status_(request_id, "completed",
                           plan.single_agent_id, plan.single_agent_name, "");
@@ -224,13 +371,49 @@ grpc::Status MultiAgentHandler::handleQuery(
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
             end_time - start_time);
         response->set_processing_time_ms(duration.count());
-        record_metrics_("Query", duration.count(), success);
-        recordInvocationFact(request_id, plan.single_agent_id,
-                             plan.single_agent_skill,
-                             success ? "success" : "failed", duration.count());
-        return success ? grpc::Status::OK
-                       : grpc::Status(grpc::StatusCode::INTERNAL,
-                                      QueryHelpers::sanitizeErrorMessage(response->status().message()));
+        if (success || !fast_path_active) {
+            // Final state: record exactly once.
+            record_metrics_("Query", duration.count(), success);
+            recordInvocationFact(request_id, plan.single_agent_id,
+                                 plan.single_agent_skill,
+                                 success ? "success" : "failed", duration.count());
+            return success ? grpc::Status::OK
+                           : grpc::Status(grpc::StatusCode::INTERNAL,
+                                          QueryHelpers::sanitizeErrorMessage(response->status().message()));
+        }
+
+        // P10 fallback: the fast-path execution failed (agent error or
+        // unreachable). Retry exactly once through full planning. No metrics
+        // were recorded for the probe attempt — the retry result below is
+        // the single entry for this request.
+        LOG_WARN("P10 single-intent fast path failed, retrying with full planning: " + request_id);
+        plan = orchestrator::ExecutionPlan{};
+        try {
+            plan = task_planner_->plan(question, agent_router_->getAllSkillDescriptions());
+        } catch (const std::exception& e) {
+            LOG_ERROR("Planning failed on fast-path retry: " + request_id + " - " + e.what());
+            plan.is_single_agent = true;
+        }
+        task_planner_->resolveAgents(plan, *agent_router_);
+        if (plan.is_single_agent) {
+            success = executeSingleAgentSync(plan, *request, response);
+            if (success) {
+                update_status_(request_id, "completed",
+                              plan.single_agent_id, plan.single_agent_name, "");
+            }
+            end_time = std::chrono::steady_clock::now();
+            duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+                end_time - start_time);
+            response->set_processing_time_ms(duration.count());
+            record_metrics_("Query", duration.count(), success);
+            recordInvocationFact(request_id, plan.single_agent_id,
+                                 plan.single_agent_skill,
+                                 success ? "success" : "failed", duration.count());
+            return success ? grpc::Status::OK
+                           : grpc::Status(grpc::StatusCode::INTERNAL,
+                                          QueryHelpers::sanitizeErrorMessage(response->status().message()));
+        }
+        // Retry produced a multi-agent plan: fall through below.
     }
 
     // Multi-agent path
@@ -321,122 +504,69 @@ grpc::Status MultiAgentHandler::handleQueryStream(
         writer->Write(thinking_event);
     }
 
-    // Step 1: Plan
+    // Step 1: Plan. The P10 fast path may skip the planning LLM entirely
+    // for high-confidence single intents.
     orchestrator::ExecutionPlan plan;
-    try {
-        plan = task_planner_->plan(question, agent_router_->getAllSkillDescriptions());
-    } catch (const std::exception& e) {
-        LOG_ERROR("Planning failed for query: " + request_id + " - " + e.what());
-        plan.is_single_agent = true;
+    bool fast_path_active = tryBuildFastPathPlan(question, plan);
+    if (!fast_path_active) {
+        try {
+            plan = task_planner_->plan(question, agent_router_->getAllSkillDescriptions());
+        } catch (const std::exception& e) {
+            LOG_ERROR("Planning failed for query: " + request_id + " - " + e.what());
+            plan.is_single_agent = true;
+        }
     }
 
     task_planner_->resolveAgents(plan, *agent_router_);
 
-    // Single-agent fast path. The relay below filters terminal events coming
-    // from the A2A adapter, records partial content, and checks both
-    // context->IsCancelled() and the writer result. No terminal event is
-    // emitted here; AIQueryServiceImpl owns the single terminal emission.
+    // Single-agent fast path. No terminal event is emitted anywhere in this
+    // branch; AIQueryServiceImpl owns the single terminal emission.
     if (plan.is_single_agent) {
-        bool cancelled = false;
-        bool write_failed = false;
-        std::string lower_error;
-
-        auto write_cb = [context, writer, &cancelled, &write_failed,
-                         &lower_error](const agent_communication::AIStreamEvent& event) {
-            if (event.event_type() == "complete") {
-                return;  // filtered: terminal belongs to the service layer
-            }
-            if (event.event_type() == "error") {
-                if (lower_error.empty()) {
-                    lower_error = event.content().empty()
-                        ? "Agent reported an error" : event.content();
-                }
-                return;  // filtered: terminal belongs to the service layer
-            }
-            if (context->IsCancelled()) {
-                cancelled = true;
-                return;
-            }
-            if (event.event_type() == "partial") {
-                tls_stream_result.answer += event.content();
-            }
-            if (!writer->Write(event)) {
-                write_failed = true;
-            }
-        };
-
-        std::string agent_url;
-        if (!plan.single_agent_id.empty()) {
-            auto agent = agent_router_->getAgent(plan.single_agent_id);
-            if (agent.has_value() && agent->is_healthy) {
-                agent_url = agent->url;
-            }
+        auto outcome = executeSingleAgentStream(plan, context, request, writer,
+                                                request_id, start_time,
+                                                fast_path_active);
+        if (outcome == SingleStreamOutcome::Success) {
+            return grpc::Status::OK;
         }
-
-        try {
-            if (!agent_url.empty()) {
-                LOG_INFO("Single-agent stream: routing to " + plan.single_agent_skill +
-                         " via " + agent_url);
-                a2a_adapter_->processQueryStreamingDirect(*request, write_cb, agent_url);
-            } else {
-                LOG_INFO("Single-agent stream: no pre-resolved agent, using adapter routing");
-                a2a_adapter_->processQueryStreaming(*request, write_cb);
-            }
-        } catch (const std::exception& e) {
-            LOG_ERROR("Single-agent streaming failed: " + request_id + " - " + e.what());
-            tls_stream_result.error = std::string("Agent communication failed: ") + e.what();
-
-            auto end_time = std::chrono::steady_clock::now();
-            auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-                end_time - start_time);
-            update_status_(request_id, "failed", "", "", e.what());
-            record_metrics_("QueryStream", duration.count(), false);
-            recordInvocationFact(request_id, plan.single_agent_id,
-                                 plan.single_agent_skill, "failed",
-                                 duration.count());
-            return grpc::Status(grpc::StatusCode::INTERNAL,
-                               QueryHelpers::sanitizeErrorMessage(
-                                   std::string("Agent streaming failed: ") + e.what()));
-        }
-
-        if (cancelled) {
-            update_status_(request_id, "cancelled", "", "", "");
-            recordInvocationFact(request_id, plan.single_agent_id,
-                                 plan.single_agent_skill, "cancelled",
-                                 std::chrono::duration_cast<std::chrono::milliseconds>(
-                                     std::chrono::steady_clock::now() - start_time).count());
+        if (outcome == SingleStreamOutcome::Cancelled) {
             return grpc::Status(grpc::StatusCode::CANCELLED, "Request cancelled");
         }
-        if (!lower_error.empty()) {
-            tls_stream_result.error = lower_error;
-            update_status_(request_id, "failed", "", "", lower_error);
-            recordInvocationFact(request_id, plan.single_agent_id,
-                                 plan.single_agent_skill, "failed",
-                                 std::chrono::duration_cast<std::chrono::milliseconds>(
-                                     std::chrono::steady_clock::now() - start_time).count());
+        // Retry is only safe when NOTHING reached the client: the adapter
+        // may have delivered status events before reporting an error, and
+        // replaying those would duplicate events and re-run the agent call
+        // (repeated downstream side effects).
+        if (!fast_path_active || tls_stream_result.any_written) {
             return grpc::Status(grpc::StatusCode::INTERNAL,
-                               QueryHelpers::sanitizeErrorMessage(lower_error));
-        }
-        if (write_failed) {
-            tls_stream_result.error = "Failed to write stream event";
-            update_status_(request_id, "failed", "", "", "Failed to write stream event");
-            recordInvocationFact(request_id, plan.single_agent_id,
-                                 plan.single_agent_skill, "failed",
-                                 std::chrono::duration_cast<std::chrono::milliseconds>(
-                                     std::chrono::steady_clock::now() - start_time).count());
-            return grpc::Status(grpc::StatusCode::INTERNAL, "Failed to write stream event");
+                                QueryHelpers::sanitizeErrorMessage(tls_stream_result.error));
         }
 
-        auto end_time = std::chrono::steady_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-            end_time - start_time);
-        update_status_(request_id, "completed",
-                      plan.single_agent_id, plan.single_agent_name, "");
-        record_metrics_("QueryStream", duration.count(), true);
-        recordInvocationFact(request_id, plan.single_agent_id,
-                             plan.single_agent_skill, "success",
-                             duration.count());
-        return grpc::Status::OK;
+        // P10 fallback: the fast-path execution failed BEFORE any event
+        // reached the client, so retrying is safe. Retry exactly once
+        // through full planning. The probe attempt recorded no metrics —
+        // the retry below is the single entry for this request.
+        LOG_WARN("P10 single-intent fast path failed, retrying with full planning: " + request_id);
+        tls_stream_result = StreamResultSlot{};
+        plan = orchestrator::ExecutionPlan{};
+        try {
+            plan = task_planner_->plan(question, agent_router_->getAllSkillDescriptions());
+        } catch (const std::exception& e) {
+            LOG_ERROR("Planning failed on fast-path retry: " + request_id + " - " + e.what());
+            plan.is_single_agent = true;
+        }
+        task_planner_->resolveAgents(plan, *agent_router_);
+        if (plan.is_single_agent) {
+            outcome = executeSingleAgentStream(plan, context, request, writer,
+                                               request_id, start_time);
+            if (outcome == SingleStreamOutcome::Success) {
+                return grpc::Status::OK;
+            }
+            if (outcome == SingleStreamOutcome::Cancelled) {
+                return grpc::Status(grpc::StatusCode::CANCELLED, "Request cancelled");
+            }
+            return grpc::Status(grpc::StatusCode::INTERNAL,
+                                QueryHelpers::sanitizeErrorMessage(tls_stream_result.error));
+        }
+        // Retry produced a multi-agent plan: fall through below.
     }
 
     // Emit plan event
@@ -507,6 +637,18 @@ grpc::Status MultiAgentHandler::handleQueryStream(
                                  result.duration_ms);
         }
 
+        // Hand the acting agent back to the service layer: the LAST
+        // executed subtask's agent is the one the conversation ends with,
+        // so the streaming agent-switch pipeline (last_agent + cross-agent
+        // summary) sees the real agent identity. plan.tasks keeps the DAG
+        // order, so iterating it yields the execution order.
+        for (const auto& task : plan.tasks) {
+            if (results.count(task.id) != 0) {
+                tls_stream_result.agent_id = task.preferred_agent_id;
+                tls_stream_result.agent_name = task.preferred_agent_name;
+            }
+        }
+
         agent_communication::AIStreamEvent answer_event;
         answer_event.set_event_type("partial");
         answer_event.set_content(aggregated.final_answer);
@@ -546,6 +688,136 @@ grpc::Status MultiAgentHandler::handleQueryStream(
         return grpc::Status(grpc::StatusCode::INTERNAL,
                            std::string("Multi-agent orchestration failed: ") + e.what());
     }
+}
+
+MultiAgentHandler::SingleStreamOutcome MultiAgentHandler::executeSingleAgentStream(
+    const orchestrator::ExecutionPlan& plan,
+    grpc::ServerContext* context,
+    const agent_communication::AIQueryRequest* request,
+    grpc::ServerWriter<agent_communication::AIStreamEvent>* writer,
+    const std::string& request_id,
+    std::chrono::steady_clock::time_point start_time,
+    bool fast_path_probe) {
+    // The relay below filters terminal events coming from the A2A adapter,
+    // records partial content, and checks both context->IsCancelled() and
+    // the writer result. No terminal event is emitted here; the top-level
+    // AIQueryServiceImpl owns the single terminal emission.
+    //
+    // fast_path_probe marks the FIRST attempt of a fast-path run: its
+    // failure may be retried once by the caller, so no metrics/invocation
+    // facts are recorded for it (recording both attempts would double-count
+    // one request). A cancellation is always terminal and is recorded.
+    bool cancelled = false;
+    bool write_failed = false;
+    std::string lower_error;
+
+    auto write_cb = [context, writer, &cancelled, &write_failed,
+                     &lower_error](const agent_communication::AIStreamEvent& event) {
+        if (event.event_type() == "complete") {
+            return;  // filtered: terminal belongs to the service layer
+        }
+        if (event.event_type() == "error") {
+            if (lower_error.empty()) {
+                lower_error = event.content().empty()
+                    ? "Agent reported an error" : event.content();
+            }
+            return;  // filtered: terminal belongs to the service layer
+        }
+        if (context->IsCancelled()) {
+            cancelled = true;
+            return;
+        }
+        if (event.event_type() == "partial") {
+            tls_stream_result.answer += event.content();
+        }
+        if (!writer->Write(event)) {
+            write_failed = true;
+        } else {
+            // Any delivered event (status included) makes the stream
+            // irreversible: the caller must not replay the run.
+            tls_stream_result.any_written = true;
+        }
+    };
+
+    std::string agent_url;
+    if (!plan.single_agent_id.empty()) {
+        auto agent = agent_router_->getAgent(plan.single_agent_id);
+        if (agent.has_value() && agent->is_healthy) {
+            agent_url = agent->url;
+        }
+    }
+
+    try {
+        if (!agent_url.empty()) {
+            LOG_INFO("Single-agent stream: routing to " + plan.single_agent_skill +
+                     " via " + agent_url);
+            a2a_adapter_->processQueryStreamingDirect(*request, write_cb, agent_url);
+        } else {
+            LOG_INFO("Single-agent stream: no pre-resolved agent, using adapter routing");
+            a2a_adapter_->processQueryStreaming(*request, write_cb);
+        }
+    } catch (const std::exception& e) {
+        LOG_ERROR("Single-agent streaming failed: " + request_id + " - " + e.what());
+        tls_stream_result.error = std::string("Agent communication failed: ") + e.what();
+
+        auto end_time = std::chrono::steady_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+            end_time - start_time);
+        update_status_(request_id, "failed", "", "", e.what());
+        if (!fast_path_probe) {
+            record_metrics_("QueryStream", duration.count(), false);
+            recordInvocationFact(request_id, plan.single_agent_id,
+                                 plan.single_agent_skill, "failed",
+                                 duration.count());
+        }
+        return SingleStreamOutcome::Failed;
+    }
+
+    if (cancelled) {
+        update_status_(request_id, "cancelled", "", "", "");
+        recordInvocationFact(request_id, plan.single_agent_id,
+                             plan.single_agent_skill, "cancelled",
+                             std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now() - start_time).count());
+        return SingleStreamOutcome::Cancelled;
+    }
+    if (!lower_error.empty()) {
+        tls_stream_result.error = lower_error;
+        update_status_(request_id, "failed", "", "", lower_error);
+        if (!fast_path_probe) {
+            recordInvocationFact(request_id, plan.single_agent_id,
+                                 plan.single_agent_skill, "failed",
+                                 std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now() - start_time).count());
+        }
+        return SingleStreamOutcome::Failed;
+    }
+    if (write_failed) {
+        tls_stream_result.error = "Failed to write stream event";
+        update_status_(request_id, "failed", "", "", "Failed to write stream event");
+        if (!fast_path_probe) {
+            recordInvocationFact(request_id, plan.single_agent_id,
+                                 plan.single_agent_skill, "failed",
+                                 std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now() - start_time).count());
+        }
+        return SingleStreamOutcome::Failed;
+    }
+
+    auto end_time = std::chrono::steady_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+        end_time - start_time);
+    update_status_(request_id, "completed",
+                  plan.single_agent_id, plan.single_agent_name, "");
+    record_metrics_("QueryStream", duration.count(), true);
+    recordInvocationFact(request_id, plan.single_agent_id,
+                         plan.single_agent_skill, "success",
+                         duration.count());
+    // Hand the acting agent back so the service layer can run the
+    // agent-switch memory pipeline on the streaming path.
+    tls_stream_result.agent_id = plan.single_agent_id;
+    tls_stream_result.agent_name = plan.single_agent_name;
+    return SingleStreamOutcome::Success;
 }
 
 std::function<std::string(const std::string&, const std::string&)>

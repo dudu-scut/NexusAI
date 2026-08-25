@@ -122,6 +122,26 @@ bool AIQueryServiceImpl::initialize(
                 agent_router_.get(), memory_service_.get(), &rpc_config_);
 
             LOG_INFO("Multi-agent orchestrator enabled (LLM: " + model + ")");
+
+            // P7: optional embedding routing tier (NEXUSAI_EMBEDDING_ROUTER,
+            // default off). Any failure degrades silently — the router keeps
+            // the 3-tier pipeline (Embedding(high) -> LLM -> Keyword) and
+            // startup is never blocked or failed by this wiring.
+            if (agent_router_ &&
+                common::envOrDefault("NEXUSAI_EMBEDDING_ROUTER", "0") == "1") {
+                orchestrator::EmbeddingRouterConfig embedding_config;
+                embedding_config.enabled = true;
+                embedding_config.api_key = api_key;  // LLM_API_KEY fallback
+                if (agent_router_->enableEmbedding(embedding_config)) {
+                    LOG_INFO("Embedding router enabled (NEXUSAI_EMBEDDING_ROUTER=1)");
+                } else {
+#ifdef AGENT_RPC_ENABLE_MCP
+                    LOG_WARN("embedding router disabled: embedding service unavailable or invalid config, fallback to 3-tier pipeline");
+#else
+                    LOG_WARN("embedding router disabled: built without AGENT_RPC_ENABLE_MCP, fallback to 3-tier pipeline");
+#endif
+                }
+            }
         } else {
             LOG_WARN("Multi-agent orchestrator initialization failed, falling back to single-agent mode");
         }
@@ -293,9 +313,15 @@ grpc::Status AIQueryServiceImpl::reserveBudgetOrReject(DurableQueryRun& run) {
     return grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED, reason);
 }
 
+// Forward declaration of the cache-only guard defined further down: the
+// memory-recall step below relies on its silent-degradation contract.
+template <typename Fn>
+static void runCacheOnly(Fn&& operation, const std::string& what);
+
 void AIQueryServiceImpl::buildSystemContextFromPg(
     const std::string& owner_id, const std::string& conversation_id,
-    agent_communication::SystemContext* system_context) {
+    agent_communication::SystemContext* system_context,
+    bool sandbox_request) {
     if (!system_context) {
         return;
     }
@@ -317,6 +343,47 @@ void AIQueryServiceImpl::buildSystemContextFromPg(
         history += messages[index].role + ": " + messages[index].content + "\n";
     }
     system_context->set_conversation_history(history);
+
+    // Batch-1 memory loop: after the PostgreSQL context is assembled, recall
+    // the Redis-accelerated tiers (Tier-2 long-term memory hints and the
+    // cross-agent switch summary). Redis stays cache-only here: the
+    // NEXUSAI_MEMORY_HINTS_RECALL switch (default on) and the live connection
+    // state gate the reads, and any failure degrades silently.
+    //
+    // Sandbox requests skip long-term memory reads, symmetric to the
+    // write-side !request->sandbox() guard in Query(): the sandbox flag lives
+    // on the request object, so the caller forwards it — this function stays
+    // request-shape-free by design.
+    const bool recall_enabled =
+        common::envOrDefault("NEXUSAI_MEMORY_HINTS_RECALL", "1") != "0";
+    if (!recall_enabled || sandbox_request || !memory_service_) {
+        return;
+    }
+    // Hot-path protection: short-circuit before touching Redis when the
+    // connection is down — the client's lazy reconnect can block for ~1s and
+    // must never stall the query path.
+    if (!redis_client_ || !redis_client_->isConnected()) {
+        return;
+    }
+    runCacheOnly([&] {
+        // Tier-2 long-term memory: merge with a non-empty PG memory_summary
+        // instead of overwriting it.
+        const std::string recalled = memory_service_->getUserMemory(owner_id);
+        if (!recalled.empty()) {
+            std::string merged = system_context->user_memory();
+            if (!merged.empty()) {
+                merged += "\n";
+            }
+            merged += recalled;
+            system_context->set_user_memory(merged);
+        }
+        // Tier-3 cross-agent summary recall.
+        const std::string summary =
+            memory_service_->getCrossAgentSummary(conversation_id);
+        if (!summary.empty()) {
+            system_context->set_cross_agent_summary(summary);
+        }
+    }, "memory recall");
 }
 
 void AIQueryServiceImpl::finalizeDurableQuery(DurableQueryRun& run, const std::string& status,
@@ -440,41 +507,6 @@ static void runCacheOnly(Fn&& operation, const std::string& what) {
     }
 }
 
-// Persist trace spans to Redis for ObservabilityService::GetTraceDetail.
-static void persistTraceSpansToRedis(common::RedisClient* redis_client) {
-    auto* trace = common::TraceContext::current();
-    if (!trace || !redis_client) {
-        return;
-    }
-    const auto& spans = trace->completedSpans();
-    if (spans.empty()) {
-        return;
-    }
-    std::string trace_id = trace->traceId();
-    std::string redis_key = "trace:" + trace_id + ":spans";
-    int64_t epoch_ms = trace->epochMs();
-    auto steady_ref = trace->startSteady();
-    for (const auto& span : spans) {
-        nlohmann::json j;
-        j["trace_id"] = trace_id;
-        j["span_id"] = span.span_id;
-        j["parent_span_id"] = span.parent_span_id;
-        j["component"] = span.component;
-        j["start_time"] = epoch_ms +
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                span.start_time - steady_ref).count();
-        j["end_time"] = epoch_ms +
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                span.end_time - steady_ref).count();
-        j["duration_ms"] = span.duration_ms;
-        j["status"] = span.status;
-        j["error_message"] = span.error_message;
-        j["metadata_json"] = span.metadata_json;
-        redis_client->rpush(redis_key, j.dump());
-    }
-    redis_client->expire(redis_key, 604800);  // TTL 7 days
-}
-
 // agent_invocations producer (final wrap-up wiring)
 void AIQueryServiceImpl::setInvocationRepository(
     common::AgentRuntimeRepository* repository) {
@@ -512,6 +544,39 @@ void AIQueryServiceImpl::recordInvocationFact(
     } catch (...) {
         LOG_WARN("agent_invocations write failed for query " + query_log_id);
     }
+}
+
+// Agent-switch memory pipeline, shared by Query() and QueryStream(). The
+// taking-over agent's name/duties come from the registry router when
+// available; agent_name is the fallback. Callers wrap this in runCacheOnly,
+// and only invoke it for real acting agents on success (never for sandbox
+// runs — the sandbox guard lives at the call sites).
+void AIQueryServiceImpl::writeAgentSwitchMemory(
+    const std::string& owner_id, const std::string& context_id,
+    const std::string& agent_id, const std::string& agent_name) {
+    std::string target_agent_name = agent_name;
+    std::string target_agent_duties;
+    if (agent_router_) {
+        if (auto target = agent_router_->getAgent(agent_id)) {
+            if (target_agent_name.empty()) {
+                target_agent_name = target->name;
+            }
+            target_agent_duties = target->description;
+            for (const auto& skill : target->skills) {
+                if (!target_agent_duties.empty()) {
+                    target_agent_duties += ", ";
+                }
+                target_agent_duties += skill;
+                const auto desc = target->skill_descriptions.find(skill);
+                if (desc != target->skill_descriptions.end() && !desc->second.empty()) {
+                    target_agent_duties += "(" + desc->second + ")";
+                }
+            }
+        }
+    }
+    helpers_.handleAgentSwitch(memory_service_.get(), memory_llm_client_.get(),
+                               domain_repo_, owner_id, context_id, agent_id,
+                               target_agent_name, target_agent_duties);
 }
 
 grpc::Status AIQueryServiceImpl::Query(
@@ -581,7 +646,9 @@ grpc::Status AIQueryServiceImpl::Query(
     enriched_req.set_user_id(owner_id);
     enriched_req.set_request_id(request_id);
     enriched_req.set_context_id(context_id);
-    buildSystemContextFromPg(owner_id, context_id, enriched_req.mutable_system_context());
+    buildSystemContextFromPg(owner_id, context_id,
+                             enriched_req.mutable_system_context(),
+                             request->sandbox());
 
     common::TraceContext::init(owner_id, context_id);
 
@@ -666,10 +733,13 @@ grpc::Status AIQueryServiceImpl::Query(
         runCacheOnly([&] {
             memory_service_->updateUserMemoryFromHints(
                 owner_id, {response->memory_hints().begin(), response->memory_hints().end()});
-            helpers_.handleAgentSwitch(memory_service_.get(), memory_llm_client_.get(),
-                                       owner_id, context_id,
-                                       response->agent_id().empty() ? "default"
-                                                                    : response->agent_id());
+            // The summary is specialized for the taking-over assistant; the
+            // response agent_name is the fallback when the router has no
+            // registry entry.
+            const std::string real_agent_id =
+                response->agent_id().empty() ? "default" : response->agent_id();
+            writeAgentSwitchMemory(owner_id, context_id, real_agent_id,
+                                   response->agent_name());
         }, "query memory cache");
     }
 
@@ -682,10 +752,18 @@ grpc::Status AIQueryServiceImpl::Query(
                          response->agent_id(), response->agent_name());
         auto* tc = common::TraceContext::current();
         if (tc) {
+            // Estimate-only accounting (no provider usage passthrough yet):
+            // prompt = 64 message-skeleton tokens + ~4 bytes per token;
+            // completion = response bytes / 4 (same coarse estimate the
+            // finalize ledger uses).
+            const int est_prompt =
+                static_cast<int>(estimateTokens(run.question));
+            const int est_completion =
+                static_cast<int>(response_text.size() / 4);
             common::CostTracker::instance().recordLLMCall(
                 tc->traceId(), owner_id, context_id,
                 response->agent_id(), "server_query",
-                0, 0, "unknown", duration.count());
+                est_prompt, est_completion, "unknown", duration.count());
         }
         LOG_INFO("AI query completed: " + request_id +
                 " in " + std::to_string(duration.count()) + "ms");
@@ -693,8 +771,6 @@ grpc::Status AIQueryServiceImpl::Query(
         helpers_.updateTaskStatus(request_id, "failed", "", "", error_message);
         LOG_ERROR("AI query failed: " + request_id + " - " + error_message);
     }
-
-    runCacheOnly([&] { persistTraceSpansToRedis(redis_client_); }, "trace span cache");
 
     if (success) {
         return grpc::Status::OK;
@@ -785,7 +861,9 @@ grpc::Status AIQueryServiceImpl::QueryStream(
     enriched_req.set_user_id(owner_id);
     enriched_req.set_request_id(request_id);
     enriched_req.set_context_id(context_id);
-    buildSystemContextFromPg(owner_id, context_id, enriched_req.mutable_system_context());
+    buildSystemContextFromPg(owner_id, context_id,
+                             enriched_req.mutable_system_context(),
+                             request->sandbox());
 
     common::TraceContext::init(owner_id, context_id);
     helpers_.updateTaskStatus(request_id, "working");
@@ -818,6 +896,8 @@ grpc::Status AIQueryServiceImpl::QueryStream(
             context, &enriched_req, writer, request_id);
         std::string answer = takeMultiAgentStreamedAnswer();
         std::string lower_error = takeMultiAgentStreamError();
+        std::string stream_agent_id = takeMultiAgentStreamedAgentId();
+        std::string stream_agent_name = takeMultiAgentStreamedAgentName();
 
         auto end_time = std::chrono::steady_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -825,25 +905,33 @@ grpc::Status AIQueryServiceImpl::QueryStream(
         QueryHelpers::recordMetrics("QueryStream", duration.count(), status.ok());
 
         if (status.ok()) {
+            // Streaming-path memory wiring: the handler hands back the real
+            // acting agent, so the agent-switch pipeline (last_agent write +
+            // async cross-agent summary) runs here exactly as on the sync
+            // Query path. Memory hints have no streaming channel
+            // (AIStreamEvent carries none), so updateUserMemoryFromHints is
+            // sync-path-only. Sandbox runs skip long-term memory, mirroring
+            // the sync-path !request->sandbox() guard.
+            if (memory_service_ && !request->sandbox() && !stream_agent_id.empty()) {
+                runCacheOnly([&] {
+                    writeAgentSwitchMemory(owner_id, context_id,
+                                           stream_agent_id, stream_agent_name);
+                }, "stream query memory cache");
+            }
             emitTerminal("complete", "");
             finalizeDurableQuery(run, "completed", answer, "");
             helpers_.updateTaskStatus(request_id, "completed");
-            runCacheOnly([&] { persistTraceSpansToRedis(redis_client_); },
-                         "trace span cache");
             return grpc::Status::OK;
         }
         if (status.error_code() == grpc::StatusCode::CANCELLED) {
             finalizeDurableQuery(run, "cancelled", answer, "Request cancelled");
             helpers_.updateTaskStatus(request_id, "cancelled");
-            runCacheOnly([&] { persistTraceSpansToRedis(redis_client_); },
-                         "trace span cache");
             return status;
         }
         const std::string message = lower_error.empty() ? status.error_message() : lower_error;
         emitTerminal("error", sanitizeErrorMessage(message));
         finalizeDurableQuery(run, "failed", answer, message);
         helpers_.updateTaskStatus(request_id, "failed", "", "", message);
-        runCacheOnly([&] { persistTraceSpansToRedis(redis_client_); }, "trace span cache");
         return status;
     }
 
@@ -921,7 +1009,6 @@ grpc::Status AIQueryServiceImpl::QueryStream(
         recordInvocationFact(run.owner_id, request_id, "", "", "cancelled",
                              duration.count());
         a2a_adapter_->cancelTask(request_id);
-        runCacheOnly([&] { persistTraceSpansToRedis(redis_client_); }, "trace span cache");
         return grpc::Status(grpc::StatusCode::CANCELLED, "Request cancelled");
     }
 
@@ -932,7 +1019,6 @@ grpc::Status AIQueryServiceImpl::QueryStream(
         recordInvocationFact(run.owner_id, request_id, "", "", "failed",
                              duration.count());
         LOG_ERROR("Streaming AI query failed: " + request_id + " - " + lower_error);
-        runCacheOnly([&] { persistTraceSpansToRedis(redis_client_); }, "trace span cache");
         return grpc::Status(grpc::StatusCode::INTERNAL, sanitizeErrorMessage(lower_error));
     }
 
@@ -943,17 +1029,15 @@ grpc::Status AIQueryServiceImpl::QueryStream(
                                   "Failed to write stream event");
         recordInvocationFact(run.owner_id, request_id, "", "", "failed",
                              duration.count());
-        runCacheOnly([&] { persistTraceSpansToRedis(redis_client_); }, "trace span cache");
         return grpc::Status(grpc::StatusCode::INTERNAL, "Failed to write stream event");
     }
 
-    // Memory cache (Redis only; PostgreSQL remains the source of truth).
-    // Cache-only: a Redis fault must not flip a completed stream into an
-    // error result.
-    if (memory_service_) {
-        runCacheOnly([&] { memory_service_->setLastAgent(context_id, "default"); },
-                     "stream memory cache");
-    }
+    // Memory cache: last_agent is recorded with the real agent id at the end
+    // of handleAgentSwitch (non-streaming Query path). The streaming paths
+    // cannot reliably surface an agent identity — the A2A adapter returns no
+    // agent id and the multi-agent stream only exposes the accumulated answer
+    // through a thread-local slot — so no fake "default" placeholder is
+    // written here anymore.
 
     // Step 6: single terminal event + exactly-once persistence.
     emitTerminal("complete", "");
@@ -962,13 +1046,19 @@ grpc::Status AIQueryServiceImpl::QueryStream(
     recordInvocationFact(run.owner_id, request_id, "", "", "success",
                          duration.count());
     auto* tc = common::TraceContext::current();
+    // Estimate-only accounting (no provider usage passthrough yet): prompt =
+    // 64 message-skeleton tokens + ~4 bytes per token; completion =
+    // accumulated streamed bytes / 4.
+    const int stream_est_prompt =
+        static_cast<int>(estimateTokens(run.question));
+    const int stream_est_completion =
+        static_cast<int>(streamed_content.size() / 4);
     common::CostTracker::instance().recordLLMCall(
         tc ? tc->traceId() : "", owner_id, context_id, "", "server_stream",
-        0, 0, "unknown", duration.count());
+        stream_est_prompt, stream_est_completion, "unknown", duration.count());
     LOG_INFO("Streaming AI query completed: " + request_id +
             " in " + std::to_string(duration.count()) + "ms");
 
-    runCacheOnly([&] { persistTraceSpansToRedis(redis_client_); }, "trace span cache");
     return grpc::Status::OK;
 
     } catch (const std::exception& error) {

@@ -7,9 +7,29 @@
 #include <rapidcheck.h>
 #include <rapidcheck/gtest.h>
 
+// AgentRouter's member layout is guarded by AGENT_RPC_ENABLE_MCP (three
+// extra unique_ptr members in MCP builds). The orchestrator library defines
+// that macro PRIVATE (see orchestrator/CMakeLists.txt), so this TU must
+// mirror it or it would see a different layout than liborchestrator.a —
+// an ODR violation that corrupts the heap. Detection: orchestrator links
+// agent_rpc_mcp PUBLIC only in ENABLE_MCP builds, which propagates mcp's
+// PUBLIC include dirs to this target; their absence means the default
+// (non-MCP) layout. Do NOT define the macro unconditionally.
+#if defined(__has_include)
+#if __has_include("agent_rpc/mcp/rag/embedding_service.h")
+#ifndef AGENT_RPC_ENABLE_MCP
+#define AGENT_RPC_ENABLE_MCP 1
+#endif
+#endif
+#endif
+
 #include "agent_rpc/orchestrator/agent_router.h"
 #include "agent_rpc/orchestrator/agent_info.h"
+#include "agent_rpc/orchestrator/task_executor.h"
+#include "agent_rpc/common/trace_context.h"
+#include "agent_rpc/common/load_balancer.h"
 
+#include <cstdlib>
 #include <unordered_set>
 #include <algorithm>
 
@@ -482,6 +502,323 @@ TEST_F(AgentRouterPropertyTest, AgentInfoHasSkillMethods) {
     
     EXPECT_TRUE(agent.hasAnySkill({"math", "writing"}));
     EXPECT_FALSE(agent.hasAnySkill({"writing", "translation"}));
+}
+
+// P5: child-task spans must be merged back into the parent TraceContext
+
+namespace {
+
+// Builds a two-task same-layer plan (forces the std::async parallel path)
+// and a router with one healthy worker agent.
+ExecutionPlan buildParallelPlan() {
+    ExecutionPlan plan;
+    plan.is_single_agent = false;
+
+    SubTask t1;
+    t1.id = "t1";
+    t1.description = "task one";
+    t1.preferred_agent_id = "worker";
+
+    SubTask t2;
+    t2.id = "t2";
+    t2.description = "task two";
+    t2.preferred_agent_id = "worker";
+
+    plan.tasks = {t1, t2};
+    return plan;
+}
+
+void registerWorkerAgent(AgentRouter& router) {
+    AgentInfo agent;
+    agent.id = "worker";
+    agent.name = "Worker";
+    agent.url = "http://localhost:9999";
+    agent.skills = {"general"};
+    agent.is_healthy = true;
+    router.addAgent(agent);
+}
+
+} // namespace
+
+TEST(TaskExecutorTracePropagationTest, ChildSpansMergeIntoParentContext) {
+#ifndef _WIN32
+    // This test asserts the default-on behavior; pin the switch explicitly
+    // so a regression run with NEXUSAI_TRACE_PARENT_PROPAGATION=0 in the
+    // environment cannot flip the expectation.
+    const char* previous = ::getenv("NEXUSAI_TRACE_PARENT_PROPAGATION");
+    const std::string previous_value = previous ? previous : "";
+    const bool had_previous = previous != nullptr;
+    ::setenv("NEXUSAI_TRACE_PARENT_PROPAGATION", "1", 1);
+#endif
+
+    AgentRouter router;
+    ASSERT_TRUE(router.initialize(RoutingStrategy::SKILL_MATCH));
+    registerWorkerAgent(router);
+
+    agent_rpc::common::TraceContext::init("owner", "ctx");
+    auto* parent = agent_rpc::common::TraceContext::current();
+    const std::string parent_trace = parent->traceId();
+
+    TaskExecutor executor(router, ExecutorConfig{});
+    auto results = executor.execute(
+        buildParallelPlan(),
+        [](const std::string&, const std::string&) { return std::string("ok"); });
+
+    ASSERT_EQ(results.size(), 2u);
+    EXPECT_TRUE(results["t1"].success);
+    EXPECT_TRUE(results["t2"].success);
+
+    // Worker-thread spans are merged into the parent context after the layer
+    // futures are collected.
+    bool found_t1 = false;
+    bool found_t2 = false;
+    for (const auto& span : parent->completedSpans()) {
+        if (span.name == "subtask_t1") found_t1 = true;
+        if (span.name == "subtask_t2") found_t2 = true;
+    }
+    EXPECT_TRUE(found_t1);
+    EXPECT_TRUE(found_t2);
+    EXPECT_EQ(parent->traceId(), parent_trace);
+
+#ifndef _WIN32
+    if (had_previous) {
+        ::setenv("NEXUSAI_TRACE_PARENT_PROPAGATION", previous_value.c_str(), 1);
+    } else {
+        ::unsetenv("NEXUSAI_TRACE_PARENT_PROPAGATION");
+    }
+#endif
+}
+
+TEST(TaskExecutorTracePropagationTest, SwitchOffSkipsSpanMerge) {
+#ifndef _WIN32
+    ::setenv("NEXUSAI_TRACE_PARENT_PROPAGATION", "0", 1);
+
+    AgentRouter router;
+    ASSERT_TRUE(router.initialize(RoutingStrategy::SKILL_MATCH));
+    registerWorkerAgent(router);
+
+    agent_rpc::common::TraceContext::init("owner", "ctx");
+    auto* parent = agent_rpc::common::TraceContext::current();
+    const size_t spans_before = parent->completedSpans().size();
+
+    TaskExecutor executor(router, ExecutorConfig{});
+    auto results = executor.execute(
+        buildParallelPlan(),
+        [](const std::string&, const std::string&) { return std::string("ok"); });
+
+    ::unsetenv("NEXUSAI_TRACE_PARENT_PROPAGATION");
+
+    ASSERT_EQ(results.size(), 2u);
+    EXPECT_TRUE(results["t1"].success);
+    // Legacy behavior when the switch is off: nothing is merged back.
+    EXPECT_EQ(parent->completedSpans().size(), spans_before);
+#endif
+}
+
+// P7: embedding tier must stay inert unless explicitly enabled
+
+TEST(AgentRouterEmbeddingGateTest, DisabledEmbeddingKeepsBaselineBehavior) {
+    AgentRouter router;
+    ASSERT_TRUE(router.initialize(RoutingStrategy::SKILL_MATCH));
+
+    AgentInfo agent;
+    agent.id = "math-agent";
+    agent.name = "Math";
+    agent.url = "http://localhost:6001";
+    agent.skills = {"math"};
+    agent.is_healthy = true;
+    router.addAgent(agent);
+
+    // Baseline state before touching the embedding tier.
+    ASSERT_TRUE(router.getAgent("math-agent").has_value());
+    ASSERT_EQ(router.getHealthyAgentCount(), 1u);
+
+    // Explicitly disabled config must succeed and change nothing.
+    EmbeddingRouterConfig off_config;
+    off_config.enabled = false;
+    EXPECT_TRUE(router.enableEmbedding(off_config));
+    EXPECT_TRUE(router.getAgent("math-agent").has_value());
+    EXPECT_EQ(router.getHealthyAgentCount(), 1u);
+
+    // An enabled request in the default (non-MCP) build is refused by the
+    // stub and routing keeps its baseline behavior; in MCP builds the call
+    // may succeed or degrade, but skill lookup must keep working either way.
+    EmbeddingRouterConfig on_config;
+    on_config.enabled = true;
+    on_config.api_key = "test-key";
+#ifndef AGENT_RPC_ENABLE_MCP
+    EXPECT_FALSE(router.enableEmbedding(on_config));
+#else
+    (void)router.enableEmbedding(on_config);
+#endif
+    EXPECT_TRUE(router.getAgent("math-agent").has_value());
+    EXPECT_EQ(router.getHealthyAgentCount(), 1u);
+}
+
+// P8: load-balancer tier gate tests
+
+namespace {
+
+#ifndef _WIN32
+// RAII guard: set/restore an environment variable around a test body so
+// parallel/sequential cases never leak switch state into each other.
+class EnvGuard {
+public:
+    explicit EnvGuard(const char* name, const char* value) : name_(name) {
+        const char* old = ::getenv(name);
+        had_old_ = (old != nullptr);
+        if (had_old_) old_value_ = old;
+        if (value) {
+            ::setenv(name, value, 1);
+        } else {
+            ::unsetenv(name);
+        }
+    }
+    ~EnvGuard() {
+        if (had_old_) {
+            ::setenv(name_, old_value_.c_str(), 1);
+        } else {
+            ::unsetenv(name_);
+        }
+    }
+
+private:
+    const char* name_;
+    bool had_old_ = false;
+    std::string old_value_;
+};
+#endif
+
+AgentInfo makeLbAgent(const std::string& id) {
+    AgentInfo agent;
+    agent.id = id;
+    agent.name = "Agent " + id;
+    agent.url = "http://localhost:700" + id;
+    agent.skills = {"general"};
+    agent.is_healthy = true;
+    agent.current_load = 0;
+    return agent;
+}
+
+} // namespace
+
+// Switch unset: the router must keep the legacy quality-weighted path
+// (all-equal coefficients degenerate to round-robin), byte-for-byte.
+TEST(AgentRouterLoadBalancerGateTest, SwitchOffKeepsLegacySemantics) {
+#ifndef _WIN32
+    EnvGuard guard("NEXUSAI_ROUTER_LB_STRATEGY", nullptr);
+
+    AgentRouter router;
+    ASSERT_TRUE(router.initialize(RoutingStrategy::SKILL_MATCH));
+    for (int i = 0; i < 5; ++i) {
+        router.addAgent(makeLbAgent(std::to_string(i)));
+    }
+
+    std::vector<std::string> selected;
+    for (int i = 0; i < 10; ++i) {
+        auto picked = router.selectAgent("lb question", {"general"});
+        ASSERT_TRUE(picked.has_value());
+        selected.push_back(picked->id);
+    }
+
+    // Legacy degenerate path: fair round-robin over the 5 healthy agents,
+    // repeating with period 5.
+    std::vector<std::string> first(selected.begin(), selected.begin() + 5);
+    std::vector<std::string> second(selected.begin() + 5, selected.end());
+    EXPECT_EQ(first, second);
+    EXPECT_EQ((std::unordered_set<std::string>(first.begin(), first.end())).size(), 5u);
+
+    // An invalid switch value must be rejected and keep the same behavior.
+    EnvGuard invalid_guard("NEXUSAI_ROUTER_LB_STRATEGY", "not_a_strategy");
+    AgentRouter fallback_router;
+    ASSERT_TRUE(fallback_router.initialize(RoutingStrategy::SKILL_MATCH));
+    for (int i = 0; i < 5; ++i) {
+        fallback_router.addAgent(makeLbAgent(std::to_string(i)));
+    }
+    auto picked = fallback_router.selectAgent("lb question", {"general"});
+    ASSERT_TRUE(picked.has_value());
+#endif
+}
+
+// Switch on (round_robin) with distinct quality coefficients: consecutive
+// selections must ADVANCE the balancer cursor instead of always picking the
+// first candidate. This regresses the updateEndpoints() reset defect — when
+// every selection rebuilt the endpoint set, the cursor was zeroed and the
+// strategy silently degenerated to "always the first healthy candidate".
+TEST(AgentRouterLoadBalancerGateTest, RoundRobinAdvancesCursorWithoutReset) {
+#ifndef _WIN32
+    EnvGuard guard("NEXUSAI_ROUTER_LB_STRATEGY", "round_robin");
+
+    AgentRouter router;
+    ASSERT_TRUE(router.initialize(RoutingStrategy::SKILL_MATCH));
+    const std::vector<std::string> ids = {"a1", "a2", "a3"};
+    for (const auto& id : ids) {
+        router.addAgent(makeLbAgent(id));
+    }
+    // Distinct quality coefficients force the tier into the load balancer
+    // (all-equal coefficients would degenerate to the legacy round-robin
+    // path and never exercise the balancer state).
+    router.setQualityProvider([](const std::string& agent_id, const std::string&) {
+        if (agent_id == "a1") return 0.9;
+        if (agent_id == "a2") return 0.7;
+        return 0.5;
+    });
+
+    std::unordered_set<std::string> seen;
+    for (int i = 0; i < 6; ++i) {
+        auto picked = router.selectAgent("lb question", {"general"});
+        ASSERT_TRUE(picked.has_value());
+        seen.insert(picked->id);
+    }
+    // A resetting balancer would have picked a single candidate six times;
+    // the advancing cursor must cover at least two of the three agents.
+    EXPECT_GE(seen.size(), 2u);
+#endif
+}
+
+// Switch on (consistent_hash): the router tier stays inside the healthy
+// candidate set, and the underlying consistent-hash balancer maps the same
+// key onto the same endpoint deterministically.
+TEST(AgentRouterLoadBalancerGateTest, ConsistentHashSameKeySamePick) {
+#ifndef _WIN32
+    EnvGuard guard("NEXUSAI_ROUTER_LB_STRATEGY", "consistent_hash");
+
+    AgentRouter router;
+    ASSERT_TRUE(router.initialize(RoutingStrategy::SKILL_MATCH));
+    const std::vector<std::string> ids = {"a1", "a2", "a3"};
+    for (const auto& id : ids) {
+        router.addAgent(makeLbAgent(id));
+    }
+    const std::unordered_set<std::string> candidates(ids.begin(), ids.end());
+
+    // Router-level selection through the tier must always land on one of
+    // the healthy candidates (the consistent-hash base uses a random key,
+    // so the exact pick is not asserted here).
+    for (int i = 0; i < 10; ++i) {
+        auto picked = router.selectAgent("lb question", {"general"});
+        ASSERT_TRUE(picked.has_value());
+        EXPECT_TRUE(candidates.count(picked->id) == 1u);
+    }
+
+    // Deterministic guarantee lives one layer down: same key, same endpoint.
+    std::vector<agent_rpc::common::ServiceEndpoint> endpoints;
+    for (const auto& id : ids) {
+        agent_rpc::common::ServiceEndpoint ep;
+        ep.host = id;
+        ep.port = 0;
+        ep.service_name = id;
+        ep.is_healthy = true;
+        ep.metadata["agent_id"] = id;
+        endpoints.push_back(ep);
+    }
+    agent_rpc::common::ConsistentHashLoadBalancer balancer;
+    balancer.updateEndpoints(endpoints);
+    const auto first_pick = balancer.selectEndpointByKey("stable-key", endpoints);
+    for (int i = 0; i < 5; ++i) {
+        const auto again = balancer.selectEndpointByKey("stable-key", endpoints);
+        EXPECT_EQ(again.host, first_pick.host);
+    }
+#endif
 }
 
 // Main

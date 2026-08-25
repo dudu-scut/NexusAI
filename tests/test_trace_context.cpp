@@ -51,6 +51,48 @@ TEST(TraceContextTest, ThreadLocalIsolation) {
     EXPECT_NE(TraceContext::current()->traceId(), child_trace_id);
 }
 
+TEST(TraceContextTest, ThreeArgInitReusesExistingTraceId) {
+    TraceContext::init("parent_user", "ctx-a");
+    const std::string parent_id = TraceContext::current()->traceId();
+    ASSERT_FALSE(parent_id.empty());
+
+    std::string child_trace_id;
+    std::thread([&]() {
+        TraceContext::init("parent_user", "", parent_id);
+        child_trace_id = TraceContext::current()->traceId();
+    }).join();
+
+    // The child thread must attach to the parent's logical trace.
+    EXPECT_EQ(child_trace_id, parent_id);
+}
+
+TEST(TraceContextTest, ThreeArgInitEmptyIdGeneratesFresh) {
+    TraceContext::init("user_x", "");
+    const std::string main_id = TraceContext::current()->traceId();
+
+    std::string child_trace_id;
+    std::thread([&]() {
+        TraceContext::init("user_x", "", std::string());
+        child_trace_id = TraceContext::current()->traceId();
+    }).join();
+
+    EXPECT_FALSE(child_trace_id.empty());
+    EXPECT_NE(child_trace_id, main_id);
+}
+
+TEST(TraceContextTest, TwoArgInitStillGeneratesFreshIds) {
+    // Regression guard: the two-argument overload is a byte-stable contract
+    // (source-scanning tests) and must keep generating fresh trace ids.
+    TraceContext::init("user_one", "ctx");
+    const std::string first = TraceContext::current()->traceId();
+    TraceContext::init("user_two", "ctx");
+    const std::string second = TraceContext::current()->traceId();
+
+    EXPECT_FALSE(first.empty());
+    EXPECT_FALSE(second.empty());
+    EXPECT_NE(first, second);
+}
+
 TEST(TraceContextTest, GenerateTraceSummary) {
     TraceContext::init("user_a", "");
     auto* ctx = TraceContext::current();

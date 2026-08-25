@@ -102,6 +102,22 @@ std::string MemoryService::getCrossAgentSummary(
     return summary;
 }
 
+void MemoryService::setCrossAgentSummaryFor(const std::string& context_id,
+                                            const std::string& agent_id,
+                                            const std::string& summary,
+                                            int ttl_seconds) {
+    // SETEX: the agent-specialized summary is a cache entry with a bounded
+    // lifetime (default 7 days), keyed per taking-over agent.
+    redis_->setex(summaryKeyFor(context_id, agent_id), ttl_seconds, summary);
+}
+
+std::string MemoryService::getCrossAgentSummaryFor(
+    const std::string& context_id, const std::string& agent_id) const {
+    std::string summary;
+    redis_->get(summaryKeyFor(context_id, agent_id), summary);
+    return summary;
+}
+
 // SystemContext construction
 agent_communication::SystemContext MemoryService::buildSystemContext(
     const std::string& user_id,

@@ -6,7 +6,9 @@
 #include "agent_rpc/server/query_helpers.h"
 #include "agent_rpc/common/metrics.h"
 #include "agent_rpc/common/logger.h"
+#include "agent_rpc/common/env_loader.h"
 #include "agent_rpc/common/memory_service.h"
+#include "agent_rpc/common/query_domain_repository.h"
 #include <a2a/llm_client.hpp>
 #include "ai_query.pb.h"
 
@@ -22,6 +24,60 @@
 
 namespace agent_rpc {
 namespace server {
+
+namespace {
+constexpr std::size_t kSummaryHistoryLimit = 20;
+}  // namespace
+
+QueryHelpers::~QueryHelpers() {
+    // Drain pending summary tasks so destruction never races with a live
+    // async worker and no detached task outlives this object.
+    std::vector<std::future<void>> pending;
+    {
+        std::lock_guard<std::mutex> lock(futures_mutex_);
+        pending.swap(pending_summaries_);
+    }
+    for (auto& future : pending) {
+        if (future.valid()) {
+            future.wait();  // tasks swallow their own exceptions
+        }
+    }
+}
+
+void QueryHelpers::reapFinishedSummaries() {
+    std::lock_guard<std::mutex> lock(futures_mutex_);
+    for (auto it = pending_summaries_.begin(); it != pending_summaries_.end();) {
+        if (it->valid() &&
+            it->wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+            try {
+                it->get();
+            } catch (...) {
+                // The task body already logs its own failures.
+            }
+            it = pending_summaries_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+std::string QueryHelpers::buildSummaryPrompt(const std::string& target_agent_name,
+                                             const std::string& target_agent_duties) {
+    std::string prompt =
+        "你是一个对话摘要助手。请用2-3句话简洁总结以下用户与助手的对话要点，"
+        "保留关键信息和上下文，以便下一个助手能够无缝接续对话。直接输出摘要，不要加前缀。";
+    if (!target_agent_name.empty() || !target_agent_duties.empty()) {
+        prompt += "\n即将接手的助手职责是：";
+        if (!target_agent_name.empty()) {
+            prompt += target_agent_name;
+        }
+        if (!target_agent_duties.empty()) {
+            prompt += "（技能/职责：" + target_agent_duties + "）";
+        }
+        prompt += "。只保留与其职责相关的信息。";
+    }
+    return prompt;
+}
 
 // The in-memory task-status cache was write-only: GetQueryStatus reads the
 // durable PostgreSQL query_logs row and nothing else ever consumed the cache,
@@ -97,50 +153,137 @@ std::string QueryHelpers::sanitizeErrorMessage(const std::string& msg) {
 void QueryHelpers::handleAgentSwitch(
     common::MemoryService* memory_service,
     void* memory_llm_client,
+    common::QueryDomainRepository* domain_repo,
     const std::string& user_id,
     const std::string& context_id,
-    const std::string& current_agent_id) {
+    const std::string& current_agent_id,
+    const std::string& target_agent_name,
+    const std::string& target_agent_duties) {
 
-    if (user_id.empty() || context_id.empty() || current_agent_id.empty()) return;
-
-    std::string last_agent = memory_service->getLastAgent(context_id);
-    if (last_agent.empty() || last_agent == current_agent_id) {
+    if (!memory_service || user_id.empty() || context_id.empty() ||
+        current_agent_id.empty()) {
         return;
     }
 
-    // Agent switched — generate summary asynchronously
-    LOG_INFO("Agent switch detected: " + last_agent + " → " + current_agent_id +
-             " (context: " + context_id + ")");
+    // Harvest finished summary tasks first so the pending vector stays bounded.
+    reapFinishedSummaries();
 
-    std::string old_history = memory_service->getConversationHistory(
-        context_id, last_agent, 20);
+    const std::string last_agent = memory_service->getLastAgent(context_id);
 
-    LLMClient* llm = static_cast<LLMClient*>(memory_llm_client);
+    // Tier-3 cross-agent summary. NEXUSAI_CROSS_AGENT_SUMMARY (default on)
+    // gates only the summary pipeline; the real last_agent recording below
+    // always happens.
+    const bool summary_enabled =
+        common::envOrDefault("NEXUSAI_CROSS_AGENT_SUMMARY", "1") != "0";
+    const bool agent_switched = !last_agent.empty() && last_agent != current_agent_id;
 
-    if (!old_history.empty() && llm) {
-        {
-            std::lock_guard<std::mutex> lock(memory_llm_mutex);
-            if (!summary_in_progress.insert(context_id).second) {
-                return;  // Another thread already generating for this context
+    if (summary_enabled && agent_switched) {
+        // Agent switched — generate summary asynchronously
+        LOG_INFO("Agent switch detected: " + last_agent + " → " + current_agent_id +
+                 " (context: " + context_id + ")");
+
+        // History source is PostgreSQL (the durable source of truth). The
+        // legacy Redis Tier-1 list was write-only on this path and therefore
+        // always returned empty; it remains only as a fallback when no
+        // domain repository is wired in.
+        std::string old_history;
+        if (domain_repo) {
+            const auto messages = domain_repo->listMessages(user_id, context_id);
+            const std::size_t start = messages.size() > kSummaryHistoryLimit
+                ? messages.size() - kSummaryHistoryLimit : 0;
+            for (std::size_t index = start; index < messages.size(); ++index) {
+                old_history += messages[index].role + ": " + messages[index].content + "\n";
             }
+        } else {
+            old_history = memory_service->getConversationHistory(
+                context_id, last_agent, static_cast<int>(kSummaryHistoryLimit));
         }
 
-        (void)std::async(std::launch::async,
-            [this, llm, context_id, old_history, memory_service]() {
+        LLMClient* llm = static_cast<LLMClient*>(memory_llm_client);
+
+        // Dedup key: when a summary specialized for the taking-over agent
+        // already exists, skip the LLM round-trip entirely.
+        const std::string existing_summary =
+            memory_service->getCrossAgentSummaryFor(context_id, current_agent_id);
+        const bool already_summarized = !existing_summary.empty();
+
+        if (!old_history.empty() && already_summarized) {
+            // Dedup hit: the specialized key (7-day TTL) may be fresher than
+            // the legacy context-level recall key read by P1 — e.g. the
+            // context key was overwritten by a later switch or externally
+            // cleared. Refresh it so recall never injects a stale summary
+            // within the dedup window. No LLM round-trip happens here.
+            memory_service->setCrossAgentSummary(context_id, existing_summary);
+        }
+
+        if (!old_history.empty() && !already_summarized && (llm || summarize_fn)) {
+            bool inserted = false;
+            {
+                // Critical section stays minimal: it guards only the
+                // in-progress bookkeeping set. The LLM call runs outside.
                 std::lock_guard<std::mutex> lock(memory_llm_mutex);
+                inserted = summary_in_progress.insert(context_id).second;
+            }
+            if (inserted) {
+                const std::string prompt =
+                    buildSummaryPrompt(target_agent_name, target_agent_duties);
+                const SummaryFn summary_fn = summarize_fn;  // copy into the task
+                std::future<void> task;
                 try {
-                    std::string summary = llm->chat(
-                        "你是一个对话摘要助手。请用2-3句话简洁总结以下用户与助手的对话要点，"
-                        "保留关键信息和上下文，以便下一个助手能够无缝接续对话。直接输出摘要，不要加前缀。",
-                        old_history);
-                    memory_service->setCrossAgentSummary(context_id, summary);
-                    LOG_INFO("Cross-agent summary generated for context: " + context_id);
+                    task = std::async(std::launch::async,
+                        [this, llm, summary_fn, prompt, old_history, memory_service,
+                         context_id, current_agent_id]() {
+                            try {
+                                const std::string summary = summary_fn
+                                    ? summary_fn(prompt, old_history)
+                                    : llm->chat(prompt, old_history);
+                                if (!summary.empty()) {
+                                    // Agent-scoped key with TTL plus the legacy
+                                    // context-only key, so the recall path
+                                    // (getCrossAgentSummary) keeps seeing fresh
+                                    // summaries.
+                                    memory_service->setCrossAgentSummaryFor(
+                                        context_id, current_agent_id, summary);
+                                    memory_service->setCrossAgentSummary(context_id, summary);
+                                    LOG_INFO("Cross-agent summary generated for context: " + context_id);
+                                }
+                            } catch (const std::exception& e) {
+                                LOG_WARN("Failed to generate cross-agent summary: " + std::string(e.what()));
+                            } catch (...) {
+                                LOG_WARN("Failed to generate cross-agent summary: unknown error");
+                            }
+                            // Only the bookkeeping erase runs under the lock.
+                            std::lock_guard<std::mutex> lock(memory_llm_mutex);
+                            summary_in_progress.erase(context_id);
+                        });
                 } catch (const std::exception& e) {
-                    LOG_WARN("Failed to generate cross-agent summary: " + std::string(e.what()));
+                    // Launch failed (resource exhaustion etc.): roll back the
+                    // in-progress marker, otherwise this context_id would be
+                    // permanently barred from summary generation.
+                    LOG_WARN("Failed to launch cross-agent summary task: " + std::string(e.what()));
+                    std::lock_guard<std::mutex> lock(memory_llm_mutex);
+                    summary_in_progress.erase(context_id);
+                } catch (...) {
+                    LOG_WARN("Failed to launch cross-agent summary task: unknown error");
+                    std::lock_guard<std::mutex> lock(memory_llm_mutex);
+                    summary_in_progress.erase(context_id);
                 }
-                summary_in_progress.erase(context_id);
-            });
+                try {
+                    std::lock_guard<std::mutex> lock(futures_mutex_);
+                    pending_summaries_.push_back(std::move(task));
+                } catch (...) {
+                    // push_back threw (bad_alloc): the future would otherwise
+                    // block on destruction; roll back the marker as well.
+                    std::lock_guard<std::mutex> lock(memory_llm_mutex);
+                    summary_in_progress.erase(context_id);
+                }
+            }
+        }
     }
+
+    // Converged last_agent write: always record the real agent id. The
+    // streaming path no longer writes a fake "default" placeholder.
+    memory_service->setLastAgent(context_id, current_agent_id);
 }
 
 std::string QueryHelpers::buildMemoryContext(

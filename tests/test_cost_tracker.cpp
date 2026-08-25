@@ -29,3 +29,21 @@ TEST(CostTrackerTest, FormatCostForBudgetCounter) {
     int64_t micro = CostTracker::toMicroDollars(cost);
     EXPECT_EQ(micro, 1234);
 }
+
+TEST(CostTrackerTest, EstimatedTokensProduceNonZeroCost) {
+    // P4: callers now pass estimated (non-zero) token counts. Even small
+    // estimates must produce a strictly positive cost instead of the old
+    // zero-token no-op.
+    double cost = CostTracker::calculateCost("estimate-model", 320, 240);
+    EXPECT_GT(cost, 0.0);
+}
+
+TEST(CostTrackerTest, EstimatedTokensRoundTripToMicroDollarIntegers) {
+    // Default pricing is $0.0005/1k prompt + $0.0015/1k completion, so
+    // 1000 + 1000 estimated tokens = $0.002 = 2000 micro-dollars exactly.
+    double cost = CostTracker::calculateCost("nonexistent-model", 1000, 1000);
+    EXPECT_GT(cost, 0.0);
+    int64_t micro = CostTracker::toMicroDollars(cost);
+    EXPECT_GT(micro, 0);
+    EXPECT_EQ(micro, 2000);
+}

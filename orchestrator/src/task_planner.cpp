@@ -56,14 +56,18 @@ ExecutionPlan TaskPlanner::plan(
         auto plan_end = std::chrono::steady_clock::now();
         int64_t plan_latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             plan_end - plan_start).count();
+        // Estimate-based accounting: LLMClient::chat() does not expose
+        // provider token usage, so tokens are estimated (64 message-skeleton
+        // tokens + ~4 bytes per token). Passing through provider usage is a
+        // long-term direction.
         agent_rpc::common::CostTracker::instance().recordLLMCall(
             trace ? trace->traceId() : "",
             "",            // user_id — not available at planner level
             "",            // context_id — not available at planner level
             "",            // no specific agent
             "planning",
-            0,             // prompt_tokens — LLMClient::chat() does not expose token usage
-            0,             // completion_tokens
+            static_cast<int>(64 + prompt.size() / 4),     // prompt_tokens (estimate)
+            static_cast<int>(response.size() / 4),        // completion_tokens (estimate)
             llm_client_->model(),
             plan_latency_ms
         );

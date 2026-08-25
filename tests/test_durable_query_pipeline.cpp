@@ -41,6 +41,7 @@
 #include "agent_rpc/common/query_domain_repository.h"
 #include "agent_rpc/a2a_adapter/a2a_config.h"
 #include "agent_rpc/server/rpc_server.h"
+#include "agent_rpc/server/multi_agent_handler.h"
 
 #include "ai_query.grpc.pb.h"
 #include "ai_query.pb.h"
@@ -1085,5 +1086,114 @@ TEST_F(DurableQueryPipelineTest, RedisFlushLeavesPostgresDataReadable) {
     EXPECT_TRUE(status.ok()) << status.error_message();
     EXPECT_EQ(queryLogStatus(user.id, second_request_id), "completed");
 }
+
+// ── P10: single-intent fast path ──────────────────────────────────────────
+
+#ifndef _WIN32
+class FastPathEnvGuard {
+public:
+    explicit FastPathEnvGuard(const char* name, const char* value) : name_(name) {
+        const char* old = ::getenv(name);
+        had_old_ = (old != nullptr);
+        if (had_old_) old_value_ = old;
+        if (value) {
+            ::setenv(name, value, 1);
+        } else {
+            ::unsetenv(name);
+        }
+    }
+    ~FastPathEnvGuard() {
+        if (had_old_) {
+            ::setenv(name_, old_value_.c_str(), 1);
+        } else {
+            ::unsetenv(name_);
+        }
+    }
+
+private:
+    const char* name_;
+    bool had_old_ = false;
+    std::string old_value_;
+};
+
+TEST(SingleIntentFastPathTest, MultiIntentDetectorVetoesParallelSignals) {
+    using server_ns::MultiAgentHandler;
+
+    // Parallel/sequence signals must veto the fast path (strict-by-design).
+    EXPECT_TRUE(MultiAgentHandler::hasMultiIntentSignals(
+        "帮我翻译这段话，然后再总结一下"));
+    EXPECT_TRUE(MultiAgentHandler::hasMultiIntentSignals("先部署服务，再运行测试"));
+    EXPECT_TRUE(MultiAgentHandler::hasMultiIntentSignals(
+        "请完成以下任务 1. 写代码 2. 写文档"));
+    // No-space Chinese numbered list: the second marker's previous byte is
+    // a CJK continuation byte, so the boundary check must not require
+    // ASCII whitespace (regression for the relaxed-boundary fix).
+    EXPECT_TRUE(MultiAgentHandler::hasMultiIntentSignals(
+        "1.写代码，2.写文档"));
+    EXPECT_TRUE(MultiAgentHandler::hasMultiIntentSignals(
+        "1、翻译这段 2、润色一下"));
+    EXPECT_TRUE(MultiAgentHandler::hasMultiIntentSignals(
+        "Translate this paragraph and then summarize it"));
+    EXPECT_TRUE(MultiAgentHandler::hasMultiIntentSignals(
+        "First deploy the service, then run the tests"));
+    EXPECT_TRUE(MultiAgentHandler::hasMultiIntentSignals(
+        "解释量子计算；顺便翻译摘要"));
+
+    // Plain single-intent queries carry no veto signal.
+    EXPECT_FALSE(MultiAgentHandler::hasMultiIntentSignals(
+        "帮我翻译这段话成英文"));
+    EXPECT_FALSE(MultiAgentHandler::hasMultiIntentSignals(
+        "What is the capital of France?"));
+    EXPECT_FALSE(MultiAgentHandler::hasMultiIntentSignals(
+        "解释一下量子计算的基本原理"));
+}
+
+TEST(SingleIntentFastPathTest, HighConfidenceSingleIntentSkipsPlanning) {
+    FastPathEnvGuard guard("NEXUSAI_SINGLE_INTENT_FAST_PATH", "1");
+
+    // All component pointers null: the fast path must build the plan
+    // WITHOUT touching the planner (calling plan() would crash here).
+    server_ns::MultiAgentHandler handler(nullptr, nullptr, nullptr,
+                                         nullptr, nullptr, nullptr);
+    handler.setFastPathSkillResolver(
+        [](const std::string&) {
+            return agent_rpc::orchestrator::AgentRouter::HighConfidenceSkill{
+                "translation", 0.93};
+        });
+
+    agent_rpc::orchestrator::ExecutionPlan plan;
+    ASSERT_TRUE(handler.tryBuildFastPathPlan("帮我翻译这段话成英文", plan));
+    EXPECT_TRUE(plan.is_single_agent);
+    EXPECT_EQ(plan.single_agent_skill, "translation");
+    EXPECT_EQ(plan.original_query, "帮我翻译这段话成英文");
+    EXPECT_TRUE(plan.tasks.empty());
+}
+
+TEST(SingleIntentFastPathTest, LowConfidenceOrMultiIntentGoesToPlanning) {
+    FastPathEnvGuard guard("NEXUSAI_SINGLE_INTENT_FAST_PATH", "1");
+
+    server_ns::MultiAgentHandler handler(nullptr, nullptr, nullptr,
+                                         nullptr, nullptr, nullptr);
+
+    // Low confidence / no hit → fast path declines, planning must run.
+    handler.setFastPathSkillResolver([](const std::string&) {
+        return std::nullopt;
+    });
+    agent_rpc::orchestrator::ExecutionPlan plan;
+    EXPECT_FALSE(handler.tryBuildFastPathPlan("帮我翻译这段话成英文", plan));
+
+    // High confidence but multi-intent signals → conservative veto.
+    handler.setFastPathSkillResolver([](const std::string&) {
+        return agent_rpc::orchestrator::AgentRouter::HighConfidenceSkill{
+            "translation", 0.95};
+    });
+    EXPECT_FALSE(handler.tryBuildFastPathPlan(
+        "帮我翻译这段话，然后再总结一下", plan));
+
+    // Switch off (default state) → fast path never applies, even with a hit.
+    FastPathEnvGuard off("NEXUSAI_SINGLE_INTENT_FAST_PATH", nullptr);
+    EXPECT_FALSE(handler.tryBuildFastPathPlan("帮我翻译这段话成英文", plan));
+}
+#endif  // !_WIN32
 
 }  // namespace

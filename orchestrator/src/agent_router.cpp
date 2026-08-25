@@ -5,6 +5,8 @@
 
 #include "agent_rpc/orchestrator/agent_router.h"
 #include "agent_rpc/common/redis_client.h"
+#include "agent_rpc/common/load_balancer.h"
+#include "agent_rpc/common/logger.h"
 #ifdef AGENT_RPC_ENABLE_MCP
 #include <agent_rpc/mcp/rag/embedding_service.h>
 #include <agent_rpc/mcp/rag/vector_index.h>
@@ -685,6 +687,17 @@ AgentInfo AgentRouter::selectWeightedByQualityWithFallback(const std::vector<Age
     // In that case, fall back to round-robin for fair load distribution.
     if (candidates.size() <= 1) return candidates[0];
 
+    // P8: optional load-balancer tier. When NEXUSAI_ROUTER_LB_STRATEGY is
+    // unset (or invalid), lb_manager_ stays null and the legacy path below
+    // runs byte-for-byte unchanged. Any failure inside the tier falls back
+    // to the same legacy path instead of dropping the request.
+    ensureLbInitialized();
+    if (lb_manager_) {
+        if (auto picked = selectViaLoadBalancer(candidates)) {
+            return *picked;
+        }
+    }
+
     // Compute quality coefficients; when the owner-aware provider has no
     // feedback for any candidate, all coefficients equal the neutral
     // default and round-robin keeps the load fair.
@@ -710,6 +723,137 @@ AgentInfo AgentRouter::selectWeightedByQualityWithFallback(const std::vector<Age
     }
 
     return selectWeightedByQuality(candidates);
+}
+
+namespace {
+
+// P8: map the NEXUSAI_ROUTER_LB_STRATEGY environment value onto the common
+// load-balance strategy enum. Unknown values yield nullopt; the caller logs
+// once and keeps the switch disabled (legacy routing).
+//
+// least_connections and shortest_response are intentionally NOT offered on
+// the server side: routing has no request-completion hook to release a
+// connection and no response-time data source, so those two strategies could
+// never behave as advertised here (their counters/stats stay empty and every
+// pick degrades to "first candidate"). The library implementations remain
+// available for the client SDK, which owns its connection lifecycle.
+std::optional<agent_rpc::common::LoadBalanceStrategy> parseLbStrategyName(
+    const std::string& raw) {
+    using agent_rpc::common::LoadBalanceStrategy;
+    if (raw == "round_robin") return LoadBalanceStrategy::ROUND_ROBIN;
+    if (raw == "random") return LoadBalanceStrategy::RANDOM;
+    if (raw == "weighted_round_robin") return LoadBalanceStrategy::WEIGHTED_ROUND_ROBIN;
+    if (raw == "consistent_hash") return LoadBalanceStrategy::CONSISTENT_HASH;
+    return std::nullopt;
+}
+
+} // namespace
+
+void AgentRouter::ensureLbInitialized() {
+    std::call_once(lb_init_flag_, [this]() {
+        const std::string raw =
+            common::envOrDefault("NEXUSAI_ROUTER_LB_STRATEGY", "");
+        if (raw.empty()) {
+            return;  // switch off: legacy routing, byte-for-byte unchanged
+        }
+        const auto parsed = parseLbStrategyName(raw);
+        if (!parsed) {
+            LOG_WARN("NEXUSAI_ROUTER_LB_STRATEGY has invalid value '" + raw +
+                     "', router load balancer stays disabled");
+            return;
+        }
+        lb_strategy_name_ = raw;
+        lb_manager_ =
+            std::make_unique<common::LoadBalancerManager>(*parsed);
+        LOG_INFO("Router load balancer enabled (NEXUSAI_ROUTER_LB_STRATEGY=" +
+                 raw + ", strategy=" + lb_manager_->getCurrentStrategyName() + ")");
+    });
+}
+
+std::optional<AgentInfo> AgentRouter::selectViaLoadBalancer(
+    const std::vector<AgentInfo>& candidates) {
+    // Composition semantics (P8):
+    // 1. Health filtering already happened when the candidate list was built
+    //    (skill match keeps healthy agents only, and circuit-broken agents
+    //    are excluded before candidates are assembled). The load balancer
+    //    therefore only decides among healthy candidates.
+    // 2. When every candidate carries the same quality coefficient (no
+    //    owner data), the tier degrades to round-robin — identical to the
+    //    legacy degenerate path.
+    std::vector<double> qcs;
+    qcs.reserve(candidates.size());
+    bool all_same = true;
+    for (const auto& agent : candidates) {
+        const std::string skill = agent.skills.empty() ? "" : agent.skills.front();
+        qcs.push_back(getQualityCoefficient(agent.id, skill));
+        if (qcs.size() > 1 && std::abs(qcs.back() - qcs[0]) > 0.001) {
+            all_same = false;
+        }
+    }
+    if (all_same) {
+        return selectRoundRobin(candidates);
+    }
+
+    try {
+        // AgentInfo -> ServiceEndpoint conversion. agent_id travels in
+        // metadata so the picked endpoint can be mapped back; the quality
+        // weight is exposed as round(q * 100) for weighted strategies.
+        std::vector<common::ServiceEndpoint> endpoints;
+        endpoints.reserve(candidates.size());
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            common::ServiceEndpoint ep;
+            ep.host = candidates[i].id;  // endpoint key, not a real host
+            ep.port = 0;
+            ep.service_name = candidates[i].name;
+            ep.is_healthy = candidates[i].is_healthy;
+            ep.metadata["agent_id"] = candidates[i].id;
+            ep.metadata["weight"] =
+                std::to_string(static_cast<int>(std::lround(qcs[i] * 100.0)));
+            endpoints.push_back(std::move(ep));
+        }
+
+        // Push the endpoint set into the load balancer ONLY when the
+        // candidate set changed. updateEndpoints() resets strategy state
+        // (round-robin cursor, weighted accumulators, hash ring), so calling
+        // it on every selection would defeat the strategies: round_robin
+        // would always pick the first candidate and weighted_round_robin
+        // would always pick the highest weight. The fingerprint is the
+        // ordered candidate id list; quality coefficients are intentionally
+        // NOT part of it — weight changes must not reset the accumulators.
+        std::string fingerprint;
+        fingerprint.reserve(candidates.size() * 16);
+        for (const auto& agent : candidates) {
+            fingerprint += agent.id;
+            fingerprint += ';';
+        }
+        {
+            std::lock_guard<std::mutex> lock(lb_fingerprint_mutex_);
+            if (fingerprint != lb_endpoint_fingerprint_) {
+                lb_manager_->updateEndpoints(endpoints);
+                lb_endpoint_fingerprint_ = fingerprint;
+            }
+        }
+        const common::ServiceEndpoint picked = lb_manager_->selectEndpoint(endpoints);
+
+        // Map the picked endpoint back onto the original AgentInfo.
+        auto id_it = picked.metadata.find("agent_id");
+        if (id_it != picked.metadata.end()) {
+            for (const auto& agent : candidates) {
+                if (agent.id == id_it->second) {
+                    return agent;
+                }
+            }
+        }
+        LOG_WARN("Router load balancer returned an unknown endpoint, falling back to legacy routing");
+        return std::nullopt;
+    } catch (const std::exception& e) {
+        LOG_WARN(std::string("Router load balancer selection failed: ") +
+                 e.what() + ", falling back to legacy routing");
+        return std::nullopt;
+    } catch (...) {
+        LOG_WARN("Router load balancer selection failed with unknown error, falling back to legacy routing");
+        return std::nullopt;
+    }
 }
 
 std::string AgentRouter::buildDynamicIntentPrompt(const std::string& user_text) const {
@@ -965,15 +1109,11 @@ void AgentRouter::buildSkillEmbeddingIndex() {
     }
 }
 
-std::string AgentRouter::analyzeRequiredSkillEmbedding(const std::string& question) {
-    if (!isEmbeddingEnabled()) return {};
-
-    embedding_query_count_.fetch_add(1);
-
-    std::lock_guard<std::mutex> lock(embedding_mutex_);
-
+std::optional<std::pair<std::string, double>>
+AgentRouter::searchBestSkillEmbeddingLocked(const std::string& question) {
+    // Requires embedding_mutex_ held. Cache-first embed: a question already
+    // embedded by another tier (e.g. the P10 fast path) is reused here.
     try {
-        // Embed the question (check cache first)
         std::vector<float> query_embedding;
         if (embedding_cache_) {
             auto cached = embedding_cache_->get(question);
@@ -989,21 +1129,47 @@ std::string AgentRouter::analyzeRequiredSkillEmbedding(const std::string& questi
             }
         }
 
-        // Search skill index
         auto search_results = skill_index_->search(query_embedding, 1, 0.0f);
-
         if (!search_results.empty()) {
             const auto& best = search_results[0];
-            if (best.similarity >= embedding_config_.high_threshold) {
-                embedding_hit_count_.fetch_add(1);
-                return best.tool.name;
-            }
+            return std::make_pair(best.tool.name,
+                                  static_cast<double>(best.similarity));
         }
     } catch (const std::exception&) {
         // Embedding failed, caller falls through to next tier
     }
+    return std::nullopt;
+}
+
+std::string AgentRouter::analyzeRequiredSkillEmbedding(const std::string& question) {
+    if (!isEmbeddingEnabled()) return {};
+
+    embedding_query_count_.fetch_add(1);
+
+    std::lock_guard<std::mutex> lock(embedding_mutex_);
+
+    auto best = searchBestSkillEmbeddingLocked(question);
+    if (best && best->second >= embedding_config_.high_threshold) {
+        embedding_hit_count_.fetch_add(1);
+        return best->first;
+    }
 
     return {};
+}
+
+std::optional<AgentRouter::HighConfidenceSkill>
+AgentRouter::resolveHighConfidenceSkill(const std::string& question) {
+    // P10: same embedding cache and index as the routing tier, so the fast
+    // path never pays an extra embed call when routing re-checks later.
+    if (!isEmbeddingEnabled()) return std::nullopt;
+
+    std::lock_guard<std::mutex> lock(embedding_mutex_);
+
+    auto best = searchBestSkillEmbeddingLocked(question);
+    if (best && best->second >= embedding_config_.high_threshold) {
+        return HighConfidenceSkill{best->first, best->second};
+    }
+    return std::nullopt;
 }
 
 #else
@@ -1019,6 +1185,12 @@ bool AgentRouter::isEmbeddingEnabled() const { return false; }
 void AgentRouter::buildSkillEmbeddingIndex() {}
 
 std::string AgentRouter::analyzeRequiredSkillEmbedding(const std::string&) { return {}; }
+
+std::optional<std::pair<std::string, double>>
+AgentRouter::searchBestSkillEmbeddingLocked(const std::string&) { return std::nullopt; }
+
+std::optional<AgentRouter::HighConfidenceSkill>
+AgentRouter::resolveHighConfidenceSkill(const std::string&) { return std::nullopt; }
 #endif
 
 std::string AgentRouter::findFallbackAgent(const std::string& skill_name, const std::string& exclude_agent_id) {

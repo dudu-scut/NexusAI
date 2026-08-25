@@ -8,6 +8,7 @@
 
 #include "agent_rpc/common/redis_client.h"
 #include "agent_rpc/common/memory_service.h"
+#include "agent_rpc/server/query_helpers.h"
 
 #include "ai_query.pb.h"
 
@@ -304,5 +305,164 @@ TEST_F(MemoryFixture, HistoryTrimming) {
 }
 
 // Authentication is PostgreSQL-backed and is covered by LocalAuthContractTest.
+
+// ============================================================================
+// Batch-1 memory loop: agent-specialized cross-agent summaries (P3)
+// ============================================================================
+
+TEST_F(MemoryFixture, CrossAgentSummaryForAgentScopedKey) {
+    auto ctx = testPrefix() + "_ctx";  // sanitization-safe (no colons)
+
+    // Absent key reads back empty.
+    EXPECT_EQ(memory->getCrossAgentSummaryFor(ctx, "agent-b"), "");
+
+    memory->setCrossAgentSummaryFor(ctx, "agent-b", "summary for agent-b");
+    EXPECT_EQ(memory->getCrossAgentSummaryFor(ctx, "agent-b"), "summary for agent-b");
+    // The agent-scoped key must not leak into the legacy context-only key.
+    EXPECT_EQ(memory->getCrossAgentSummary(ctx), "");
+
+    // Different agents get independent summaries for the same context.
+    memory->setCrossAgentSummaryFor(ctx, "agent-c", "summary for agent-c");
+    EXPECT_EQ(memory->getCrossAgentSummaryFor(ctx, "agent-b"), "summary for agent-b");
+    EXPECT_EQ(memory->getCrossAgentSummaryFor(ctx, "agent-c"), "summary for agent-c");
+
+    redis.del("nexusai:summary:" + ctx + ":agent-b");
+    redis.del("nexusai:summary:" + ctx + ":agent-c");
+}
+
+TEST(QueryHelpersPromptTest, BuildSummaryPromptContainsTargetDuties) {
+    const std::string prompt = server::QueryHelpers::buildSummaryPrompt(
+        "数学助手", "数学计算与公式推导");
+    EXPECT_NE(prompt.find("即将接手的助手职责是"), std::string::npos);
+    EXPECT_NE(prompt.find("数学助手"), std::string::npos);
+    EXPECT_NE(prompt.find("数学计算与公式推导"), std::string::npos);
+    EXPECT_NE(prompt.find("只保留与其职责相关的信息"), std::string::npos);
+
+    // Without target info the base prompt stays generic.
+    const std::string generic_prompt = server::QueryHelpers::buildSummaryPrompt("", "");
+    EXPECT_EQ(generic_prompt.find("即将接手的助手职责是"), std::string::npos);
+    EXPECT_NE(generic_prompt.find("对话摘要助手"), std::string::npos);
+}
+
+TEST_F(MemoryFixture, AgentSwitchGeneratesTargetSpecializedSummary) {
+    auto uid = testPrefix() + "_uid";
+    auto ctx = testPrefix() + "_ctx";
+
+    // Seed the previous agent's history (Redis Tier-1 fallback used when no
+    // QueryDomainRepository is wired in).
+    memory->setLastAgent(ctx, "agent-a");
+    memory->appendMessage(ctx, "agent-a", "user", "帮我推导二次方程求根公式");
+    memory->appendMessage(ctx, "agent-a", "agent", "好的，使用配方法……");
+    // appendMessage records the last agent; restore the switch baseline.
+    memory->setLastAgent(ctx, "agent-a");
+
+    int summarize_calls = 0;
+    std::string seen_prompt;
+    std::string seen_history;
+
+    {
+        server::QueryHelpers helpers;
+        helpers.summarize_fn = [&](const std::string& prompt,
+                                   const std::string& history) {
+            ++summarize_calls;
+            seen_prompt = prompt;
+            seen_history = history;
+            return "SUMMARY-OK";
+        };
+        helpers.handleAgentSwitch(memory.get(), nullptr, nullptr, uid, ctx,
+                                  "agent-b", "数学助手", "数学计算与公式推导");
+        // Destructor drains the pending summary future before assertions.
+    }
+
+    EXPECT_EQ(summarize_calls, 1);
+    // Prompt is specialized to the taking-over assistant's duties.
+    EXPECT_NE(seen_prompt.find("即将接手的助手职责是"), std::string::npos);
+    EXPECT_NE(seen_prompt.find("数学计算与公式推导"), std::string::npos);
+    // History came from the previous conversation.
+    EXPECT_NE(seen_history.find("二次方程求根公式"), std::string::npos);
+
+    // Agent-scoped key written AND legacy context-only key refreshed so the
+    // recall path (getCrossAgentSummary) sees the fresh summary.
+    EXPECT_EQ(memory->getCrossAgentSummaryFor(ctx, "agent-b"), "SUMMARY-OK");
+    EXPECT_EQ(memory->getCrossAgentSummary(ctx), "SUMMARY-OK");
+    // Converged last_agent write records the real agent id.
+    EXPECT_EQ(memory->getLastAgent(ctx), "agent-b");
+
+    redis.del("nexusai:conv:" + ctx + ":agent-a");
+    redis.del("nexusai:last_agent:" + ctx);
+    redis.del("nexusai:summary:" + ctx);
+    redis.del("nexusai:summary:" + ctx + ":agent-b");
+}
+
+TEST_F(MemoryFixture, AgentSwitchCacheHitSkipsSummarizer) {
+    auto uid = testPrefix() + "_uid";
+    auto ctx = testPrefix() + "_ctx";
+
+    memory->setLastAgent(ctx, "agent-a");
+    memory->appendMessage(ctx, "agent-a", "user", "任意历史内容");
+    memory->setLastAgent(ctx, "agent-a");
+
+    // A specialized summary for the taking-over agent already exists — the
+    // dedup key must short-circuit the LLM round-trip.
+    memory->setCrossAgentSummaryFor(ctx, "agent-b", "EXISTING-SUMMARY");
+
+    int summarize_calls = 0;
+    {
+        server::QueryHelpers helpers;
+        helpers.summarize_fn = [&](const std::string&, const std::string&) {
+            ++summarize_calls;
+            return std::string("NEVER-WRITTEN");
+        };
+        helpers.handleAgentSwitch(memory.get(), nullptr, nullptr, uid, ctx,
+                                  "agent-b", "数学助手", "数学计算");
+    }
+
+    EXPECT_EQ(summarize_calls, 0);
+    EXPECT_EQ(memory->getCrossAgentSummaryFor(ctx, "agent-b"), "EXISTING-SUMMARY");
+    // Dedup hit still refreshes the legacy context-level key: recall reads
+    // that key, so a fresh specialized summary must never coexist with a
+    // stale context-level one within the 7-day dedup window.
+    EXPECT_EQ(memory->getCrossAgentSummary(ctx), "EXISTING-SUMMARY");
+    // last_agent still converges on the real agent id.
+    EXPECT_EQ(memory->getLastAgent(ctx), "agent-b");
+
+    redis.del("nexusai:conv:" + ctx + ":agent-a");
+    redis.del("nexusai:last_agent:" + ctx);
+    redis.del("nexusai:summary:" + ctx + ":agent-b");
+}
+
+#ifndef _WIN32
+TEST_F(MemoryFixture, AgentSwitchHonorsCrossAgentSummarySwitch) {
+    auto uid = testPrefix() + "_uid";
+    auto ctx = testPrefix() + "_ctx";
+
+    memory->setLastAgent(ctx, "agent-a");
+    memory->appendMessage(ctx, "agent-a", "user", "任意历史内容");
+    memory->setLastAgent(ctx, "agent-a");
+
+    ::setenv("NEXUSAI_CROSS_AGENT_SUMMARY", "0", 1);
+
+    int summarize_calls = 0;
+    {
+        server::QueryHelpers helpers;
+        helpers.summarize_fn = [&](const std::string&, const std::string&) {
+            ++summarize_calls;
+            return std::string("NEVER-WRITTEN");
+        };
+        helpers.handleAgentSwitch(memory.get(), nullptr, nullptr, uid, ctx,
+                                  "agent-b", "翻译助手", "多语言翻译");
+    }
+
+    ::unsetenv("NEXUSAI_CROSS_AGENT_SUMMARY");
+
+    EXPECT_EQ(summarize_calls, 0);
+    EXPECT_EQ(memory->getCrossAgentSummary(ctx), "");
+    // The switch gates only the summary pipeline; last_agent is still written.
+    EXPECT_EQ(memory->getLastAgent(ctx), "agent-b");
+
+    redis.del("nexusai:conv:" + ctx + ":agent-a");
+    redis.del("nexusai:last_agent:" + ctx);
+}
+#endif  // _WIN32
 
 }  // namespace agent_rpc::tests

@@ -5,6 +5,7 @@
 
 #include "agent_rpc/orchestrator/task_executor.h"
 #include "agent_rpc/common/trace_context.h"
+#include "agent_rpc/common/env_loader.h"
 #include <algorithm>
 #include <chrono>
 #include <future>
@@ -119,6 +120,13 @@ std::unordered_map<std::string, SubTaskResult> TaskExecutor::execute(
                 parent_user_id = parent_trace->userId();
             }
 
+            // P5: cross-thread trace propagation (default on). When enabled,
+            // worker threads reuse the parent trace id and their completed
+            // spans are merged back into the parent TraceContext once every
+            // future of this layer has been collected.
+            const bool trace_propagation =
+                agent_rpc::common::envOrDefault("NEXUSAI_TRACE_PARENT_PROPAGATION", "1") != "0";
+
             for (const auto& tid : layer) {
                 auto it = task_map.find(tid);
                 if (it == task_map.end()) continue;
@@ -135,13 +143,26 @@ std::unordered_map<std::string, SubTaskResult> TaskExecutor::execute(
                 futures.emplace_back(tid,
                     std::async(std::launch::async,
                         [this, &st, p = std::move(prompt), &call_agent,
-                         parent_trace_id, parent_user_id]() {
-                            // Propagate trace context to subtask thread
-                            agent_rpc::common::TraceContext::init(parent_user_id, "");
+                         parent_trace_id, parent_user_id, trace_propagation]() {
+                            // Propagate trace context to subtask thread: reuse
+                            // the parent trace id when propagation is enabled,
+                            // otherwise keep the legacy fresh-id behavior.
+                            if (trace_propagation) {
+                                agent_rpc::common::TraceContext::init(
+                                    parent_user_id, "", parent_trace_id);
+                            } else {
+                                agent_rpc::common::TraceContext::init(parent_user_id, "");
+                            }
                             auto* trace = agent_rpc::common::TraceContext::current();
                             trace->startSpan("subtask_" + st.id, "executor");
                             auto result = executeSubtask(st, p, call_agent);
                             trace->endSpan();
+                            // Hand the worker-thread spans back to the parent
+                            // thread (copied before the thread-local context
+                            // is destroyed with the thread).
+                            if (trace_propagation) {
+                                result.child_spans = trace->completedSpans();
+                            }
                             return result;
                         }));
             }
@@ -190,6 +211,23 @@ std::unordered_map<std::string, SubTaskResult> TaskExecutor::execute(
                     }
 
                     results[tid] = std::move(r);
+                }
+            }
+
+            // P5: all futures of this layer are collected at this point, so
+            // merging worker-thread spans back into the parent TraceContext
+            // happens without any concurrency window. Timed-out/abandoned
+            // tasks carry empty child_spans, so nothing is merged for them.
+            if (trace_propagation && parent_trace) {
+                for (const auto& tid : layer) {
+                    auto rit = results.find(tid);
+                    if (rit == results.end() || rit->second.child_spans.empty()) {
+                        continue;
+                    }
+                    auto& parent_spans = parent_trace->mutableSpans();
+                    parent_spans.insert(parent_spans.end(),
+                                        rit->second.child_spans.begin(),
+                                        rit->second.child_spans.end());
                 }
             }
         }

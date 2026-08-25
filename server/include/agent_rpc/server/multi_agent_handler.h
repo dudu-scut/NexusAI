@@ -15,8 +15,10 @@
 #include "agent_rpc/orchestrator/result_aggregator.h"
 
 #include <grpcpp/grpcpp.h>
+#include <chrono>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace agent_communication {
@@ -98,6 +100,39 @@ public:
         grpc::ServerWriter<agent_communication::AIStreamEvent>* writer,
         const std::string& request_id);
 
+    // ── P10: single-intent fast path ────────────────────────────────────
+
+    /**
+     * @brief P10: conservative multi-intent signal detector.
+     *
+     * Public static so tests can pin the veto rules. Strict by design: any
+     * parallel/sequence signal (Chinese connectors such as 然后/并且/接着/
+     * 先…再, numbered lists "1."/"2.", English "and then"/"first…then",
+     * clause separators) vetoes the fast path and the query goes through
+     * full planning.
+     */
+    static bool hasMultiIntentSignals(const std::string& text);
+
+    /**
+     * @brief P10: injectable high-confidence skill resolver (test seam).
+     *
+     * When unset, agent_router_->resolveHighConfidenceSkill() is used.
+     */
+    using FastPathSkillFn = std::function<std::optional<
+        orchestrator::AgentRouter::HighConfidenceSkill>(const std::string&)>;
+    void setFastPathSkillResolver(FastPathSkillFn fn);
+
+    /**
+     * @brief P10: decide whether the single-intent fast path applies and,
+     * if so, fill a single-agent plan without any planning LLM call.
+     *
+     * Requires NEXUSAI_SINGLE_INTENT_FAST_PATH=1, a high-confidence skill
+     * hit, and no multi-intent signals. Only constructs the plan — it never
+     * emits stream events.
+     */
+    bool tryBuildFastPathPlan(const std::string& question,
+                              orchestrator::ExecutionPlan& plan);
+
 private:
     orchestrator::TaskPlanner* task_planner_;
     orchestrator::AgentRouter* agent_router_;
@@ -120,6 +155,24 @@ private:
     orchestrator::ExecutionPlan planQuery(const std::string& question);
     std::function<std::string(const std::string&, const std::string&)>
         buildCallAgent(const agent_communication::AIQueryRequest* request);
+
+    // P10: injected fast-path skill resolver (null → router embedding tier).
+    FastPathSkillFn fast_path_skill_resolver_;
+
+    // P10 helpers shared by the sync/stream fast-path fallback logic.
+    bool executeSingleAgentSync(const orchestrator::ExecutionPlan& plan,
+                                const agent_communication::AIQueryRequest& request,
+                                agent_communication::AIQueryResponse* response);
+
+    enum class SingleStreamOutcome { Success, Cancelled, Failed };
+    SingleStreamOutcome executeSingleAgentStream(
+        const orchestrator::ExecutionPlan& plan,
+        grpc::ServerContext* context,
+        const agent_communication::AIQueryRequest* request,
+        grpc::ServerWriter<agent_communication::AIStreamEvent>* writer,
+        const std::string& request_id,
+        std::chrono::steady_clock::time_point start_time,
+        bool fast_path_probe = false);
 };
 
 } // namespace server

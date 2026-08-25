@@ -45,6 +45,26 @@ public:
             std::chrono::system_clock::now().time_since_epoch()).count();
     }
 
+    // Cross-thread propagation overload: when existing_trace_id is non-empty
+    // the caller's trace id is reused so child threads attach to the same
+    // logical trace; when empty, behaves like the two-argument init and
+    // generates a fresh trace id. Independent overload on purpose — the
+    // two-argument version above is a byte-stable contract asserted by
+    // source-scanning tests and must keep its exact behavior/text.
+    static void init(const std::string& user_id, const std::string& context_id,
+                     const std::string& existing_trace_id) {
+        auto& tls = threadInstance();
+        tls.user_id_ = user_id;
+        tls.context_id_ = context_id;
+        tls.trace_id_ = existing_trace_id.empty() ? generateUUID() : existing_trace_id;
+        tls.spans_.clear();
+        tls.span_stack_.clear();
+        tls.depth_ = 0;
+        tls.start_steady_ = std::chrono::steady_clock::now();
+        tls.start_epoch_ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+
     static TraceContext* current() {
         return &threadInstance();
     }

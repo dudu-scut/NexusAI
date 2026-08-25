@@ -39,6 +39,14 @@ bool RedisClient::connect(const std::string& host, int port, int timeout_ms) {
         return false;
     }
 
+    // Command timeout: the connect timeout above only bounds the handshake.
+    // Without redisSetTimeout a stalled Redis (process alive, network
+    // partition) blocks redisCommand() reads indefinitely on the RPC thread.
+    // The same timeout bounds every command; failures degrade per-call.
+    if (redisSetTimeout(ctx_, tv) != REDIS_OK) {
+        LOG_WARN("Redis command timeout not applied, commands may block");
+    }
+
     LOG_INFO("Redis connected to " + host + ":" + std::to_string(port));
     return true;
 }
@@ -74,6 +82,11 @@ bool RedisClient::ensureConnected() {
             ctx_ = nullptr;
         }
         return false;
+    }
+    // Re-applied on every reconnect so lazy reconnection never drops the
+    // command-read timeout (see connect()).
+    if (redisSetTimeout(ctx_, tv) != REDIS_OK) {
+        LOG_WARN("Redis command timeout not applied on reconnect");
     }
     return true;
 }

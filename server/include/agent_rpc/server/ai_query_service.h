@@ -48,9 +48,13 @@ namespace server {
 // Defined in multi_agent_handler.cpp: the streaming multi-agent handler keeps
 // its accumulated answer/error in a thread-local slot instead of emitting
 // terminal stream events itself. The top-level QueryStream relay is the only
-// component allowed to emit "complete"/"error" events.
+// component allowed to emit "complete"/"error" events. The acting agent id/
+// name are handed back the same way so the streaming path can run the
+// agent-switch memory pipeline (last_agent + cross-agent summary).
 std::string takeMultiAgentStreamedAnswer();
 std::string takeMultiAgentStreamError();
+std::string takeMultiAgentStreamedAgentId();
+std::string takeMultiAgentStreamedAgentName();
 
 /**
  * @brief AI Query Service implementation
@@ -185,9 +189,12 @@ private:
     // as "rejected" before the caller returns RESOURCE_EXHAUSTED.
     grpc::Status reserveBudgetOrReject(DurableQueryRun& run);
     // Step 5: SystemContext assembled from PostgreSQL (Redis is cache-only).
+    // sandbox_request mirrors the write-side !request->sandbox() guard: when
+    // true, the Redis long-term-memory / summary recall is skipped.
     void buildSystemContextFromPg(const std::string& owner_id,
                                   const std::string& conversation_id,
-                                  agent_communication::SystemContext* system_context);
+                                  agent_communication::SystemContext* system_context,
+                                  bool sandbox_request = false);
     // Step 6: terminal persistence, executed at most once per run.
     void finalizeDurableQuery(DurableQueryRun& run, const std::string& status,
                               const std::string& response_text,
@@ -206,6 +213,17 @@ private:
                               const std::string& skill_name,
                               const std::string& status,
                               std::int64_t latency_ms);
+
+    // Agent-switch memory pipeline shared by Query() and QueryStream(): looks
+    // up the taking-over agent's name/duties from the router and drives
+    // helpers_.handleAgentSwitch (last_agent write + async cross-agent
+    // summary). Callers wrap this in runCacheOnly — Redis faults are
+    // swallowed and never affect the query outcome. agent_id must be the
+    // real acting agent (never "default" unless it really is one).
+    void writeAgentSwitchMemory(const std::string& owner_id,
+                                const std::string& context_id,
+                                const std::string& agent_id,
+                                const std::string& agent_name);
 
     // Non-owning; RpcServer owns the repository.
     common::AgentRuntimeRepository* invocation_repository_ = nullptr;
