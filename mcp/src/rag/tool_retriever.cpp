@@ -179,7 +179,7 @@ std::vector<RetrievedTool> ToolRetriever::retrieve(const std::string& query, int
     
     try {
         // Get the query embedding
-        std::vector<float> query_embedding = getEmbedding(query);
+        std::vector<float> query_embedding = embedding_service_->embed(query);
         
         // Search
         auto search_results = index_->search(

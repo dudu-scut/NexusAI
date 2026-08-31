@@ -340,9 +340,7 @@ public:
      * Returns the best-matching skill plus its similarity when the
      * embedding tier is enabled and the match reaches the configured
      * high threshold; nullopt otherwise (tier disabled, no hit, or below
-     * threshold). Shares the embedding cache with
-     * analyzeRequiredSkillEmbedding(), so a later routing pass does not
-     * pay a second embed call for the same question.
+     * threshold).
      */
     struct HighConfidenceSkill {
         std::string skill;
@@ -456,11 +454,10 @@ private:
     void buildSkillEmbeddingIndex();
 
     /**
-     * @brief P10: cache-first embed + best-skill search.
+     * @brief P10: embed + best-skill search.
      *
      * Must be called while holding embedding_mutex_. Shared by
-     * analyzeRequiredSkillEmbedding() and resolveHighConfidenceSkill() so
-     * both tiers reuse the same embedding cache.
+     * analyzeRequiredSkillEmbedding() and resolveHighConfidenceSkill().
      */
     std::optional<std::pair<std::string, double>>
     searchBestSkillEmbeddingLocked(const std::string& question);

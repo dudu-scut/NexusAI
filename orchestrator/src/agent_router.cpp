@@ -1111,24 +1111,9 @@ void AgentRouter::buildSkillEmbeddingIndex() {
 
 std::optional<std::pair<std::string, double>>
 AgentRouter::searchBestSkillEmbeddingLocked(const std::string& question) {
-    // Requires embedding_mutex_ held. Cache-first embed: a question already
-    // embedded by another tier (e.g. the P10 fast path) is reused here.
+    // Requires embedding_mutex_ held.
     try {
-        std::vector<float> query_embedding;
-        if (embedding_cache_) {
-            auto cached = embedding_cache_->get(question);
-            if (cached.has_value()) {
-                query_embedding = cached.value();
-            }
-        }
-
-        if (query_embedding.empty()) {
-            query_embedding = embedding_service_->embed(question);
-            if (embedding_cache_ && !query_embedding.empty()) {
-                embedding_cache_->put(question, query_embedding);
-            }
-        }
-
+        std::vector<float> query_embedding = embedding_service_->embed(question);
         auto search_results = skill_index_->search(query_embedding, 1, 0.0f);
         if (!search_results.empty()) {
             const auto& best = search_results[0];
@@ -1159,8 +1144,7 @@ std::string AgentRouter::analyzeRequiredSkillEmbedding(const std::string& questi
 
 std::optional<AgentRouter::HighConfidenceSkill>
 AgentRouter::resolveHighConfidenceSkill(const std::string& question) {
-    // P10: same embedding cache and index as the routing tier, so the fast
-    // path never pays an extra embed call when routing re-checks later.
+    // P10: shares the skill index with the routing tier.
     if (!isEmbeddingEnabled()) return std::nullopt;
 
     std::lock_guard<std::mutex> lock(embedding_mutex_);
