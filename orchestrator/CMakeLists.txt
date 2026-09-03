@@ -10,7 +10,6 @@ set(ORCHESTRATOR_SOURCES
     src/task_executor.cpp
     src/result_aggregator.cpp
     src/feedback_aggregator.cpp
-    src/context_compressor.cpp
     src/replay_service.cpp
     src/cron_scheduler.cpp           # Batch 6
     src/export_service.cpp           # Batch 6
@@ -24,7 +23,6 @@ set(ORCHESTRATOR_HEADERS
     include/agent_rpc/orchestrator/task_executor.h
     include/agent_rpc/orchestrator/result_aggregator.h
     include/agent_rpc/orchestrator/feedback_aggregator.h
-    include/agent_rpc/orchestrator/context_compressor.h
     include/agent_rpc/orchestrator/cron_scheduler.h    # Batch 6
     include/agent_rpc/orchestrator/export_service.h    # Batch 6
 )
@@ -61,7 +59,9 @@ if(ENABLE_MCP)
         ${CMAKE_CURRENT_SOURCE_DIR}/../mcp/include
     )
     target_link_libraries(orchestrator PUBLIC agent_rpc_mcp)
-    target_compile_definitions(orchestrator PRIVATE AGENT_RPC_ENABLE_MCP=1)
+    # P20 遗留 ODR 根治：PUBLIC 传播编译宏，使链接本库的测试 TU 与库内
+    # AgentRouter 类布局一致（PRIVATE 曾导致 MCP 构建下堆损坏）。
+    target_compile_definitions(orchestrator PUBLIC AGENT_RPC_ENABLE_MCP=1)
 endif()
 
 # Embedding routing requires C++20 (MCP module uses C++20)

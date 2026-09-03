@@ -374,3 +374,17 @@ test('CMake resolves libpqxx through config targets or pkg-config fallback', () 
   assert.match(resolver, /pkg_check_modules\(AGENT_RPC_LIBPQXX REQUIRED IMPORTED_TARGET libpqxx\)/);
   assert.match(resolver, /PkgConfig::AGENT_RPC_LIBPQXX/);
 });
+
+// P15 P0(c): the generic proxy forwards OrchestrationService RPCs
+
+test('proxy forwards OrchestrationService RPCs (ExecutePlan/ReplayQuery/ExportConversation)', () => {
+  const server = read('gateway/proxy/server.mjs');
+  // The OrchestrationService client is registered at startup (no allowlist).
+  assert.match(server, /clients\['agent_communication\.OrchestrationService'\]/);
+  // Generic dynamic forwarding maps any service/method through the
+  // registered client via camelCase conversion ¡ª ExecutePlan/ReplayQuery/
+  // ExportConversation all reach the server through unaryCall/streamCall.
+  assert.match(server, /const grpcMethod = methodName\[0\]\.toLowerCase\(\) \+ methodName\.slice\(1\);/);
+  assert.match(server, /function unaryCall\(serviceName, methodName, body, metadata\)/);
+  assert.match(server, /function streamCall\(serviceName, methodName, body, metadata, res\)/);
+});

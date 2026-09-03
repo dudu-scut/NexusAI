@@ -5,9 +5,11 @@
 #include "../models/message_send_params.hpp"
 #include "../models/a2a_response.hpp"
 #include "../core/http_client.hpp"
+#include <atomic>
 #include <string>
 #include <memory>
 #include <functional>
+#include <vector>
 
 namespace a2a {
 
@@ -77,6 +79,21 @@ public:
      * @param seconds Timeout in seconds
      */
     void set_timeout(long seconds);
+
+    /**
+     * @brief Attach an abort flag checked during transfers (P20).
+     * Forwarded to the underlying HttpClient; see HttpClient::set_abort_flag.
+     * @param flag  Pointer to an external atomic abort flag (may be null)
+     */
+    void set_abort_flag(const std::atomic<bool>* flag);
+
+    /**
+     * @brief Pin host→IP mappings for the next transfers (P21 L2).
+     * Forwarded to the underlying HttpClient; see
+     * HttpClient::set_resolve_entries.
+     * @param entries  "host:port:ip" strings, one per validated address
+     */
+    void set_resolve_entries(const std::vector<std::string>& entries);
 
     /**
      * @brief Add a custom HTTP header to all outgoing requests

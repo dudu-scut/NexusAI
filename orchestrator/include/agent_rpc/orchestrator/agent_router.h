@@ -26,6 +26,9 @@ namespace agent_rpc { namespace mcp { namespace rag {
     class VectorIndex;
     class EmbeddingCache;
 }}}
+namespace agent_rpc { namespace mcp {
+    class SemanticCacheIndex;
+}}
 #endif
 
 // Forward declaration for LLM-based intent classification
@@ -358,9 +361,22 @@ private:
      *   Embedding(high) → LLM → Keyword → Fallback
      *
      * @param question User input text
+     * @param out_query_vector When non-null and the embedding tier is
+     *        enabled, receives the query embedding — reused by the P10(c)
+     *        intent cache so caching never pays an extra embed call.
      * @return Skill name if high-confidence match found, empty string otherwise
      */
-    std::string analyzeRequiredSkillEmbedding(const std::string& question);
+    std::string analyzeRequiredSkillEmbedding(
+        const std::string& question,
+        std::vector<float>* out_query_vector = nullptr);
+
+    /**
+     * @brief P10(c): store a resolved intent for the given query vector.
+     * Only acts when the intent cache exists (NEXUSAI_INTENT_CACHE=1);
+     * lazy cleanup runs before the store to keep expired entries bounded.
+     */
+    void storeIntentCache(const std::vector<float>& query_vector,
+                          const std::string& skill);
 
     /**
      * @brief Check if embedding routing is enabled
@@ -462,6 +478,14 @@ private:
     std::optional<std::pair<std::string, double>>
     searchBestSkillEmbeddingLocked(const std::string& question);
 
+    /**
+     * @brief P10: best-skill search over an already-computed query vector.
+     * Must be called while holding embedding_mutex_ (P10(c) intent cache
+     * reuses the vector the tier already embedded).
+     */
+    std::optional<std::pair<std::string, double>>
+    searchBestSkillEmbeddingLockedWithVector(const std::vector<float>& query_vector);
+
     mutable std::mutex agents_mutex_;
     std::unordered_map<std::string, AgentInfo> agents_;
     std::atomic<RoutingStrategy> strategy_{RoutingStrategy::SKILL_MATCH};
@@ -485,6 +509,10 @@ private:
     std::unique_ptr<agent_rpc::mcp::rag::EmbeddingService> embedding_service_;
     std::unique_ptr<agent_rpc::mcp::rag::VectorIndex> skill_index_;
     std::unique_ptr<agent_rpc::mcp::rag::EmbeddingCache> embedding_cache_;
+    // P10(c): intent cache — similar queries reuse the intent skill without
+    // an LLM classification call. Created when NEXUSAI_INTENT_CACHE=1 and
+    // the embedding tier is enabled; lookup shares the tier's query vector.
+    std::unique_ptr<agent_rpc::mcp::SemanticCacheIndex> intent_cache_;
 #endif
     mutable std::mutex embedding_mutex_;
     std::atomic<uint64_t> embedding_query_count_{0};

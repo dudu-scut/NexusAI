@@ -24,6 +24,9 @@ import type {
   ReplayQueryResponse,
   ExportConversationRequest,
   ExportConversationResponse,
+  DAGStructure,
+  ExecutePlanRequest,
+  ExecutePlanResponse,
   ShareSessionRequest,
   ShareSessionResponse,
   ReadSharedConversationRequest,
@@ -340,7 +343,16 @@ export async function getCostReport(
   }
 }
 
-// OrchestrationService — Replay / Export
+// OrchestrationService — ExecutePlan / Replay / Export
+
+/** Execute a user-approved (or user-modified) DAG plan (U4). */
+export async function executePlan(
+  dag: DAGStructure,
+  contextId: string,
+): Promise<ExecutePlanResponse> {
+  const req: ExecutePlanRequest = { dag, context_id: contextId, user_id: '' }
+  return unaryCall<ExecutePlanRequest, ExecutePlanResponse>(ORCHESTRATION, 'ExecutePlan', req)
+}
 
 /** Replay a traced query (mode: "exact" = re-execute, "route" = route comparison) */
 export async function replayQuery(

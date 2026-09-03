@@ -23,12 +23,22 @@ TaskExecutor::TaskExecutor(AgentRouter& router, const ExecutorConfig& config)
 std::unordered_map<std::string, SubTaskResult> TaskExecutor::execute(
     const ExecutionPlan& plan,
     const AgentCallFn& call_agent,
-    const ProgressCallback& on_progress) {
+    const ProgressCallback& on_progress,
+    const CancelFn& on_cancel) {
 
     std::unordered_map<std::string, SubTaskResult> results;
 
     auto global_start = std::chrono::steady_clock::now();
     auto global_deadline = global_start + std::chrono::seconds(config_.global_timeout_seconds);
+
+    // P20: per-subtask wait cap — subtask_timeout_seconds is now honored for
+    // the first time (previously declared and assigned but never read). A
+    // non-positive value disables the cap and falls back to the remaining
+    // global budget.
+    const std::chrono::milliseconds subtask_cap =
+        (config_.subtask_timeout_seconds > 0)
+        ? std::chrono::milliseconds(static_cast<long long>(config_.subtask_timeout_seconds) * 1000)
+        : std::chrono::milliseconds::max();
 
     // Topological sort into layers
     auto layers = topologicalLayers(plan.tasks);
@@ -61,7 +71,11 @@ std::unordered_map<std::string, SubTaskResult> TaskExecutor::execute(
         }
 
         if (layer.size() == 1) {
-            // Single subtask — execute directly, no async overhead
+            // Single subtask — P20: run on a worker thread like the parallel
+            // branch. The legacy synchronous path only checked the global
+            // deadline at the start, so a lone subtask could overrun without
+            // bound; waiting with a deadline caps the overrun and enables
+            // cancellation of the in-flight call.
             const auto& tid = layer[0];
             auto it = task_map.find(tid);
             if (it == task_map.end()) { ++layer_idx; continue; }
@@ -97,13 +111,90 @@ std::unordered_map<std::string, SubTaskResult> TaskExecutor::execute(
                 break;
             }
 
-            SubTaskResult result = executeSubtask(st, prompt, call_agent);
+            // Pre-resolve the target so a timeout can cancel the matching
+            // in-flight call; the same target is handed to the worker so the
+            // executed URL and the cancelled URL can never diverge.
+            std::string cancel_url;
+            std::string cancel_agent_id;
+            try {
+                auto target = resolveAgent(st);
+                cancel_url = target.first;
+                cancel_agent_id = target.second;
+            } catch (const std::exception& e) {
+                SubTaskResult r;
+                r.subtask_id = tid;
+                r.success = false;
+                r.error_message = e.what();
+                if (on_progress) {
+                    on_progress({SubTaskEventType::FAILED, tid, r.error_message});
+                }
+                results[tid] = std::move(r);
+                ++layer_idx;
+                continue;
+            }
+
+            // Capture parent trace context for subtask thread propagation
+            std::string parent_trace_id;
+            std::string parent_user_id;
+            auto* parent_trace = agent_rpc::common::TraceContext::current();
+            if (parent_trace) {
+                parent_trace_id = parent_trace->traceId();
+                parent_user_id = parent_trace->userId();
+            }
+            const bool trace_propagation =
+                agent_rpc::common::envOrDefault("NEXUSAI_TRACE_PARENT_PROPAGATION", "1") != "0";
+
+            auto fut = std::async(std::launch::async,
+                [this, &st, p = std::move(prompt), &call_agent,
+                 cancel_url, cancel_agent_id,
+                 parent_trace_id, parent_user_id, trace_propagation]() {
+                    if (trace_propagation) {
+                        agent_rpc::common::TraceContext::init(
+                            parent_user_id, "", parent_trace_id);
+                    } else {
+                        agent_rpc::common::TraceContext::init(parent_user_id, "");
+                    }
+                    auto* trace = agent_rpc::common::TraceContext::current();
+                    trace->startSpan("subtask_" + st.id, "executor");
+                    auto result = executeSubtask(
+                        st, p, call_agent, cancel_url, cancel_agent_id);
+                    trace->endSpan();
+                    if (trace_propagation) {
+                        result.child_spans = trace->completedSpans();
+                    }
+                    return result;
+                });
+
+            SubTaskResult result;
+            auto remaining_now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                global_deadline - std::chrono::steady_clock::now());
+            auto wait_for = std::min(subtask_cap, remaining_now);
+            auto status = fut.wait_for(wait_for);
+            if (status == std::future_status::ready) {
+                result = fut.get();
+            } else {
+                result.subtask_id = tid;
+                result.success = false;
+                result.error_message = "Subtask timeout exceeded";
+                // P20: abort the in-flight A2A call instead of leaving a
+                // zombie thread blocked until its HTTP timeout.
+                if (on_cancel && !cancel_url.empty()) {
+                    on_cancel(cancel_url);
+                }
+            }
 
             if (on_progress) {
                 SubTaskEventType evt_type = result.success
                     ? SubTaskEventType::COMPLETE : SubTaskEventType::FAILED;
                 on_progress({evt_type, tid,
                     result.success ? result.result : result.error_message});
+            }
+
+            if (trace_propagation && parent_trace && !result.child_spans.empty()) {
+                auto& parent_spans = parent_trace->mutableSpans();
+                parent_spans.insert(parent_spans.end(),
+                                    result.child_spans.begin(),
+                                    result.child_spans.end());
             }
 
             results[tid] = std::move(result);
@@ -127,9 +218,31 @@ std::unordered_map<std::string, SubTaskResult> TaskExecutor::execute(
             const bool trace_propagation =
                 agent_rpc::common::envOrDefault("NEXUSAI_TRACE_PARENT_PROPAGATION", "1") != "0";
 
+            // Pre-resolve each target so a timeout can cancel the matching
+            // in-flight call and the worker uses the SAME target (no second
+            // routing pass — routing fallbacks are non-deterministic).
+            std::unordered_map<std::string, std::pair<std::string, std::string>>
+                layer_targets;
             for (const auto& tid : layer) {
                 auto it = task_map.find(tid);
                 if (it == task_map.end()) continue;
+                try {
+                    layer_targets[tid] = resolveAgent(*it->second);
+                } catch (const std::exception& e) {
+                    SubTaskResult r;
+                    r.subtask_id = tid;
+                    r.success = false;
+                    r.error_message = e.what();
+                    if (on_progress) {
+                        on_progress({SubTaskEventType::FAILED, tid, r.error_message});
+                    }
+                    results[tid] = std::move(r);
+                }
+            }
+
+            for (const auto& tid : layer) {
+                auto it = task_map.find(tid);
+                if (it == task_map.end() || results.count(tid) != 0) continue;
 
                 const SubTask& st = *it->second;
                 std::string prompt = buildSubtaskPrompt(st, results);
@@ -138,11 +251,16 @@ std::unordered_map<std::string, SubTaskResult> TaskExecutor::execute(
                     on_progress({SubTaskEventType::START, tid, ""});
                 }
 
+                const auto& target = layer_targets.at(tid);
+                const std::string cancel_url = target.first;
+                const std::string cancel_agent_id = target.second;
+
                 // Capture st by reference (valid throughout layer execution)
                 // and prompt by value (moved into lambda)
                 futures.emplace_back(tid,
                     std::async(std::launch::async,
                         [this, &st, p = std::move(prompt), &call_agent,
+                         cancel_url, cancel_agent_id,
                          parent_trace_id, parent_user_id, trace_propagation]() {
                             // Propagate trace context to subtask thread: reuse
                             // the parent trace id when propagation is enabled,
@@ -155,7 +273,8 @@ std::unordered_map<std::string, SubTaskResult> TaskExecutor::execute(
                             }
                             auto* trace = agent_rpc::common::TraceContext::current();
                             trace->startSpan("subtask_" + st.id, "executor");
-                            auto result = executeSubtask(st, p, call_agent);
+                            auto result = executeSubtask(
+                                st, p, call_agent, cancel_url, cancel_agent_id);
                             trace->endSpan();
                             // Hand the worker-thread spans back to the parent
                             // thread (copied before the thread-local context
@@ -182,13 +301,22 @@ std::unordered_map<std::string, SubTaskResult> TaskExecutor::execute(
                         result.success = false;
                         result.error_message = "Global timeout exceeded";
                     } else {
-                        auto status = fut.wait_for(remaining);
+                        // P20: wait no longer than the per-subtask cap OR the
+                        // remaining global budget, whichever is tighter.
+                        auto wait_for = std::min(subtask_cap, remaining);
+                        auto status = fut.wait_for(wait_for);
                         if (status == std::future_status::ready) {
                             result = fut.get();
                         } else {
                             result.subtask_id = tid;
                             result.success = false;
                             result.error_message = "Global timeout exceeded (task did not complete in time)";
+                            // P20: abort the in-flight A2A call.
+                            auto target_it = layer_targets.find(tid);
+                            if (on_cancel && target_it != layer_targets.end() &&
+                                !target_it->second.first.empty()) {
+                                on_cancel(target_it->second.first);
+                            }
                         }
                     }
 
@@ -338,10 +466,38 @@ std::string TaskExecutor::buildSubtaskPrompt(
     return prompt;
 }
 
+std::pair<std::string, std::string> TaskExecutor::resolveAgent(
+    const SubTask& subtask) const {
+
+    // Resolve agent URL: prefer pre-resolved agent, fallback to skill routing
+    if (!subtask.preferred_agent_id.empty()) {
+        auto agent = router_.getAgent(subtask.preferred_agent_id);
+        if (agent.has_value() && agent->is_healthy) {
+            return {agent->url, subtask.preferred_agent_id};
+        }
+    }
+
+    // Fallback: route by skill (preferred agent unavailable or not set)
+    std::vector<std::string> skills;
+    if (!subtask.required_skill.empty()) {
+        skills.push_back(subtask.required_skill);
+    }
+    auto agent = router_.selectAgent(subtask.description, skills);
+    if (agent.has_value()) {
+        return {agent->url, agent->id};
+    }
+
+    throw std::runtime_error(
+        "No agent available for subtask: " + subtask.id +
+        " (skill: " + subtask.required_skill + ")");
+}
+
 SubTaskResult TaskExecutor::executeSubtask(
     const SubTask& subtask,
     const std::string& enriched_prompt,
-    const AgentCallFn& call_agent) {
+    const AgentCallFn& call_agent,
+    const std::string& pre_resolved_url,
+    const std::string& pre_resolved_agent_id) {
 
     SubTaskResult result;
     result.subtask_id = subtask.id;
@@ -350,31 +506,15 @@ SubTaskResult TaskExecutor::executeSubtask(
     auto start = std::chrono::steady_clock::now();
 
     try {
-        // Resolve agent URL: prefer pre-resolved agent, fallback to skill routing
-        std::string agent_url;
-
-        if (!subtask.preferred_agent_id.empty()) {
-            auto agent = router_.getAgent(subtask.preferred_agent_id);
-            if (agent.has_value() && agent->is_healthy) {
-                agent_url = agent->url;
-            }
-        }
-
+        std::string agent_url = pre_resolved_url;
+        std::string agent_id = pre_resolved_agent_id;
         if (agent_url.empty()) {
-            // Fallback: route by skill (preferred agent unavailable or not set)
-            std::vector<std::string> skills;
-            if (!subtask.required_skill.empty()) {
-                skills.push_back(subtask.required_skill);
-            }
-            auto agent = router_.selectAgent(subtask.description, skills);
-            if (agent.has_value()) {
-                agent_url = agent->url;
-            } else {
-                throw std::runtime_error(
-                    "No agent available for subtask: " + subtask.id +
-                    " (skill: " + subtask.required_skill + ")");
-            }
+            // Legacy path (direct executeSubtask callers): resolve here.
+            auto target = resolveAgent(subtask);
+            agent_url = target.first;
+            agent_id = target.second;
         }
+        result.agent_id = agent_id;
 
         std::string response = call_agent(agent_url, enriched_prompt);
 

@@ -1,6 +1,7 @@
 #include <a2a/core/http_client.hpp>
 #include <a2a/core/exception.hpp>
 #include <curl/curl.h>
+#include <atomic>
 #include <sstream>
 #include <cstring>
 
@@ -29,6 +30,15 @@ static size_t write_callback(void* contents, size_t size, size_t nmemb, void* us
     std::string* response = static_cast<std::string*>(userp);
     response->append(static_cast<char*>(contents), total_size);
     return total_size;
+}
+
+// Progress callback used as the in-flight abort channel: returning 1 aborts
+// the transfer with CURLE_ABORTED_BY_CALLBACK (P20: DAG subtask cancellation).
+static int abort_check_callback(void* clientp, curl_off_t /*dltotal*/,
+                                curl_off_t /*dlnow*/, curl_off_t /*ultotal*/,
+                                curl_off_t /*ulnow*/) {
+    const auto* flag = static_cast<const std::atomic<bool>*>(clientp);
+    return (flag && flag->load(std::memory_order_relaxed)) ? 1 : 0;
 }
 
 /**
@@ -207,6 +217,8 @@ public:
     
     long timeout_;
     std::map<std::string, std::string> headers_;
+    const std::atomic<bool>* abort_flag_ = nullptr;
+    std::vector<std::string> resolve_entries_;
 };
 
 HttpClient::HttpClient() : impl_(std::make_unique<Impl>()) {}
@@ -215,6 +227,14 @@ HttpClient::~HttpClient() = default;
 
 HttpClient::HttpClient(HttpClient&&) noexcept = default;
 HttpClient& HttpClient::operator=(HttpClient&&) noexcept = default;
+
+void HttpClient::set_abort_flag(const std::atomic<bool>* flag) {
+    impl_->abort_flag_ = flag;
+}
+
+void HttpClient::set_resolve_entries(const std::vector<std::string>& entries) {
+    impl_->resolve_entries_ = entries;
+}
 
 HttpResponse HttpClient::get(const std::string& url) {
     CURL* curl = curl_easy_init();
@@ -282,6 +302,20 @@ HttpResponse HttpClient::post(const std::string& url,
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_body);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, impl_->timeout_);
+    // P20: in-flight abort channel (DAG subtask cancellation).
+    if (impl_->abort_flag_) {
+        curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+        curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, abort_check_callback);
+        curl_easy_setopt(curl, CURLOPT_XFERINFODATA, impl_->abort_flag_);
+    }
+    // P21 L2: pin validated host→IP mappings for this transfer.
+    struct curl_slist* resolve_list = nullptr;
+    for (const auto& entry : impl_->resolve_entries_) {
+        resolve_list = curl_slist_append(resolve_list, entry.c_str());
+    }
+    if (resolve_list) {
+        curl_easy_setopt(curl, CURLOPT_RESOLVE, resolve_list);
+    }
     
     // Set headers
     struct curl_slist* header_list = nullptr;
@@ -297,6 +331,7 @@ HttpResponse HttpClient::post(const std::string& url,
     CURLcode res = curl_easy_perform(curl);
     
     if (res != CURLE_OK) {
+        curl_slist_free_all(resolve_list);
         curl_slist_free_all(header_list);
         curl_easy_cleanup(curl);
         throw A2AException(
@@ -311,6 +346,7 @@ HttpResponse HttpClient::post(const std::string& url,
     response.status_code = static_cast<int>(status_code);
     response.body = response_body;
     
+    curl_slist_free_all(resolve_list);
     curl_slist_free_all(header_list);
     curl_easy_cleanup(curl);
     
@@ -342,6 +378,12 @@ void HttpClient::post_stream(const std::string& url,
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 300L);  // Total timeout: prevent a malicious server from holding the connection forever
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);  // Minimum speed: 1 byte/s
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 60L);  // Timeout if below minimum speed for 60s
+    // P20: in-flight abort channel (DAG subtask cancellation).
+    if (impl_->abort_flag_) {
+        curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+        curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, abort_check_callback);
+        curl_easy_setopt(curl, CURLOPT_XFERINFODATA, impl_->abort_flag_);
+    }
     
     // Set headers
     struct curl_slist* header_list = nullptr;

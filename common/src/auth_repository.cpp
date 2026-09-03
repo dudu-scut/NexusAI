@@ -137,6 +137,40 @@ std::optional<AuthSessionRecord> AuthRepository::findActiveSessionByTokenHash(
     return session;
 }
 
+std::optional<AuthSessionWithUser> AuthRepository::findActiveSessionWithUserByTokenHash(
+    const std::string& token_hash) {
+    // P22 A: single round-trip replaces the previous session + user pair of
+    // lookups. password_scrypt is not selected on purpose.
+    std::optional<AuthSessionWithUser> session_with_user;
+    store_.executeTransaction([&](pqxx::work& transaction) {
+        const auto result = execParams(
+            transaction,
+            "SELECT s.id, s.owner_id, s.token_hash, s.expires_at::text AS expires_at, "
+            "s.revoked_at::text AS revoked_at, s.created_at::text AS created_at, "
+            "s.updated_at::text AS updated_at, u.id AS user_id, u.username, u.role "
+            "FROM auth_sessions s JOIN users u ON u.id = s.owner_id "
+            "WHERE s.token_hash = $1 AND s.revoked_at IS NULL "
+            "AND s.expires_at > NOW()",
+            token_hash);
+        if (!result.empty()) {
+            const auto& row = result.front();
+            AuthSessionWithUser joined;
+            joined.session = sessionFromRow(row);
+            joined.user_id = row["user_id"].is_null()
+                                 ? std::string{}
+                                 : row["user_id"].template as<std::string>();
+            joined.username = row["username"].is_null()
+                                  ? std::string{}
+                                  : row["username"].template as<std::string>();
+            joined.role = row["role"].is_null()
+                              ? std::string{}
+                              : row["role"].template as<std::string>();
+            session_with_user = std::move(joined);
+        }
+    });
+    return session_with_user;
+}
+
 bool AuthRepository::revokeSession(const std::string& session_id) {
     bool revoked = false;
     store_.executeTransaction([&](pqxx::work& transaction) {

@@ -80,6 +80,38 @@ public:
     static void evaluateAllHealth();
 
     /**
+     * @brief Iterate all tracked agents and evaluate health, invoking a
+     * callback per evaluated agent. The callback runs OUTSIDE the metrics
+     * lock so it may safely take router locks (lock-order rule: never hold
+     * the metrics lock while calling into the router). Agents with fewer
+     * than kMinHealthSamples recorded writes are skipped (cold-start
+     * protection). A null callback keeps the logging-only behavior of the
+     * no-argument overload.
+     *
+     * @param callback  (agent_id, status) invoked per evaluated agent
+     */
+    static void evaluateAllHealth(
+        const std::function<void(const std::string&, HealthStatus)>& callback);
+
+    /**
+     * @brief Refresh the heartbeat timestamp for an agent (called from the
+     * agent Heartbeat RPC path). Only touches last_heartbeat — the success
+     * buffer and EMA latency are driven exclusively by recordAgentCall.
+     * @param agent_id Agent identifier
+     */
+    static void recordHeartbeat(const std::string& agent_id);
+
+    /**
+     * @brief Scan tracked agents for heartbeat timeouts.
+     * @param timeout   Maximum allowed silence since the last heartbeat/call
+     * @param callback  Invoked with (agent_id, true) when timed out and
+     *                  (agent_id, false) when the heartbeat is fresh
+     */
+    static void evaluateHeartbeatTimeouts(
+        std::chrono::seconds timeout,
+        const std::function<void(const std::string&, bool timed_out)>& callback);
+
+    /**
      * @brief Get a singleton reference (default MemoryServiceRegistry).
      */
     static ServiceRegistry& instance();

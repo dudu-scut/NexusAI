@@ -128,3 +128,16 @@ test('rpc server owns the durable repositories and refuses partial startup', () 
   assert.match(rpcServer, /\*postgres_store_,\s*\*query_domain_repository_,\s*\*budget_repository_/);
   assert.doesNotMatch(rpcServer, /continuing without it/);
 });
+
+// P20: gateway converts request timeout_seconds into a gRPC deadline
+
+test('proxy derives a gRPC deadline from timeout_seconds (P20)', () => {
+  const server = read('gateway/proxy/server.mjs');
+  assert.match(server, /function deadlineFromBody\(body\) \{/);
+  assert.match(server, /body && body\.timeout_seconds/);
+  // Both unary and streaming calls pass the derived deadline option; the
+  // absent-field path leaves it unset (legacy byte-equivalent behavior).
+  assert.match(server, /const options = deadline !== undefined \? \{ deadline \} : \{\};/);
+  assert.match(server, /client\[grpcMethod\]\(body, metadata, options, \(err, response\)/);
+  assert.match(server, /client\[grpcMethod\]\(body, metadata, options\);/);
+});

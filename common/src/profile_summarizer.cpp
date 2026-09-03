@@ -3,6 +3,7 @@
 #include "agent_rpc/common/env_loader.h"
 #include "agent_rpc/common/logger.h"
 #include "agent_rpc/common/redis_client.h"
+#include "agent_rpc/common/query_domain_repository.h"
 
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
@@ -18,7 +19,7 @@ namespace common {
 using json = nlohmann::json;
 
 // ---------------------------------------------------------------------------
-// CURL write callback (same pattern as context_compressor.cpp)
+// CURL write callback (same pattern as the a2a HTTP client)
 // ---------------------------------------------------------------------------
 static size_t writeCallback(void* contents, size_t size, size_t nmemb,
                              std::string* output) {
@@ -111,7 +112,7 @@ std::string ProfileSummarizer::summarize(const std::string& identity_json,
     return result;
 }
 
-void ProfileSummarizer::processPending() {
+void ProfileSummarizer::processPending(QueryDomainRepository* domain_repo) {
     // ---------------------------------------------------------------
     // LLM-based profile extraction (Batch 4 U2)
     // Called periodically from BackgroundScheduler ("profile_extraction",
@@ -166,7 +167,28 @@ void ProfileSummarizer::processPending() {
             redis.lrange(user_conv_key, 0, -1, context_ids);
 
             std::ostringstream history_oss;
-            for (const auto& ctx_id : context_ids) {
+            if (domain_repo) {
+                // P17(m): PostgreSQL conversation history is the real
+                // material source — the Redis Tier-1 mirror stays empty in
+                // production (see P1). Take the last 20 messages per
+                // conversation owned by this user.
+                const auto conversations =
+                    domain_repo->listConversations(user_id);
+                for (const auto& conv : conversations) {
+                    const auto msgs =
+                        domain_repo->listMessages(user_id, conv.id);
+                    const std::size_t start =
+                        msgs.size() > 20 ? msgs.size() - 20 : 0;
+                    for (std::size_t index = start; index < msgs.size();
+                         ++index) {
+                        history_oss << msgs[index].role << ": "
+                                    << msgs[index].content << "\n";
+                    }
+                }
+            } else {
+                // Legacy best-effort Redis scan (fallback when no repo is
+                // injected; the Tier-1 mirror is empty in production).
+                for (const auto& ctx_id : context_ids) {
                 // Get last agent used in this context
                 std::string last_agent;
                 redis.get("nexusai:last_agent:" + ctx_id, last_agent);
@@ -178,6 +200,7 @@ void ProfileSummarizer::processPending() {
                 for (const auto& m : msgs) {
                     history_oss << m << "\n";
                 }
+            }
             }
 
             // Combine memory hints + conversation into the prompt
@@ -204,9 +227,14 @@ void ProfileSummarizer::processPending() {
                 {"messages", json::array({
                     {{"role", "system"},
                      {"content", "你是一个用户画像分析助手。请从以下对话和记忆中提取用户的"
-                                 "偏好、兴趣和沟通风格。以JSON格式输出："
-                                 "{\"interests\": [], \"preferences\": {}, "
-                                 "\"communication_style\": \"\"}"}},
+                                 "偏好、兴趣和沟通风格。"
+                                 // P17(o): the prompt demands the READER-side
+                                 // structure directly (write/read share one
+                                 // schema — no post-hoc conversion layer).
+                                 "严格以如下 JSON 结构输出，不要输出任何其他内容："
+                                 "{\"identity\": {\"name\": \"\", \"role\": \"\", "
+                                 "\"industry\": \"\"}, "
+                                 "\"preferences\": [{\"key\": \"\", \"value\": \"\"}]}"}},
                     {{"role", "user"},
                      {"content", conversation_history}}
                 })},
@@ -269,10 +297,37 @@ void ProfileSummarizer::processPending() {
                 continue;
             }
 
-            // 4e. Persist extracted profile to Redis
-            redis.set("user_profile:" + user_id, profile_text);
+            // 4e. Persist extracted profile to Redis.
+            // P17(o): validate against the reader-side schema before
+            // persisting. On failure the raw text is still kept (inspectable)
+            // and a warning marks the mismatch instead of silently poisoning
+            // the summarize() consumer with unparseable JSON.
+            bool schema_ok = false;
+            try {
+                const auto parsed = json::parse(profile_text);
+                schema_ok = parsed.is_object() &&
+                            parsed.contains("identity") &&
+                            parsed["identity"].is_object() &&
+                            parsed.contains("preferences") &&
+                            parsed["preferences"].is_array();
+            } catch (const json::exception&) {
+                schema_ok = false;
+            }
 
-            LOG_INFO("ProfileSummarizer: Extracted profile for user " + user_id);
+            if (schema_ok) {
+                redis.set("user_profile:" + user_id, profile_text);
+                LOG_INFO("ProfileSummarizer: Extracted profile for user " + user_id);
+            } else {
+                // P17(o): a failed schema validation must NOT poison the
+                // reader — keep the raw text under an inspection-only key.
+                redis.set("user_profile_raw:" + user_id, profile_text);
+                LOG_WARN("ProfileSummarizer: profile failed schema validation for user " +
+                         user_id + " (raw text kept under user_profile_raw)");
+            }
+
+            // Release the queue dedup guard for this user so a future
+            // trigger can enqueue again.
+            redis.hdel("profile:queued", user_id);
 
         } catch (const std::exception& e) {
             LOG_ERROR("ProfileSummarizer: Failed for user " + user_id + ": " +

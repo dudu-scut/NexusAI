@@ -1,5 +1,6 @@
 #include "agent_rpc/common/memory_service.h"
 #include "agent_rpc/common/profile_summarizer.h"
+#include "agent_rpc/common/logger.h"
 
 #include <nlohmann/json.hpp>
 
@@ -74,6 +75,22 @@ std::string MemoryService::getUserMemory(const std::string& user_id) const {
     return oss.str();
 }
 
+// P18 方向2 第二闸：hints 键受控枚举。合法键 = ASCII 小写字母/数字/下划线/
+// 连字符或 UTF-8 多字节（中文键）；长度 1-64；写入前校验，非法键静默丢弃
+// （防同义不同键污染与 ':' 等键注入字节）。
+namespace {
+bool isValidHintKey(const std::string& key) {
+    if (key.empty() || key.size() > 64) return false;
+    for (const unsigned char c : key) {
+        const bool ascii_ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                              c == '_' || c == '-';
+        const bool utf8 = c >= 0x80;
+        if (!ascii_ok && !utf8) return false;
+    }
+    return true;
+}
+}  // anonymous namespace
+
 void MemoryService::updateUserMemoryFromHints(
     const std::string& user_id,
     const std::map<std::string, std::string>& hints) {
@@ -81,6 +98,10 @@ void MemoryService::updateUserMemoryFromHints(
 
     auto key = memoryKey(user_id);
     for (const auto& [k, v] : hints) {
+        if (!isValidHintKey(k)) {
+            LOG_WARN("MemoryService: dropping hint with invalid key '" + k + "'");
+            continue;
+        }
         if (v.empty()) {
             redis_->hdel(key, k);
         } else {

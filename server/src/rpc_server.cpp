@@ -187,6 +187,11 @@ bool RpcServer::initialize(const common::RpcConfig& config) {
     health_service_impl_ = std::make_shared<HealthServiceImpl>();
     ai_query_service_impl_ = std::make_shared<AIQueryServiceImpl>();
     auth_service_impl_ = std::make_shared<AuthServiceImpl>(auth_repository_.get());
+    // P22 B: cache-aside session cache lives in the interceptor layer so
+    // AuthServiceImpl stays Redis-free (PostgreSQL remains the sole session
+    // fact source, contract-locked). Null/disconnected Redis degrades to the
+    // authoritative JOIN lookup.
+    AuthInterceptor::setRedisClient(redis_client_.get());
     
     common::MessageSerializer::getInstance().initialize(common::SerializerFactory::PROTOBUF_BINARY);
     

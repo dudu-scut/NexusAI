@@ -329,6 +329,29 @@ export interface UseTemplateResponse {
 
 // Replay & Export (orchestration.proto)
 
+// P15 P1(e): ExecutePlan (U4) — user-approved/modified DAG execution.
+export interface DAGNode {
+  id: string
+  description: string
+  agent_id: string
+  dependencies: string[]
+}
+
+export interface DAGStructure {
+  nodes: DAGNode[]
+}
+
+export interface ExecutePlanRequest {
+  dag: DAGStructure
+  context_id: string
+  user_id: string
+}
+
+export interface ExecutePlanResponse {
+  status: Status
+  trace_id: string
+}
+
 export interface ReplayQueryRequest {
   trace_id: string
   mode: 'exact' | 'route'

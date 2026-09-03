@@ -125,6 +125,46 @@
         <button class="btn-text retry-btn" @click="chatStore.retryLast()">重试</button>
       </div>
 
+      <!-- P15 P1(e/f): rerun the last rendered execution plan (read-only
+           confirmation) + P1(f) phase-1 edit panel (agent dropdown +
+           editable descriptions; dependency editing is phase 2) -->
+      <div
+        v-if="lastExecutionPlan && !chatStore.isStreaming && !lastErrorMessage"
+        class="retry-bar"
+      >
+        <span class="retry-reason">已完成计划：{{ lastExecutionPlan.tasks.length }} 个子任务</span>
+        <button class="btn-text retry-btn" :disabled="rerunningPlan" @click="rerunLastPlan">
+          {{ rerunningPlan ? '重跑中…' : '重跑此计划' }}
+        </button>
+        <button class="btn-text retry-btn" :disabled="rerunningPlan" @click="openPlanEditor">
+          {{ editingPlan ? '收起编辑' : '编辑计划' }}
+        </button>
+      </div>
+
+      <div v-if="editingPlan" class="plan-editor glass">
+        <div v-for="task in editedTasks" :key="task.id" class="plan-editor-row">
+          <span class="plan-task-id">{{ task.id }}</span>
+          <textarea
+            v-model="task.description"
+            class="plan-desc-input"
+            rows="2"
+          />
+          <select v-model="task.agent_id" class="plan-agent-select">
+            <option value="">自动路由</option>
+            <option
+              v-for="agent in availableAgents"
+              :key="agent.service_name"
+              :value="agent.service_name"
+            >
+              {{ agent.service_name }}
+            </option>
+          </select>
+        </div>
+        <button class="btn-send" :disabled="submittingPlan" @click="submitEditedPlan">
+          {{ submittingPlan ? '执行中…' : '执行编辑后的计划' }}
+        </button>
+      </div>
+
       <div class="chat-input-area">
         <div class="input-wrapper glass" :class="{ 'input-focused': isFocused }">
           <textarea
@@ -176,7 +216,8 @@ import { ref, computed, nextTick, watch, inject } from 'vue'
 import { useRouter } from 'vue-router'
 import { useChatStore } from '../stores/chat'
 import { useAuthStore } from '../stores/auth'
-import { shareSession } from '../services/grpc-client'
+import { shareSession, executePlan, getAgents } from '../services/grpc-client'
+import type { DAGStructure, ServiceInfo } from '../types/proto'
 import MessageBubble from '../components/MessageBubble.vue'
 import ActivityPanel from '../components/ActivityPanel.vue'
 import AgentSelector from '../components/AgentSelector.vue'
@@ -338,6 +379,95 @@ watch(
     }
   },
 )
+
+// P15 P1(e): rerun the last rendered execution plan — posts the plan
+// verbatim (read-only confirmation form; DAG editing lands in the panel
+// follow-up).
+const lastExecutionPlan = computed(
+  () => chatStore.messages[chatStore.messages.length - 1]?.executionPlan,
+)
+const rerunningPlan = ref(false)
+
+async function rerunLastPlan() {
+  const plan = lastExecutionPlan.value
+  if (!plan || rerunningPlan.value) return
+  rerunningPlan.value = true
+  try {
+    const dag: DAGStructure = {
+      nodes: plan.tasks.map(t => ({
+        id: t.id,
+        description: t.description,
+        agent_id: (t as any).assigned_agent_id ?? '',
+        dependencies: (t as any).depends_on ?? [],
+      })),
+    }
+    const response = await executePlan(dag, chatStore.contextId)
+    addActivity('complete', `Plan re-executed: trace ${response.trace_id}`)
+    toast?.addToast({ type: 'success', message: '计划已重新执行' })
+  } catch (error) {
+    addActivity('error', `Plan re-execution failed: ${(error as Error).message}`)
+    toast?.addToast({ type: 'error', message: '计划重跑失败' })
+  } finally {
+    rerunningPlan.value = false
+  }
+}
+
+// P15 P1(f) phase 1: plan editor — agent dropdown (registry-sourced) and
+// editable descriptions; dependency add/remove is phase 2.
+const editingPlan = ref(false)
+const submittingPlan = ref(false)
+const availableAgents = ref<ServiceInfo[]>([])
+const editedTasks = ref<
+  Array<{ id: string; description: string; agent_id: string; dependencies: string[] }>
+>([])
+
+async function openPlanEditor() {
+  const plan = lastExecutionPlan.value
+  if (!plan) return
+  if (!editingPlan.value) {
+    editingPlan.value = true
+    editedTasks.value = plan.tasks.map(t => ({
+      id: t.id,
+      description: t.description,
+      agent_id: (t as any).assigned_agent_id ?? '',
+      dependencies: (t as any).depends_on ?? [],
+    }))
+    if (availableAgents.value.length === 0) {
+      try {
+        const response = await getAgents()
+        availableAgents.value = response.agents
+      } catch (error) {
+        addActivity('error', `Agent list load failed: ${(error as Error).message}`)
+      }
+    }
+  } else {
+    editingPlan.value = false
+  }
+}
+
+async function submitEditedPlan() {
+  if (submittingPlan.value) return
+  submittingPlan.value = true
+  try {
+    const dag: DAGStructure = {
+      nodes: editedTasks.value.map(t => ({
+        id: t.id,
+        description: t.description,
+        agent_id: t.agent_id,
+        dependencies: t.dependencies,
+      })),
+    }
+    const response = await executePlan(dag, chatStore.contextId)
+    addActivity('complete', `Edited plan executed: trace ${response.trace_id}`)
+    toast?.addToast({ type: 'success', message: '编辑后的计划已执行' })
+    editingPlan.value = false
+  } catch (error) {
+    addActivity('error', `Edited plan execution failed: ${(error as Error).message}`)
+    toast?.addToast({ type: 'error', message: '编辑计划执行失败' })
+  } finally {
+    submittingPlan.value = false
+  }
+}
 
 // Auto-scroll
 watch(

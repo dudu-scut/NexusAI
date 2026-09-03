@@ -5,6 +5,7 @@
 #include <string>
 
 namespace agent_rpc {
+namespace common { class RedisClient; }
 namespace server {
 
 class AuthServiceImpl;
@@ -66,6 +67,12 @@ public:
     static void setAuthEnabled(bool enabled);
     static bool isAuthEnabled();
 
+    // P22 B: cache-aside session cache injected by RpcServer. The cache lives
+    // HERE (the consumer layer) so AuthServiceImpl stays Redis-free and
+    // PostgreSQL remains the sole session fact source (contract-locked).
+    // Null/disconnected Redis degrades to the authoritative PG JOIN lookup.
+    static void setRedisClient(common::RedisClient* redis);
+
 private:
     static std::string extractBearerToken(
         const std::multimap<grpc::string_ref, grpc::string_ref>& metadata);
@@ -74,6 +81,7 @@ private:
     grpc::ServerContextBase* context_;
     std::string method_path_;
 
+    static common::RedisClient* s_redis_;
     static thread_local AuthContext tls_auth_;
     static std::atomic<bool> auth_enabled_;
 };

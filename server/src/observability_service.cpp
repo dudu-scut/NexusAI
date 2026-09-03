@@ -75,6 +75,58 @@ int daysBetween(const std::tm& from, const std::tm& to) {
 
 } // anonymous namespace
 
+grpc::Status ObservabilityServiceImpl::buildRedisFallbackTrace(
+    const std::string& redis_key,
+    const std::string& trace_id,
+    const std::string& owner,
+    agent_communication::GetTraceDetailResponse* response) {
+    (void)owner;  // ownership was already enforced before the fallback
+    // Batch-flush Redis spans carry: trace_id/span_id/name/component/
+    // duration_ms/status as one JSON string per list element.
+    std::vector<std::string> raw_spans;
+    if (!redis_client_->lrange(redis_key, 0, -1, raw_spans) || raw_spans.empty()) {
+        auto* status = response->mutable_status();
+        status->set_code(-1);
+        status->set_message("Trace not found: " + trace_id);
+        return grpc::Status(grpc::StatusCode::NOT_FOUND,
+                            "Trace not found: " + trace_id);
+    }
+
+    std::ostringstream summary;
+    bool first_span = true;
+    for (const auto& raw : raw_spans) {
+        try {
+            const auto j = nlohmann::json::parse(raw);
+            auto* span = response->add_spans();
+            span->set_trace_id(trace_id);
+            span->set_span_id(j.value("span_id", ""));
+            span->set_parent_span_id("");
+            std::string component = j.value("component", "");
+            if (component.empty()) {
+                component = j.value("name", "");
+            }
+            span->set_component(component);
+            span->set_duration_ms(j.value("duration_ms", 0));
+            span->set_status(j.value("status", "ok"));
+            if (!first_span) summary << " \xe2\x86\x92 ";
+            summary << span->component() << " " << span->duration_ms() << "ms";
+            first_span = false;
+        } catch (const nlohmann::json::exception& e) {
+            LOG_WARN("Malformed Redis span for trace " + trace_id + ": " +
+                     std::string(e.what()));
+        }
+    }
+
+    response->set_trace_summary(summary.str());
+    auto* status = response->mutable_status();
+    status->set_code(0);
+    status->set_message("OK");
+    LOG_INFO("GetTraceDetail returned " +
+             std::to_string(response->spans_size()) +
+             " spans (Redis fallback) for trace: " + trace_id);
+    return grpc::Status::OK;
+}
+
 grpc::Status ObservabilityServiceImpl::GetTraceDetail(
     grpc::ServerContext* context,
     const agent_communication::GetTraceDetailRequest* request,
@@ -112,6 +164,14 @@ grpc::Status ObservabilityServiceImpl::GetTraceDetail(
         trace = query_repository_->getTraceById(owner, "trace-" + trace_id);
     }
     if (!trace.has_value()) {
+        // P6 遗留收口：PG 无记录时回退读批量 flush 键（PG 主、Redis 兜底）。
+        if (redis_client_ && redis_client_->isConnected()) {
+            const std::string redis_key = "trace:spans:" + trace_id;
+            if (redis_client_->exists(redis_key)) {
+                return buildRedisFallbackTrace(redis_key, trace_id, owner,
+                                               response);
+            }
+        }
         auto* status = response->mutable_status();
         status->set_code(-1);
         status->set_message("Trace not found: " + trace_id);

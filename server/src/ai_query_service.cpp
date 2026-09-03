@@ -33,6 +33,7 @@
 #include "agent_rpc/orchestrator/export_service.h"
 #include "agent_rpc/orchestrator/replay_service.h"
 #include "agent_rpc/common/cost_tracker.h"
+#include "agent_rpc/common/profile_summarizer.h"
 #include <nlohmann/json.hpp>
 
 #include <chrono>
@@ -119,7 +120,8 @@ bool AIQueryServiceImpl::initialize(
 
             orchestration_impl_ = std::make_unique<OrchestrationServiceImpl>(
                 task_planner_.get(), task_executor_.get(),
-                agent_router_.get(), memory_service_.get(), &rpc_config_);
+                agent_router_.get(), memory_service_.get(), &rpc_config_,
+                domain_repo_, budget_repo_, redis_client_);
 
             LOG_INFO("Multi-agent orchestrator enabled (LLM: " + model + ")");
 
@@ -383,6 +385,33 @@ void AIQueryServiceImpl::buildSystemContextFromPg(
         if (!summary.empty()) {
             system_context->set_cross_agent_summary(summary);
         }
+        // P17(k): user profile read-back. Read user_profile:<uid>, compress
+        // it via summarize(), and merge with a "[User Profile] " prefix into
+        // user_memory (same merge pattern as the hints above). An empty or
+        // corrupt profile degrades silently with no prefix.
+        std::string profile_raw;
+        if (redis_client_->get("user_profile:" + owner_id, profile_raw) &&
+            !profile_raw.empty()) {
+            try {
+                const auto profile_json = nlohmann::json::parse(profile_raw);
+                const std::string identity =
+                    profile_json.value("identity", nlohmann::json::object()).dump();
+                const std::string preferences =
+                    profile_json.value("preferences", nlohmann::json::array()).dump();
+                const std::string profile_summary =
+                    common::ProfileSummarizer::summarize(identity, preferences);
+                if (!profile_summary.empty()) {
+                    std::string merged = system_context->user_memory();
+                    if (!merged.empty()) {
+                        merged += "\n";
+                    }
+                    merged += "[User Profile] " + profile_summary;
+                    system_context->set_user_memory(merged);
+                }
+            } catch (const nlohmann::json::exception&) {
+                // Corrupt profile — silent degradation guard.
+            }
+        }
     }, "memory recall");
 }
 
@@ -477,6 +506,79 @@ void AIQueryServiceImpl::finalizeDurableQuery(DurableQueryRun& run, const std::s
         // not a missed write.
         LOG_INFO("finalize: token ledger duplicate skipped for request " + run.request_id);
     }
+
+    // P17(l): profile-extraction trigger on successful terminal states. The
+    // owner is queued onto profile:pending (dedup-guarded) when the
+    // conversation crossed the message threshold or the cached profile is
+    // absent. Redis-only, cache-only: failures never flip the finalized
+    // terminal state.
+    if (status == "completed") {
+        // P16/P17 shared message count: one PG round-trip feeds both the
+        // profile-extraction gate and the segment pipeline (Minor #5).
+        int message_count = 0;
+        try {
+            const auto messages =
+                domain_repo_->listMessages(run.owner_id, run.conversation_id);
+            message_count = static_cast<int>(messages.size());
+        } catch (const std::exception&) {
+            message_count = 0;
+        }
+
+        runCacheOnly(
+            [this, &run, message_count] {
+                maybeScheduleProfileExtraction(run, message_count);
+            },
+            "profile extraction scheduling");
+        // P16(a/c): platform-side segment extraction for Tier-2 long-term
+        // memory. The sync AND streaming terminal paths share this finalize,
+        // so both trigger the same segment pipeline. PG failures degrade
+        // silently (count 0 → no-op) — the terminal state is already
+        // completed and must never flip back.
+        runCacheOnly(
+            [this, &run, message_count] {
+                if (message_count > 0) {
+                    helpers_.maybeExtractMemorySegment(
+                        memory_service_.get(), memory_llm_client_.get(),
+                        domain_repo_, run.owner_id, run.conversation_id,
+                        message_count);
+                }
+            },
+            "memory segment extraction");
+    }
+}
+
+void AIQueryServiceImpl::maybeScheduleProfileExtraction(
+    const DurableQueryRun& run, int message_count) {
+    constexpr int kMessageThreshold = 50;
+    if (!redis_client_ || !redis_client_->isConnected()) {
+        return;
+    }
+
+    // Gate A: conversation message threshold (count passed in by the
+    // caller — one shared PG round-trip).
+    bool schedule = message_count >= kMessageThreshold;
+    // Gate B: absent profile (the profile schema carries no updated_at
+    // timestamp yet, so staleness is approximated by key absence; a real
+    // expiry check lands together with the timestamped schema).
+    if (!schedule) {
+        std::string profile_raw;
+        schedule = !redis_client_->get("user_profile:" + run.owner_id,
+                                       profile_raw) ||
+                   profile_raw.empty();
+    }
+    if (!schedule) {
+        return;
+    }
+
+    // Dedup guard (atomic SET-NX via HSETNX, transient): at most one queue
+    // entry per owner while the extraction is pending — profile extraction
+    // is idempotent and cheap to skip. processPending clears the member
+    // after each processed user.
+    if (!redis_client_->hsetnx("profile:queued", run.owner_id, "1")) {
+        return;
+    }
+    redis_client_->rpush("profile:pending", run.owner_id);
+    LOG_INFO("Profile extraction queued for owner " + run.owner_id);
 }
 
 void AIQueryServiceImpl::abortDurableRun(DurableQueryRun& run, const std::string& reason) {

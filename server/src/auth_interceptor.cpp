@@ -1,7 +1,10 @@
 #include "agent_rpc/server/auth_interceptor.h"
 #include "agent_rpc/server/auth_service.h"
+#include "agent_rpc/common/redis_client.h"
 
 #include <cstddef>
+#include <nlohmann/json.hpp>
+#include <chrono>
 
 namespace agent_rpc {
 namespace server {
@@ -57,6 +60,11 @@ bool isValidTraceId(const grpc::string_ref& value) {
 
 thread_local AuthInterceptor::AuthContext AuthInterceptor::tls_auth_;
 std::atomic<bool> AuthInterceptor::auth_enabled_{false};
+common::RedisClient* AuthInterceptor::s_redis_ = nullptr;
+
+void AuthInterceptor::setRedisClient(common::RedisClient* redis) {
+    s_redis_ = redis;
+}
 
 AuthInterceptor::AuthInterceptor(AuthServiceImpl* auth_service,
                                   grpc::ServerContextBase* context,
@@ -87,8 +95,48 @@ void AuthInterceptor::Intercept(
                 std::string token = extractBearerToken(*metadata);
                 if (!token.empty()) {
                     std::string user_id, username, role;
-                    if (auth_service_->validateToken(token, user_id, username, role) &&
-                        !user_id.empty() && !username.empty()) {
+
+                    // P22 B: cache-aside read — a hit costs zero PostgreSQL
+                    // round-trips. The cache TTL (300s) is a deliberate
+                    // trade-off: the interceptor has no channel to the
+                    // session expiry timestamp, so a short TTL bounds how
+                    // long a revoked/banned session can keep being served.
+                    const std::string token_hash =
+                        AuthServiceImpl::hashToken(token);
+                    const std::string cache_key =
+                        "auth:session:" + token_hash;
+                    bool cache_hit = false;
+                    if (s_redis_ && s_redis_->isConnected()) {
+                        std::string cached;
+                        if (s_redis_->get(cache_key, cached)) {
+                            try {
+                                const auto cached_json =
+                                    nlohmann::json::parse(cached);
+                                user_id = cached_json.value("user_id", "");
+                                username = cached_json.value("username", "");
+                                role = cached_json.value("role", "");
+                                cache_hit = !user_id.empty();
+                            } catch (const nlohmann::json::exception&) {
+                                cache_hit = false;
+                            }
+                        }
+                    }
+
+                    if (!cache_hit &&
+                        auth_service_->validateToken(token, user_id,
+                                                     username, role)) {
+                        // Cache-aside fill.
+                        if (s_redis_ && s_redis_->isConnected() &&
+                            !user_id.empty()) {
+                            const nlohmann::json payload = {
+                                {"user_id", user_id},
+                                {"username", username},
+                                {"role", role}};
+                            s_redis_->setex(cache_key, 300, payload.dump());
+                        }
+                    }
+
+                    if (!user_id.empty() && !username.empty()) {
                         tls_auth_.authenticated = true;
                         tls_auth_.user_id = user_id;
                         tls_auth_.username = username;

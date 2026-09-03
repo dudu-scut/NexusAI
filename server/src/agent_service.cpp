@@ -4,6 +4,7 @@
 #include "agent_rpc/common/metrics.h"
 #include "agent_rpc/orchestrator/agent_router.h"
 #include "agent_rpc/orchestrator/agent_info.h"
+#include "agent_rpc/registry/service_registry.h"
 #include <grpcpp/grpcpp.h>
 #include <nlohmann/json.hpp>
 #include <sstream>
@@ -517,6 +518,11 @@ grpc::Status AgentCommunicationServiceImpl::Heartbeat(
     if (router_) {
         router_->updateHeartbeat(request->agent_id());
     }
+
+    // Feed the health-evaluation loop's heartbeat-timeout guard (90s):
+    // every Heartbeat RPC refreshes the live-metrics heartbeat timestamp so
+    // silent agents are excluded and recovering agents come back.
+    agent_rpc::registry::ServiceRegistry::recordHeartbeat(request->agent_id());
 
     auto* status = response->mutable_status();
     status->set_code(0);

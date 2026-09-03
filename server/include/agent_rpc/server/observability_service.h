@@ -54,6 +54,13 @@ public:
         agent_communication::GetCostReportResponse* response) override;
 
 private:
+    // P6 遗留收口：PG 无记录时的 Redis 批量键兜底读（PG 主、Redis 兜底）。
+    grpc::Status buildRedisFallbackTrace(
+        const std::string& redis_key,
+        const std::string& trace_id,
+        const std::string& owner,
+        agent_communication::GetTraceDetailResponse* response);
+
     common::RedisClient* redis_client_;
     common::AgentRuntimeRepository* runtime_repository_ = nullptr;
     common::QueryDomainRepository* query_repository_ = nullptr;

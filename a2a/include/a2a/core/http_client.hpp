@@ -1,9 +1,11 @@
 #pragma once
 
+#include <atomic>
 #include <string>
 #include <map>
 #include <memory>
 #include <functional>
+#include <vector>
 
 namespace a2a {
 
@@ -59,6 +61,25 @@ public:
      * @brief Set request timeout in seconds
      */
     void set_timeout(long seconds);
+
+    /**
+     * @brief Attach an abort flag checked during the transfer.
+     * When the flag is set to true mid-request, the in-flight transfer
+     * aborts with CURLE_ABORTED_BY_CALLBACK and post/post_stream throw.
+     * The flag must outlive the request (caller-owned, typically a
+     * shared_ptr<atomic<bool>> held by the orchestrator).
+     * @param flag  Pointer to an external atomic abort flag (may be null)
+     */
+    void set_abort_flag(const std::atomic<bool>* flag);
+
+    /**
+     * @brief Pin host→IP mappings for the next transfers (P21 L2).
+     * Backs CURLOPT_RESOLVE so the validated addresses are the exact ones
+     * used for connection, closing the DNS-rebinding TOCTOU window.
+     * Entries use curl's syntax: "host:port:address" (port may be empty).
+     * @param entries  "host:port:ip" strings, one per validated address
+     */
+    void set_resolve_entries(const std::vector<std::string>& entries);
     
     /**
      * @brief Add custom header

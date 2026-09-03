@@ -27,7 +27,7 @@ public:
         // This module no longer calls it independently.
     }
 
-    ~LLMClient() {
+    virtual ~LLMClient() {
         // Never call curl_global_cleanup in destructor:
         // multiple instances share the process-global curl state,
         // and cleanup is handled at process exit.
@@ -38,8 +38,9 @@ public:
      * @param system_prompt System prompt
      * @param user_message User message
      * @return AI reply
+     * Virtual so tests can inject a scripted fake (see TaskPlanner retry tests).
      */
-    std::string chat(const std::string& system_prompt,
+    virtual std::string chat(const std::string& system_prompt,
                     const std::string& user_message) {
         // Build the OpenAI-compatible request JSON
         json messages = json::array();

@@ -28,6 +28,17 @@ struct AuthSessionRecord {
     std::string updated_at;
 };
 
+// P22 A: one-query JOIN of the active session with its owning user, so
+// token validation needs a single PostgreSQL round-trip instead of two
+// (session lookup + user lookup). password_scrypt is deliberately not
+// selected — session validation never needs the password hash.
+struct AuthSessionWithUser {
+    AuthSessionRecord session;
+    std::string user_id;
+    std::string username;
+    std::string role;
+};
+
 class AuthRepository final {
 public:
     explicit AuthRepository(PostgresStore& store);
@@ -37,6 +48,8 @@ public:
     std::optional<UserRecord> findUserById(const std::string& user_id);
     bool createSession(const AuthSessionRecord& session);
     std::optional<AuthSessionRecord> findActiveSessionByTokenHash(const std::string& token_hash);
+    std::optional<AuthSessionWithUser> findActiveSessionWithUserByTokenHash(
+        const std::string& token_hash);
     bool revokeSession(const std::string& session_id);
 
 private:

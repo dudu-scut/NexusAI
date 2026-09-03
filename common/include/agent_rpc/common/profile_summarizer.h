@@ -5,6 +5,7 @@
 namespace agent_rpc {
 namespace common {
 
+class QueryDomainRepository;  // P17(m): optional PostgreSQL material source
 /**
  * @brief ProfileSummarizer — User profile summarization with optional LLM extraction
  *
@@ -42,8 +43,13 @@ public:
      * conversation data, calls the DeepSeek chat-completions API to
      * extract structured profiles, and stores results in
      * "user_profile:<user_id>".
+     *
+     * @param domain_repo  P17(m): when non-null, conversation material is
+     *        read from PostgreSQL (the authoritative history — the Redis
+     *        Tier-1 mirror stays empty in production); null falls back to
+     *        the legacy best-effort Redis scan.
      */
-    static void processPending();
+    static void processPending(QueryDomainRepository* domain_repo = nullptr);
 };
 
 }  // namespace common

@@ -5,6 +5,7 @@
 
 #include "agent_rpc/a2a_adapter/a2a_adapter.h"
 #include "agent_rpc/a2a_adapter/error_mapper.h"
+#include "agent_rpc/a2a_adapter/url_validation.h"
 #include "agent_rpc/common/circuit_breaker.h"
 #include "agent_rpc/common/trace_context.h"
 #include "agent_rpc/common/redis_client.h"
@@ -516,22 +517,15 @@ bool A2AAdapter::processQueryDirect(
         return false;
     }
 
-    // Validate agent URL to prevent SSRF and internal network access.
-    // Only allow http/https schemes to known ports.  Reject empty URLs,
-    // file://, and other schemes that could be abused.
-    if (agent_url.empty()) {
+    // P21 L1: validate agent URL to prevent SSRF. Real parse + strict
+    // http/https whitelist + userinfo/ambiguity-byte rejection (L2/L3 host
+    // and port layers activate under NEXUSAI_SSRF_STRICT=1).
+    std::string url_err;
+    if (!validateAgentUrl(agent_url, url_err)) {
         if (response) {
             auto* status = response->mutable_status();
             status->set_code(static_cast<int>(grpc::StatusCode::INVALID_ARGUMENT));
-            status->set_message("Agent URL must not be empty");
-        }
-        return false;
-    }
-    if (agent_url.find("http://") != 0 && agent_url.find("https://") != 0) {
-        if (response) {
-            auto* status = response->mutable_status();
-            status->set_code(static_cast<int>(grpc::StatusCode::INVALID_ARGUMENT));
-            status->set_message("Agent URL must use http:// or https:// scheme");
+            status->set_message(url_err);
         }
         return false;
     }
@@ -556,6 +550,34 @@ bool A2AAdapter::processQueryDirect(
 
         a2a::A2AClient client(agent_url);
         client.set_timeout(config_.request_timeout_seconds);
+
+        // P21 L2 (strict mode): resolve the host, reject blacklisted
+        // addresses, and pin the validated IPs to the connection
+        // (anti-rebinding).
+        std::string host;
+        std::string port_str;
+        if (ssrfStrictModeEnabled() &&
+            splitAgentUrlHostPort(agent_url, host, port_str)) {
+            std::vector<std::string> ips;
+            std::string host_err;
+            if (!validateResolvedHost(host, ips, host_err)) {
+                if (response) {
+                    auto* status = response->mutable_status();
+                    status->set_code(static_cast<int>(grpc::StatusCode::INVALID_ARGUMENT));
+                    status->set_message(host_err);
+                }
+                return false;
+            }
+            const bool https = agent_url.compare(0, 8, "https://") == 0;
+            const std::string pin_port =
+                port_str.empty() ? (https ? "443" : "80") : port_str;
+            std::vector<std::string> resolve_entries;
+            resolve_entries.reserve(ips.size());
+            for (const auto& ip : ips) {
+                resolve_entries.push_back(host + ":" + pin_port + ":" + ip);
+            }
+            client.set_resolve_entries(resolve_entries);
+        }
 
         // Inject trace headers into direct A2A HTTP call
         auto* trace = agent_rpc::common::TraceContext::current();
@@ -635,15 +657,34 @@ void A2AAdapter::processQueryStreamingDirect(
         return;
     }
 
-    // Validate agent URL (same SSRF protection as processQueryDirect)
-    if (agent_url.empty() ||
-        (agent_url.find("http://") != 0 && agent_url.find("https://") != 0)) {
+    // P21 L1: validate agent URL (same SSRF protection as processQueryDirect)
+    std::string url_err;
+    if (!validateAgentUrl(agent_url, url_err)) {
         agent_communication::AIStreamEvent cb_event;
         response_adapter_->buildStreamEvent(
-            "Invalid agent URL — must use http:// or https:// scheme",
+            "Invalid agent URL — " + url_err,
             request.context_id(), "error", &cb_event);
         callback(cb_event);
         return;
+    }
+
+    // P21 L2 (strict mode): reject blacklisted hosts on the streaming
+    // direct path as well. The streaming HTTP path has no RESOLVE pin
+    // channel, so this is validate-only (known limitation).
+    std::string host;
+    std::string port_str;
+    if (ssrfStrictModeEnabled() &&
+        splitAgentUrlHostPort(agent_url, host, port_str)) {
+        std::vector<std::string> ips;
+        std::string host_err;
+        if (!validateResolvedHost(host, ips, host_err)) {
+            agent_communication::AIStreamEvent cb_event;
+            response_adapter_->buildStreamEvent(
+                "Invalid agent URL — " + host_err,
+                request.context_id(), "error", &cb_event);
+            callback(cb_event);
+            return;
+        }
     }
 
     // Circuit breaker: check if the target agent is healthy for streaming direct

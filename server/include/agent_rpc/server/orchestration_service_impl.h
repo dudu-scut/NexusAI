@@ -15,6 +15,14 @@
 
 #include <grpcpp/grpcpp.h>
 
+namespace agent_rpc {
+namespace common {
+class QueryDomainRepository;      // P2(g/h): durable rows + PG history
+class PostgresBudgetRepository;   // P2(g): budget reservation
+class RedisClient;                // P2(h): profile read-back
+}  // namespace common
+}  // namespace agent_rpc
+
 namespace agent_communication {
 class ExecutePlanRequest;
 class ExecutePlanResponse;
@@ -40,7 +48,10 @@ public:
         orchestrator::TaskExecutor* executor,
         orchestrator::AgentRouter* router,
         common::MemoryService* memory,
-        common::RpcConfig* config);
+        common::RpcConfig* config,
+        common::QueryDomainRepository* domain_repo = nullptr,
+        common::PostgresBudgetRepository* budget_repo = nullptr,
+        common::RedisClient* redis = nullptr);
 
     grpc::Status executePlan(
         grpc::ServerContext* context,
@@ -63,6 +74,11 @@ private:
     orchestrator::AgentRouter* agent_router_;
     common::MemoryService* memory_service_;
     common::RpcConfig* rpc_config_;
+    // P2(g/h): durable pipeline + PG-authoritative memory assembly. Nullable
+    // (unit tests); production wires all three via AIQueryServiceImpl.
+    common::QueryDomainRepository* domain_repo_ = nullptr;
+    common::PostgresBudgetRepository* budget_repo_ = nullptr;
+    common::RedisClient* redis_ = nullptr;
 };
 
 } // namespace server

@@ -64,6 +64,8 @@ struct QueryHelpers {
 
     std::mutex memory_llm_mutex;
     std::set<std::string> summary_in_progress;  // context_ids with ongoing summary generation
+    // P16: context_id+segment_index keys with an ongoing segment extraction.
+    std::set<std::string> segment_in_progress;
     // Note: memory_llm_client_ is not owned here; passed as parameter.
 
     // Injectable summarizer hook: (system_prompt, history) -> summary text.
@@ -87,6 +89,26 @@ struct QueryHelpers {
                            const std::string& current_agent_id,
                            const std::string& target_agent_name = "",
                            const std::string& target_agent_duties = "");
+
+    /**
+     * P16(a/c): platform-side conversation-segment extraction for Tier-2
+     * long-term memory. Fires every kSegmentMessages messages (4 user
+     * turns), reads the segment from PostgreSQL, asks the LLM to output ONLY
+     * new/changed hints (incremental extraction — the primary dedup gate),
+     * and merges them via updateUserMemoryFromHints. Runs asynchronously;
+     * the dedup key is context_id + segment index (process-level, idempotent
+     * across restarts up to one redundant extraction). Shared by the sync
+     * and streaming terminal paths via finalizeDurableQuery.
+     *
+     * @param message_count  total messages persisted for the conversation
+     *                       (used for the segment index gate)
+     */
+    void maybeExtractMemorySegment(common::MemoryService* memory_service,
+                                   void* memory_llm_client,  // LLMClient*
+                                   common::QueryDomainRepository* domain_repo,
+                                   const std::string& user_id,
+                                   const std::string& context_id,
+                                   int message_count);
 
     static std::string buildMemoryContext(const agent_communication::AIQueryRequest* request);
 

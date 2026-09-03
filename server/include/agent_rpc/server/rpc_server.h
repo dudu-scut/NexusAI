@@ -58,6 +58,12 @@ public:
 
     std::shared_ptr<AuthServiceImpl> getAuthService();
 
+    // P17(m): the profile summarizer's source-material injection point
+    // (PostgreSQL conversation history instead of the empty Redis tier).
+    common::QueryDomainRepository* getQueryDomainRepository() {
+        return query_domain_repository_.get();
+    }
+
     // Redis client (liveness/metrics cache only)
     common::RedisClient* getRedisClient() { return redis_client_.get(); }
     

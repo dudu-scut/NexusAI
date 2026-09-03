@@ -8,28 +8,20 @@
 #include <rapidcheck/gtest.h>
 
 // AgentRouter's member layout is guarded by AGENT_RPC_ENABLE_MCP (three
-// extra unique_ptr members in MCP builds). The orchestrator library defines
-// that macro PRIVATE (see orchestrator/CMakeLists.txt), so this TU must
-// mirror it or it would see a different layout than liborchestrator.a —
-// an ODR violation that corrupts the heap. Detection: orchestrator links
-// agent_rpc_mcp PUBLIC only in ENABLE_MCP builds, which propagates mcp's
-// PUBLIC include dirs to this target; their absence means the default
-// (non-MCP) layout. Do NOT define the macro unconditionally.
-#if defined(__has_include)
-#if __has_include("agent_rpc/mcp/rag/embedding_service.h")
-#ifndef AGENT_RPC_ENABLE_MCP
-#define AGENT_RPC_ENABLE_MCP 1
-#endif
-#endif
-#endif
+// extra unique_ptr members in MCP builds). P20 遗留 ODR 根治：该宏现经
+// orchestrator/CMakeLists.txt 以 PUBLIC 传播，链接本库的测试 TU 自动与
+// liborchestrator.a 布局一致——不再需要本地 __has_include 探测。
 
 #include "agent_rpc/orchestrator/agent_router.h"
 #include "agent_rpc/orchestrator/agent_info.h"
 #include "agent_rpc/orchestrator/task_executor.h"
+#include "agent_rpc/orchestrator/task_planner.h"
 #include "agent_rpc/common/trace_context.h"
 #include "agent_rpc/common/load_balancer.h"
+#include "agent_rpc/a2a_adapter/url_validation.h"
 
 #include <cstdlib>
+#include <thread>
 #include <unordered_set>
 #include <algorithm>
 
@@ -819,6 +811,293 @@ TEST(AgentRouterLoadBalancerGateTest, ConsistentHashSameKeySamePick) {
         EXPECT_EQ(again.host, first_pick.host);
     }
 #endif
+}
+
+// ── P13: TaskPlanner missing-critical-field handling (batch 7) ──────────
+
+namespace {
+
+// Scripted LLM fake: returns canned responses in call order; records every
+// prompt it received so tests can assert the retry correction hint.
+class ScriptedLLMClient : public LLMClient {
+public:
+    explicit ScriptedLLMClient(std::vector<std::string> responses)
+        : LLMClient("test-key", "scripted", "http://127.0.0.1:1/unused")
+        , responses_(std::move(responses)) {}
+
+    std::string chat(const std::string& /*system_prompt*/,
+                     const std::string& user_message) override {
+        calls_.push_back(user_message);
+        if (responses_.empty()) {
+            return "";  // no scripted reply — keep the fake safe for
+                         // parse-only tests that never reach chat()
+        }
+        const auto idx = calls_.size() - 1;
+        return responses_[idx < responses_.size() ? idx : responses_.size() - 1];
+    }
+
+    int callCount() const { return static_cast<int>(calls_.size()); }
+    const std::string& promptAt(int i) const { return calls_.at(i); }
+
+private:
+    std::vector<std::string> responses_;
+    std::vector<std::string> calls_;
+};
+
+} // anonymous namespace
+
+TEST(TaskPlannerDropTest, MissingDescriptionIsDropped) {
+    TaskPlannerConfig cfg;
+    TaskPlanner planner(cfg, std::make_unique<ScriptedLLMClient>(std::vector<std::string>{}));
+    const std::string response = R"({"single": false, "tasks": [
+        {"id": "t1", "description": "翻译文本", "skill": "translation"},
+        {"id": "t2", "skill": "math"},
+        {"id": "", "description": "无 id", "skill": "math"}
+    ]})";
+    auto plan = planner.parsePlanResponse(response, "测试查询");
+    ASSERT_FALSE(plan.is_single_agent);
+    ASSERT_EQ(plan.tasks.size(), 1u);
+    EXPECT_EQ(plan.tasks[0].id, "t1");
+}
+
+TEST(TaskPlannerDropTest, MissingSkillIsRetained) {
+    TaskPlannerConfig cfg;
+    TaskPlanner planner(cfg, std::make_unique<ScriptedLLMClient>(std::vector<std::string>{}));
+    const std::string response = R"({"single": false, "tasks": [
+        {"id": "t1", "description": "无技能任务"},
+        {"id": "t2", "description": "正常任务", "skill": "math"}
+    ]})";
+    auto plan = planner.parsePlanResponse(response, "测试查询");
+    ASSERT_FALSE(plan.is_single_agent);
+    // Missing skill is kept — routing falls back to the four-tier pipeline.
+    ASSERT_EQ(plan.tasks.size(), 2u);
+    EXPECT_EQ(plan.tasks[0].required_skill, "");
+}
+
+TEST(TaskPlannerDropTest, AllDroppedFallsBackToSingle) {
+    TaskPlannerConfig cfg;
+    TaskPlanner planner(cfg, std::make_unique<ScriptedLLMClient>(std::vector<std::string>{}));
+    const std::string response = R"({"single": false, "tasks": [
+        {"id": "t1", "skill": "math"},
+        {"id": "t2", "skill": "math"}
+    ]})";
+    auto plan = planner.parsePlanResponse(response, "测试查询");
+    EXPECT_TRUE(plan.is_single_agent);
+    EXPECT_TRUE(plan.tasks.empty());
+}
+
+TEST(TaskPlannerDropTest, RetriesExactlyOnceWhenTasksDropped) {
+    // First response drops one task (missing description); the retry prompt
+    // carries the correction hint and the clean second result is accepted.
+    const std::string first = R"({"single": false, "tasks": [
+        {"id": "t1", "description": "翻译文本", "skill": "translation"},
+        {"id": "t2", "skill": "math"}
+    ]})";
+    const std::string second = R"({"single": false, "tasks": [
+        {"id": "t1", "description": "翻译文本", "skill": "translation"},
+        {"id": "t2", "description": "计算", "skill": "math"}
+    ]})";
+    TaskPlannerConfig cfg;
+    auto fake = std::make_unique<ScriptedLLMClient>(
+        std::vector<std::string>{first, second});
+    auto* fake_ptr = fake.get();
+    TaskPlanner planner(cfg, std::move(fake));
+
+    std::unordered_map<std::string, std::string> skills = {
+        {"translation", "翻译"}, {"math", "数学"}};
+    auto plan = planner.plan("翻译并计算", skills);
+
+    EXPECT_EQ(fake_ptr->callCount(), 2);  // exactly one retry
+    ASSERT_FALSE(plan.is_single_agent);
+    ASSERT_EQ(plan.tasks.size(), 2u);     // retry result accepted
+    EXPECT_NE(fake_ptr->promptAt(1).find("缺少 description 字段"),
+              std::string::npos);
+}
+
+TEST(TaskPlannerDropTest, RetryOnceThenAcceptFailSoft) {
+    // Both attempts drop tasks: hard cap stops after one retry, single-agent
+    // fallback is preserved (fail-soft baseline unchanged).
+    const std::string bad = R"({"single": false, "tasks": [
+        {"id": "t1", "skill": "math"}
+    ]})";
+    TaskPlannerConfig cfg;
+    auto fake = std::make_unique<ScriptedLLMClient>(
+        std::vector<std::string>{bad, bad});
+    auto* fake_ptr = fake.get();
+    TaskPlanner planner(cfg, std::move(fake));
+
+    std::unordered_map<std::string, std::string> skills = {{"math", "数学"}};
+    auto plan = planner.plan("计算", skills);
+
+    EXPECT_EQ(fake_ptr->callCount(), 2);  // exactly one retry, no loop
+    EXPECT_TRUE(plan.is_single_agent);    // all dropped → single fallback
+}
+
+TEST(TaskPlannerDropTest, DropCountWrittenToPlanningSpanMetadata) {
+    const std::string first = R"({"single": false, "tasks": [
+        {"id": "t1", "description": "翻译文本", "skill": "translation"},
+        {"id": "t2", "skill": "math"}
+    ]})";
+    const std::string second = R"({"single": false, "tasks": [
+        {"id": "t1", "description": "翻译文本", "skill": "translation"},
+        {"id": "t2", "description": "计算", "skill": "math"}
+    ]})";
+    TaskPlannerConfig cfg;
+    TaskPlanner planner(cfg, std::make_unique<ScriptedLLMClient>(
+        std::vector<std::string>{first, second}));
+
+    agent_rpc::common::TraceContext::init("test_user", "test_ctx");
+    auto* trace = agent_rpc::common::TraceContext::current();
+    std::unordered_map<std::string, std::string> skills = {
+        {"translation", "翻译"}, {"math", "数学"}};
+    auto plan = planner.plan("翻译并计算", skills);
+    (void)plan;
+
+    bool planning_found = false;
+    for (const auto& span : trace->mutableSpans()) {
+        if (span.name == "planning") {
+            planning_found = true;
+            EXPECT_NE(span.metadata_json.find("\"dropped_tasks\":1"),
+                      std::string::npos);
+        }
+    }
+    EXPECT_TRUE(planning_found);
+}
+
+// ── P20: subtask timeout enforcement + in-flight cancellation ───────────
+
+TEST_F(AgentRouterPropertyTest, SingleTaskLayerTimesOutAndCancelsInFlight) {
+    auto agent = createAgent("slow-agent", {"math"});
+    router_->addAgent(agent);
+
+    ExecutorConfig cfg;
+    cfg.subtask_timeout_seconds = 1;   // per-subtask cap (previously dead)
+    cfg.global_timeout_seconds = 30;
+    TaskExecutor executor(*router_, cfg);
+
+    ExecutionPlan plan;
+    plan.is_single_agent = false;
+    SubTask st;
+    st.id = "t1";
+    st.description = "do math";
+    st.required_skill = "math";
+    st.preferred_agent_id = "slow-agent";
+    plan.tasks.push_back(st);
+
+    std::string cancelled_url;
+    auto call_agent = [](const std::string&, const std::string&) -> std::string {
+        // Simulate an agent that never answers: the worker keeps sleeping,
+        // which also exercises the future-destructor join path.
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        return "late answer";
+    };
+    auto on_cancel = [&cancelled_url](const std::string& url) {
+        cancelled_url = url;
+    };
+
+    auto start = std::chrono::steady_clock::now();
+    auto results = executor.execute(plan, call_agent, nullptr, on_cancel);
+    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now() - start).count();
+
+    ASSERT_EQ(results.count("t1"), 1u);
+    EXPECT_FALSE(results.at("t1").success);
+    EXPECT_EQ(results.at("t1").error_message, "Subtask timeout exceeded");
+    // The in-flight call was cancelled with the pre-resolved agent URL.
+    EXPECT_EQ(cancelled_url, agent.url);
+    // Waiting stopped at the per-subtask cap (then joined the worker); the
+    // global deadline (30s) was never close to being consumed.
+    EXPECT_LT(elapsed, 25);
+}
+
+TEST_F(AgentRouterPropertyTest, SingleTaskLayerCompletesNormallyWithAgentId) {
+    auto agent = createAgent("fast-agent", {"math"});
+    router_->addAgent(agent);
+
+    ExecutorConfig cfg;
+    cfg.subtask_timeout_seconds = 10;
+    cfg.global_timeout_seconds = 30;
+    TaskExecutor executor(*router_, cfg);
+
+    ExecutionPlan plan;
+    plan.is_single_agent = false;
+    SubTask st;
+    st.id = "t1";
+    st.description = "do math";
+    st.required_skill = "math";
+    st.preferred_agent_id = "fast-agent";
+    plan.tasks.push_back(st);
+
+    auto call_agent = [](const std::string&, const std::string&) -> std::string {
+        return "answer";
+    };
+
+    auto results = executor.execute(plan, call_agent);
+
+    ASSERT_EQ(results.count("t1"), 1u);
+    EXPECT_TRUE(results.at("t1").success);
+    EXPECT_EQ(results.at("t1").result, "answer");
+    EXPECT_EQ(results.at("t1").agent_id, "fast-agent");  // P14(a) backfill
+}
+
+// ── P21: SSRF URL validation (L1 always-on; L2 resolution blacklist) ─────
+
+TEST(AgentUrlValidationTest, RejectsBadSchemesUserinfoAndAmbiguity) {
+    std::string err;
+    EXPECT_FALSE(agent_rpc::a2a_adapter::validateAgentUrl("", err));
+    EXPECT_FALSE(agent_rpc::a2a_adapter::validateAgentUrl("file:///etc/passwd", err));
+    EXPECT_FALSE(agent_rpc::a2a_adapter::validateAgentUrl("ftp://host/", err));
+    EXPECT_FALSE(agent_rpc::a2a_adapter::validateAgentUrl("http://user:pass@host/", err));
+    EXPECT_FALSE(agent_rpc::a2a_adapter::validateAgentUrl(" HTTP://host/", err));
+    EXPECT_FALSE(agent_rpc::a2a_adapter::validateAgentUrl("http://evil.com\\@127.0.0.1/", err));
+    EXPECT_FALSE(agent_rpc::a2a_adapter::validateAgentUrl("http://", err));
+}
+
+TEST(AgentUrlValidationTest, AcceptsCleanUrlsCaseInsensitiveScheme) {
+    std::string err;
+    EXPECT_TRUE(agent_rpc::a2a_adapter::validateAgentUrl("http://127.0.0.1:5100/api", err));
+    EXPECT_TRUE(agent_rpc::a2a_adapter::validateAgentUrl("https://example.com", err));
+    // Case-insensitive scheme: legacy prefix check rejected this; the real
+    // parse accepts it as the same http scheme.
+    EXPECT_TRUE(agent_rpc::a2a_adapter::validateAgentUrl("HTTP://example.com", err));
+}
+
+TEST(AgentUrlValidationTest, SplitExtractsHostAndPort) {
+    std::string host;
+    std::string port;
+    ASSERT_TRUE(agent_rpc::a2a_adapter::splitAgentUrlHostPort(
+        "http://agent:8080/v1", host, port));
+    EXPECT_EQ(host, "agent");
+    EXPECT_EQ(port, "8080");
+
+    ASSERT_TRUE(agent_rpc::a2a_adapter::splitAgentUrlHostPort(
+        "https://agent.example.com", host, port));
+    EXPECT_EQ(host, "agent.example.com");
+    EXPECT_TRUE(port.empty());
+}
+
+TEST(AgentUrlValidationTest, HostResolutionRejectsForbiddenRanges) {
+    std::vector<std::string> ips;
+    std::string err;
+    EXPECT_FALSE(agent_rpc::a2a_adapter::validateResolvedHost("127.0.0.1", ips, err));
+    EXPECT_FALSE(agent_rpc::a2a_adapter::validateResolvedHost("169.254.169.254", ips, err));
+    EXPECT_FALSE(agent_rpc::a2a_adapter::validateResolvedHost("10.0.0.5", ips, err));
+    EXPECT_FALSE(agent_rpc::a2a_adapter::validateResolvedHost("192.168.1.1", ips, err));
+    EXPECT_FALSE(agent_rpc::a2a_adapter::validateResolvedHost("172.16.0.1", ips, err));
+    EXPECT_FALSE(agent_rpc::a2a_adapter::validateResolvedHost("::1", ips, err));
+}
+
+TEST(AgentUrlValidationTest, HostResolutionAcceptsPublicIpAndUsesCache) {
+    // Numeric public address: no DNS dependency in the test environment.
+    std::vector<std::string> ips;
+    std::string err;
+    ASSERT_TRUE(agent_rpc::a2a_adapter::validateResolvedHost("8.8.8.8", ips, err));
+    EXPECT_FALSE(ips.empty());
+
+    // Second call is served from the TTL cache with identical results.
+    std::vector<std::string> ips2;
+    EXPECT_TRUE(agent_rpc::a2a_adapter::validateResolvedHost("8.8.8.8", ips2, err));
+    EXPECT_EQ(ips, ips2);
 }
 
 // Main

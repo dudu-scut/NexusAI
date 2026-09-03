@@ -43,10 +43,14 @@ public:
                        std::string& username,
                        std::string& role);
 
+    // Public so AuthInterceptor can derive the cache-aside key (P22 B); the
+    // cache lives in the interceptor layer, keeping this service Redis-free
+    // (PostgreSQL remains the sole session fact source).
+    static std::string hashToken(const std::string& token);
+
 private:
     static std::string generateId(std::size_t byte_count);
     static std::string generateToken();
-    static std::string hashToken(const std::string& token);
     static bool hashPassword(const std::string& password, std::string& encoded_hash);
     static bool verifyPassword(const std::string& password, const std::string& encoded_hash);
     static std::string formatTimestamp(std::chrono::system_clock::time_point time);

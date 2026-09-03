@@ -13,6 +13,11 @@
 
 #include "agent_rpc/client/rpc_client.h"
 #include "agent_rpc/common/logger.h"
+#include "orchestration.grpc.pb.h"
+#include "orchestration.pb.h"
+#include <nlohmann/json.hpp>
+#include <chrono>
+#include <fstream>
 #include <iostream>
 #include <signal.h>
 #include <string>
@@ -93,6 +98,75 @@ std::vector<std::string> splitAddresses(const std::string& addresses) {
     return result;
 }
 
+// P15 P1(d): execute-plan subcommand — reads a DAG JSON file and submits
+// it to the OrchestrationService.ExecutePlan RPC. The JSON shape mirrors
+// the frontend plan event:
+//   {"nodes": [{"id": "t1", "description": "...", "agent_id": "",
+//               "dependencies": []}, ...]}
+int runExecutePlan(const std::string& server_address,
+                   const std::string& dag_file,
+                   const std::string& token,
+                   int timeout_seconds) {
+    std::ifstream input(dag_file);
+    if (!input.is_open()) {
+        std::cerr << "错误: 无法打开 DAG 文件: " << dag_file << std::endl;
+        return 1;
+    }
+    nlohmann::json dag_json;
+    try {
+        input >> dag_json;
+    } catch (const nlohmann::json::exception& e) {
+        std::cerr << "错误: DAG JSON 解析失败: " << e.what() << std::endl;
+        return 1;
+    }
+    if (!dag_json.is_object() || !dag_json.contains("nodes") ||
+        !dag_json["nodes"].is_array() || dag_json["nodes"].empty()) {
+        std::cerr << "错误: DAG JSON 缺少非空的 nodes 数组" << std::endl;
+        return 1;
+    }
+
+    agent_communication::ExecutePlanRequest request;
+    auto* dag = request.mutable_dag();
+    for (const auto& node_json : dag_json["nodes"]) {
+        auto* node = dag->add_nodes();
+        node->set_id(node_json.value("id", ""));
+        node->set_description(node_json.value("description", ""));
+        node->set_agent_id(node_json.value("agent_id", ""));
+        if (node_json.contains("dependencies") &&
+            node_json["dependencies"].is_array()) {
+            for (const auto& dep : node_json["dependencies"]) {
+                if (dep.is_string()) {
+                    node->add_dependencies(dep.get<std::string>());
+                }
+            }
+        }
+    }
+    request.set_context_id("execute-plan-cli");
+
+    auto channel = grpc::CreateChannel(server_address,
+                                       grpc::InsecureChannelCredentials());
+    auto stub = agent_communication::OrchestrationService::NewStub(channel);
+    grpc::ClientContext context;
+    context.set_deadline(std::chrono::system_clock::now() +
+                         std::chrono::seconds(timeout_seconds));
+    if (!token.empty()) {
+        context.AddMetadata("authorization", "Bearer " + token);
+    }
+
+    agent_communication::ExecutePlanResponse response;
+    const auto status = stub->ExecutePlan(&context, request, &response);
+    if (!status.ok()) {
+        std::cerr << "错误: ExecutePlan 失败: " << status.error_message()
+                  << " (code: " << status.error_code() << ")" << std::endl;
+        return 1;
+    }
+    std::cout << "执行成功，trace_id: " << response.trace_id() << std::endl;
+    if (response.has_status() && response.status().code() != 0) {
+        std::cout << "状态: " << response.status().message() << std::endl;
+    }
+    return 0;
+}
+
 int main(int argc, char* argv[]) {
     // 默认配置
     std::string server_address = "localhost:50051";
@@ -101,6 +175,9 @@ int main(int argc, char* argv[]) {
     std::string context_id = "default";
     bool stream_mode = false;
     int timeout_seconds = 60;
+    // P15 P1(d): execute-plan subcommand mode.
+    std::string execute_plan_file;
+    std::string token;
     
     // 从环境变量读取
     if (const char* env_addr = std::getenv("RPC_SERVER_ADDRESS")) {
@@ -130,6 +207,10 @@ int main(int argc, char* argv[]) {
             service_name = argv[++i];
         } else if ((arg == "-t" || arg == "--timeout") && i + 1 < argc) {
             timeout_seconds = std::atoi(argv[++i]);
+        } else if (arg == "--execute-plan" && i + 1 < argc) {
+            execute_plan_file = argv[++i];
+        } else if (arg == "--token" && i + 1 < argc) {
+            token = argv[++i];
         } else if (arg[0] != '-') {
             server_address = arg;
         } else {
@@ -142,6 +223,14 @@ int main(int argc, char* argv[]) {
     // 设置信号处理
     signal(SIGINT, signalHandler);
     signal(SIGTERM, signalHandler);
+
+    // P15 P1(d): non-interactive execute-plan mode returns before the
+    // interactive loop; the E2E scripts use this as the real entry point
+    // for user-approved DAG execution.
+    if (!execute_plan_file.empty()) {
+        return runExecutePlan(server_address, execute_plan_file, token,
+                              timeout_seconds);
+    }
 
     LogConfig log_config;
     log_config.level = LogLevel::Level_INFO;

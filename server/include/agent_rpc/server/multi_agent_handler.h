@@ -15,11 +15,14 @@
 #include "agent_rpc/orchestrator/result_aggregator.h"
 
 #include <grpcpp/grpcpp.h>
+#include <atomic>
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_map>
 
 namespace agent_communication {
 class AIQueryRequest;
@@ -154,7 +157,21 @@ private:
 
     orchestrator::ExecutionPlan planQuery(const std::string& question);
     std::function<std::string(const std::string&, const std::string&)>
-        buildCallAgent(const agent_communication::AIQueryRequest* request);
+        buildCallAgent(const agent_communication::AIQueryRequest* request,
+                       int effective_timeout_seconds);
+
+    // P20: in-flight A2A call registry. Every DAG subtask registers a
+    // per-call abort flag keyed by agent URL before the blocking
+    // send_message; a timed-out subtask flips the flag, which aborts the
+    // blocking HTTP transfer via the HttpClient progress callback.
+    // multimap + flag-matched erase: parallel subtasks may share one URL,
+    // so a URL can carry several live flags.
+    void cancelInFlight(const std::string& agent_url);
+    void unregisterInFlight(const std::string& agent_url,
+                            const std::shared_ptr<std::atomic<bool>>& flag);
+    std::mutex in_flight_mutex_;
+    std::unordered_multimap<std::string, std::shared_ptr<std::atomic<bool>>>
+        in_flight_calls_;
 
     // P10: injected fast-path skill resolver (null → router embedding tier).
     FastPathSkillFn fast_path_skill_resolver_;

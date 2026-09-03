@@ -66,6 +66,12 @@ public:
     explicit TaskPlanner(const TaskPlannerConfig& config);
 
     /**
+     * Test seam: construct with an injected LLM client (e.g. a scripted fake)
+     * so plan() can be exercised without a real network call.
+     */
+    TaskPlanner(const TaskPlannerConfig& config, std::unique_ptr<LLMClient> llm_client);
+
+    /**
      * Analyze a user query and produce an execution plan.
      * @param query              User's question / request
      * @param available_skills   skill → description map from the registry
@@ -84,13 +90,30 @@ public:
      */
     void resolveAgents(ExecutionPlan& plan, AgentRouter& router);
 
+    /**
+     * Parse a raw LLM plan response into an ExecutionPlan.
+     * Public so tests can feed fabricated JSON directly without an LLM call.
+     *
+     * @param response  Raw LLM response text (markdown fences tolerated)
+     * @param query     Original user query (stored as plan.original_query)
+     * @return Parsed ExecutionPlan
+     */
+    ExecutionPlan parsePlanResponse(const std::string& response,
+                                    const std::string& query) const;
+
 private:
     std::string buildPlanningPrompt(
         const std::string& query,
         const std::unordered_map<std::string, std::string>& available_skills) const;
 
+    /**
+     * Parse a raw LLM plan response, reporting how many subtasks were dropped
+     * because of missing critical fields (empty id or description). The
+     * two-argument overload above forwards here with an ignored counter.
+     */
     ExecutionPlan parsePlanResponse(const std::string& response,
-                                    const std::string& query) const;
+                                    const std::string& query,
+                                    int& dropped_count) const;
 
     TaskPlannerConfig config_;
     std::unique_ptr<LLMClient> llm_client_;

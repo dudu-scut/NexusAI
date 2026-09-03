@@ -141,6 +141,18 @@ function buildMetadata(headers) {
   return meta;
 }
 
+// Helper: derive a gRPC deadline from the request body's timeout_seconds
+// (AIQueryRequest.timeout_seconds, sent by the frontend). Absent/invalid
+// field → undefined → grpc-js leaves the deadline unset (byte-equivalent
+// legacy behavior). P20: this activates the server-side deadline
+// contraction path.
+function deadlineFromBody(body) {
+  const t = body && body.timeout_seconds;
+  return typeof t === 'number' && Number.isFinite(t) && t > 0
+    ? new Date(Date.now() + t * 1000)
+    : undefined;
+}
+
 // Helper: Convert Buffer fields to base64
 // protobuf bytes fields come back as Buffer objects from grpc-js.
 // JSON.stringify renders them as {"type":"Buffer","data":[...]}.
@@ -170,7 +182,9 @@ function unaryCall(serviceName, methodName, body, metadata) {
       return reject(new Error(`Unknown method: ${serviceName}.${methodName}`));
     }
 
-    client[grpcMethod](body, metadata, (err, response) => {
+    const deadline = deadlineFromBody(body);
+    const options = deadline !== undefined ? { deadline } : {};
+    client[grpcMethod](body, metadata, options, (err, response) => {
       if (err) {
         reject(err);
       } else {
@@ -203,7 +217,9 @@ function streamCall(serviceName, methodName, body, metadata, res) {
     'Access-Control-Allow-Origin': '*',
   });
 
-  const stream = client[grpcMethod](body, metadata);
+  const deadline = deadlineFromBody(body);
+  const options = deadline !== undefined ? { deadline } : {};
+  const stream = client[grpcMethod](body, metadata, options);
   let ended = false;
   // The gRPC server is the single authoritative emitter of terminal
   // events. Track whether a terminal event (complete/error) was relayed and

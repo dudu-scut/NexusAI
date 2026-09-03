@@ -16,8 +16,8 @@
 #include <cstdlib>
 #include <iomanip>
 #include <limits>
-#include <optional>
 #include <sstream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -347,17 +347,17 @@ bool AuthServiceImpl::validateTokenInternal(const std::string& token,
         return false;
     }
 
-    const auto session = repository_->findActiveSessionByTokenHash(hashToken(token));
-    if (!session.has_value()) {
+    // P22 A: one JOIN query replaces the previous session + user pair of
+    // lookups (2 PostgreSQL round-trips → 1).
+    const std::string token_hash = hashToken(token);
+    const auto session_with_user =
+        repository_->findActiveSessionWithUserByTokenHash(token_hash);
+    if (!session_with_user.has_value()) {
         return false;
     }
-    const auto user = repository_->findUserById(session->owner_id);
-    if (!user.has_value()) {
-        return false;
-    }
-    user_id = user->id;
-    username = user->username;
-    role = user->role;
+    user_id = session_with_user->user_id;
+    username = session_with_user->username;
+    role = session_with_user->role;
     return true;
 }
 

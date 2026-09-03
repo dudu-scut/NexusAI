@@ -202,6 +202,12 @@ private:
     // Crash guard: best-effort "failed" finalize when the pipeline throws,
     // so runtime PG/Redis faults never escape into the gRPC handler.
     void abortDurableRun(DurableQueryRun& run, const std::string& reason);
+    // P17(l): profile-extraction trigger (successful terminal states only).
+    // Queues the owner onto profile:pending behind a message-threshold /
+    // absent-profile gate and an atomic HSETNX dedup guard.
+    // message_count is the caller's shared PG round-trip result.
+    void maybeScheduleProfileExtraction(const DurableQueryRun& run,
+                                        int message_count);
     static std::int64_t estimateTokens(const std::string& question);
     static common::BudgetLimits budgetLimitsFromEnvironment();
 

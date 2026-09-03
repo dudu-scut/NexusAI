@@ -35,6 +35,7 @@
 #include <cstdlib>
 #include <queue>
 #include <mutex>
+#include <unordered_map>
 
 #ifndef NEXUSAI_MIGRATIONS_DEFAULT_DIR
 #error "NEXUSAI_MIGRATIONS_DEFAULT_DIR must be provided by server/CMakeLists.txt"
@@ -334,14 +335,65 @@ int main(int argc, char* argv[]) {
     // as cache-tier data.
     agent_rpc::common::BackgroundScheduler::instance().scheduleAtFixedRate(
         "profile_extraction",
-        []() { agent_rpc::common::ProfileSummarizer::processPending(); },
+        [&server]() {
+            // P17(m): PostgreSQL conversation history is the extraction
+            // material source (the Redis Tier-1 mirror stays empty).
+            agent_rpc::common::ProfileSummarizer::processPending(
+                server.getQueryDomainRepository());
+        },
         std::chrono::seconds(300));
 
     // Register health evaluation task (every 30 seconds)
     agent_rpc::common::BackgroundScheduler::instance().scheduleAtFixedRate(
         "health_evaluation",
-        []() {
-            agent_rpc::registry::ServiceRegistry::evaluateAllHealth();
+        [&server]() {
+            auto ai_service = server.getAIQueryService();
+            auto* router = ai_service ? ai_service->getAgentRouter() : nullptr;
+            if (!router) {
+                return;
+            }
+
+            // Combine heartbeat-timeout and metric-based signals into one
+            // verdict per agent: UNHEALTHY latches — either a dead
+            // heartbeat or UNHEALTHY metrics excludes the agent from
+            // routing; it only recovers when both signals are healthy
+            // again. DEGRADED is observability-only (logged by the
+            // dashboard, not excluded — the router flag is boolean).
+            std::unordered_map<std::string, bool> unhealthy_by_agent;
+            auto accumulate = [&unhealthy_by_agent](const std::string& id,
+                                                    bool unhealthy) {
+                auto it = unhealthy_by_agent.find(id);
+                if (it == unhealthy_by_agent.end()) {
+                    unhealthy_by_agent.emplace(id, unhealthy);
+                } else {
+                    it->second = it->second || unhealthy;
+                }
+            };
+
+            // Heartbeat timeout guard (90s): agents that stop calling home
+            // are excluded; a fresh heartbeat restores them.
+            agent_rpc::registry::ServiceRegistry::evaluateHeartbeatTimeouts(
+                std::chrono::seconds(90),
+                [&accumulate](const std::string& agent_id, bool timed_out) {
+                    accumulate(agent_id, timed_out);
+                });
+
+            // Metric-based evaluation: write results back to the router so
+            // the is_healthy flag drives the 11 routing exclusion checks.
+            agent_rpc::registry::ServiceRegistry::evaluateAllHealth(
+                [&accumulate](const std::string& agent_id,
+                              agent_rpc::registry::HealthStatus status) {
+                    accumulate(agent_id,
+                               status == agent_rpc::registry::HealthStatus::UNHEALTHY);
+                });
+
+            for (const auto& [agent_id, unhealthy] : unhealthy_by_agent) {
+                if (unhealthy) {
+                    router->markAgentUnhealthy(agent_id);
+                } else {
+                    router->markAgentHealthy(agent_id);
+                }
+            }
         },
         std::chrono::seconds(30));
 

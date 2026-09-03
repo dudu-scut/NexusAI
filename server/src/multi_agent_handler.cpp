@@ -16,10 +16,20 @@
 #include "agent_rpc/common/env_loader.h"
 #include "agent_rpc/common/trace_context.h"
 #include "agent_rpc/common/memory_service.h"
+#include "agent_rpc/registry/service_registry.h"
+#include "agent_rpc/a2a_adapter/url_validation.h"
 
 #include <a2a/client/a2a_client.hpp>
 #include <a2a/llm_client.hpp>
 #include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <chrono>
+#include <mutex>
+#include <string>
+#include <unordered_map>
 
 #include "ai_query.grpc.pb.h"
 #include "ai_query.pb.h"
@@ -377,6 +387,11 @@ grpc::Status MultiAgentHandler::handleQuery(
             recordInvocationFact(request_id, plan.single_agent_id,
                                  plan.single_agent_skill,
                                  success ? "success" : "failed", duration.count());
+            // Live health metrics for the 30s evaluation loop (P14a).
+            if (!plan.single_agent_id.empty()) {
+                agent_rpc::registry::ServiceRegistry::recordAgentCall(
+                    plan.single_agent_id, success, duration.count());
+            }
             return success ? grpc::Status::OK
                            : grpc::Status(grpc::StatusCode::INTERNAL,
                                           QueryHelpers::sanitizeErrorMessage(response->status().message()));
@@ -409,6 +424,11 @@ grpc::Status MultiAgentHandler::handleQuery(
             recordInvocationFact(request_id, plan.single_agent_id,
                                  plan.single_agent_skill,
                                  success ? "success" : "failed", duration.count());
+            // Live health metrics for the 30s evaluation loop (P14a).
+            if (!plan.single_agent_id.empty()) {
+                agent_rpc::registry::ServiceRegistry::recordAgentCall(
+                    plan.single_agent_id, success, duration.count());
+            }
             return success ? grpc::Status::OK
                            : grpc::Status(grpc::StatusCode::INTERNAL,
                                           QueryHelpers::sanitizeErrorMessage(response->status().message()));
@@ -422,10 +442,14 @@ grpc::Status MultiAgentHandler::handleQuery(
 
     std::string memory_ctx = QueryHelpers::buildMemoryContext(request);
 
-    auto call_agent = buildCallAgent(request);
+    auto call_agent = buildCallAgent(request, effective_timeout_seconds);
+    // P20: a timed-out subtask aborts its in-flight A2A call.
+    auto on_cancel = [this](const std::string& agent_url) {
+        cancelInFlight(agent_url);
+    };
 
     try {
-        auto results = task_executor_->execute(plan, call_agent);
+        auto results = task_executor_->execute(plan, call_agent, nullptr, on_cancel);
         auto aggregated = result_aggregator_->aggregate(plan, results);
 
         // One invocation fact per executed subtask (owner from auth context).
@@ -439,6 +463,14 @@ grpc::Status MultiAgentHandler::handleQuery(
                     skill_name = task.required_skill;
                     break;
                 }
+            }
+            // Prefer the actually executed agent (routing fallback may pick
+            // a different agent than the pre-resolved preference).
+            std::string actual_agent_id =
+                result.agent_id.empty() ? agent_id : result.agent_id;
+            if (!actual_agent_id.empty()) {
+                agent_rpc::registry::ServiceRegistry::recordAgentCall(
+                    actual_agent_id, result.success, result.duration_ms);
             }
             recordInvocationFact(request_id, agent_id, skill_name,
                                  result.success ? "success" : "failed",
@@ -594,7 +626,25 @@ grpc::Status MultiAgentHandler::handleQueryStream(
 
     update_status_(request_id, "working", "", "", "");
 
-    auto call_agent = buildCallAgent(request);
+    // Propagate gRPC deadline to A2A call timeouts (same contraction logic
+    // as the sync path; the gateway now sets a real deadline from the
+    // request's timeout_seconds, so this activates for streaming too).
+    auto gpr_deadline = context->deadline();
+    int effective_timeout_seconds = rpc_config_->timeout_seconds;
+    if (gpr_deadline != std::chrono::system_clock::time_point::max()) {
+        auto now = std::chrono::system_clock::now();
+        auto remaining = std::chrono::duration_cast<std::chrono::seconds>(
+            gpr_deadline - now);
+        if (remaining.count() > 0 && remaining.count() < effective_timeout_seconds) {
+            effective_timeout_seconds = static_cast<int>(remaining.count());
+        }
+    }
+
+    auto call_agent = buildCallAgent(request, effective_timeout_seconds);
+    // P20: a timed-out subtask aborts its in-flight A2A call.
+    auto on_cancel = [this](const std::string& agent_url) {
+        cancelInFlight(agent_url);
+    };
 
     try {
         orchestrator::ProgressCallback progress_cb =
@@ -617,7 +667,7 @@ grpc::Status MultiAgentHandler::handleQueryStream(
                 writer->Write(stream_event);
             };
 
-        auto results = task_executor_->execute(plan, call_agent, progress_cb);
+        auto results = task_executor_->execute(plan, call_agent, progress_cb, on_cancel);
         auto aggregated = result_aggregator_->aggregate(plan, results);
 
         // One invocation fact per executed subtask (owner from auth context).
@@ -631,6 +681,14 @@ grpc::Status MultiAgentHandler::handleQueryStream(
                     skill_name = task.required_skill;
                     break;
                 }
+            }
+            // Prefer the actually executed agent (routing fallback may pick
+            // a different agent than the pre-resolved preference).
+            std::string actual_agent_id =
+                result.agent_id.empty() ? agent_id : result.agent_id;
+            if (!actual_agent_id.empty()) {
+                agent_rpc::registry::ServiceRegistry::recordAgentCall(
+                    actual_agent_id, result.success, result.duration_ms);
             }
             recordInvocationFact(request_id, agent_id, skill_name,
                                  result.success ? "success" : "failed",
@@ -769,6 +827,10 @@ MultiAgentHandler::SingleStreamOutcome MultiAgentHandler::executeSingleAgentStre
             recordInvocationFact(request_id, plan.single_agent_id,
                                  plan.single_agent_skill, "failed",
                                  duration.count());
+            if (!plan.single_agent_id.empty()) {
+                agent_rpc::registry::ServiceRegistry::recordAgentCall(
+                    plan.single_agent_id, false, duration.count());
+            }
         }
         return SingleStreamOutcome::Failed;
     }
@@ -785,10 +847,14 @@ MultiAgentHandler::SingleStreamOutcome MultiAgentHandler::executeSingleAgentStre
         tls_stream_result.error = lower_error;
         update_status_(request_id, "failed", "", "", lower_error);
         if (!fast_path_probe) {
+            auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start_time).count();
             recordInvocationFact(request_id, plan.single_agent_id,
-                                 plan.single_agent_skill, "failed",
-                                 std::chrono::duration_cast<std::chrono::milliseconds>(
-                                     std::chrono::steady_clock::now() - start_time).count());
+                                 plan.single_agent_skill, "failed", duration_ms);
+            if (!plan.single_agent_id.empty()) {
+                agent_rpc::registry::ServiceRegistry::recordAgentCall(
+                    plan.single_agent_id, false, duration_ms);
+            }
         }
         return SingleStreamOutcome::Failed;
     }
@@ -796,10 +862,14 @@ MultiAgentHandler::SingleStreamOutcome MultiAgentHandler::executeSingleAgentStre
         tls_stream_result.error = "Failed to write stream event";
         update_status_(request_id, "failed", "", "", "Failed to write stream event");
         if (!fast_path_probe) {
+            auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start_time).count();
             recordInvocationFact(request_id, plan.single_agent_id,
-                                 plan.single_agent_skill, "failed",
-                                 std::chrono::duration_cast<std::chrono::milliseconds>(
-                                     std::chrono::steady_clock::now() - start_time).count());
+                                 plan.single_agent_skill, "failed", duration_ms);
+            if (!plan.single_agent_id.empty()) {
+                agent_rpc::registry::ServiceRegistry::recordAgentCall(
+                    plan.single_agent_id, false, duration_ms);
+            }
         }
         return SingleStreamOutcome::Failed;
     }
@@ -813,6 +883,10 @@ MultiAgentHandler::SingleStreamOutcome MultiAgentHandler::executeSingleAgentStre
     recordInvocationFact(request_id, plan.single_agent_id,
                          plan.single_agent_skill, "success",
                          duration.count());
+    if (!plan.single_agent_id.empty()) {
+        agent_rpc::registry::ServiceRegistry::recordAgentCall(
+            plan.single_agent_id, true, duration.count());
+    }
     // Hand the acting agent back so the service layer can run the
     // agent-switch memory pipeline on the streaming path.
     tls_stream_result.agent_id = plan.single_agent_id;
@@ -821,36 +895,129 @@ MultiAgentHandler::SingleStreamOutcome MultiAgentHandler::executeSingleAgentStre
 }
 
 std::function<std::string(const std::string&, const std::string&)>
-MultiAgentHandler::buildCallAgent(const agent_communication::AIQueryRequest* request) {
+MultiAgentHandler::buildCallAgent(const agent_communication::AIQueryRequest* request,
+                                  int effective_timeout_seconds) {
     std::string memory_ctx = QueryHelpers::buildMemoryContext(request);
 
-    return [this, memory_ctx](const std::string& agent_url,
-                               const std::string& prompt) -> std::string {
+    return [this, memory_ctx, effective_timeout_seconds](
+               const std::string& agent_url,
+               const std::string& prompt) -> std::string {
         std::string enriched_prompt = prompt;
         if (!memory_ctx.empty()) {
             enriched_prompt = memory_ctx + "\n" + prompt;
         }
 
-        a2a::A2AClient client(agent_url);
-        client.set_timeout(rpc_config_->timeout_seconds);
-
-        a2a::AgentMessage msg = a2a::AgentMessage::create()
-            .with_role(a2a::MessageRole::User)
-            .with_text(enriched_prompt);
-
-        auto params = a2a::MessageSendParams::create().with_message(msg);
-        auto a2a_response = client.send_message(params);
-        if (a2a_response.is_task()) {
-            for (const auto& artifact : a2a_response.as_task().artifacts()) {
-                if (artifact.content().has_value()) {
-                    return artifact.content().value();
-                }
-            }
-        } else if (a2a_response.is_message()) {
-            return a2a_response.as_message().get_text();
+        // P21 L1: the DAG delegation path was the naked path — validate the
+        // agent URL with the same real-parse checks as the direct paths.
+        std::string url_err;
+        if (!agent_rpc::a2a_adapter::validateAgentUrl(agent_url, url_err)) {
+            throw std::runtime_error("Agent URL rejected: " + url_err);
         }
-        return "";
+
+        // P20: register an abort flag for this in-flight call so a timed-out
+        // subtask can interrupt the blocking HTTP transfer. The flag is
+        // erased on every exit path (success, exception).
+        auto abort_flag = std::make_shared<std::atomic<bool>>(false);
+        {
+            std::lock_guard<std::mutex> lock(in_flight_mutex_);
+            in_flight_calls_.emplace(agent_url, abort_flag);
+        }
+        auto unregister = [this, &agent_url, abort_flag]() {
+            unregisterInFlight(agent_url, abort_flag);
+        };
+
+        try {
+            a2a::A2AClient client(agent_url);
+            client.set_abort_flag(abort_flag.get());
+            // P20: the remaining request budget tightens the HTTP timeout
+            // instead of the fixed rpc_config value.
+            client.set_timeout(std::max(1L, static_cast<long>(std::min(
+                effective_timeout_seconds, rpc_config_->timeout_seconds))));
+
+            // P21 L2 (strict mode): resolve the host, reject blacklisted
+            // addresses, and pin the validated IPs to the connection so the
+            // resolution and the connect share one result (anti-rebinding).
+            std::string host;
+            std::string port_str;
+            if (agent_rpc::a2a_adapter::ssrfStrictModeEnabled() &&
+                agent_rpc::a2a_adapter::splitAgentUrlHostPort(
+                    agent_url, host, port_str)) {
+                std::vector<std::string> ips;
+                std::string host_err;
+                if (!agent_rpc::a2a_adapter::validateResolvedHost(
+                        host, ips, host_err)) {
+                    throw std::runtime_error("Agent host rejected: " + host_err);
+                }
+                // Scheme detection must match L1's case-insensitive parse:
+                // any case of https pins port 443.
+                const bool https =
+                    std::equal(agent_url.begin(),
+                               agent_url.begin() + std::min<size_t>(8, agent_url.size()),
+                               "https://", [](char a, char b) {
+                                   return std::tolower(static_cast<unsigned char>(a)) == b;
+                               });
+                const std::string pin_port =
+                    port_str.empty() ? (https ? "443" : "80") : port_str;
+                std::vector<std::string> resolve_entries;
+                resolve_entries.reserve(ips.size());
+                for (const auto& ip : ips) {
+                    resolve_entries.push_back(host + ":" + pin_port + ":" + ip);
+                }
+                client.set_resolve_entries(resolve_entries);
+            }
+
+            a2a::AgentMessage msg = a2a::AgentMessage::create()
+                .with_role(a2a::MessageRole::User)
+                .with_text(enriched_prompt);
+
+            auto params = a2a::MessageSendParams::create().with_message(msg);
+            auto a2a_response = client.send_message(params);
+            unregister();
+            if (a2a_response.is_task()) {
+                for (const auto& artifact : a2a_response.as_task().artifacts()) {
+                    if (artifact.content().has_value()) {
+                        return artifact.content().value();
+                    }
+                }
+            } else if (a2a_response.is_message()) {
+                return a2a_response.as_message().get_text();
+            }
+            return "";
+        } catch (...) {
+            unregister();
+            throw;
+        }
     };
+}
+
+void MultiAgentHandler::cancelInFlight(const std::string& agent_url) {
+    // Collect all live flags for the URL first (lock scope), then flip them
+    // outside the lock; a timed-out subtask aborts every call sharing its
+    // target URL.
+    std::vector<std::shared_ptr<std::atomic<bool>>> flags;
+    {
+        std::lock_guard<std::mutex> lock(in_flight_mutex_);
+        auto range = in_flight_calls_.equal_range(agent_url);
+        for (auto it = range.first; it != range.second; ++it) {
+            flags.push_back(it->second);
+        }
+    }
+    for (auto& flag : flags) {
+        flag->store(true);
+    }
+}
+
+void MultiAgentHandler::unregisterInFlight(
+    const std::string& agent_url,
+    const std::shared_ptr<std::atomic<bool>>& flag) {
+    std::lock_guard<std::mutex> lock(in_flight_mutex_);
+    auto range = in_flight_calls_.equal_range(agent_url);
+    for (auto it = range.first; it != range.second; ++it) {
+        if (it->second == flag) {
+            in_flight_calls_.erase(it);
+            return;
+        }
+    }
 }
 
 } // namespace server

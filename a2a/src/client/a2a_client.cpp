@@ -207,6 +207,14 @@ void A2AClient::set_timeout(long seconds) {
     impl_->http_client_.set_timeout(seconds);
 }
 
+void A2AClient::set_abort_flag(const std::atomic<bool>* flag) {
+    impl_->http_client_.set_abort_flag(flag);
+}
+
+void A2AClient::set_resolve_entries(const std::vector<std::string>& entries) {
+    impl_->http_client_.set_resolve_entries(entries);
+}
+
 void A2AClient::add_header(const std::string& key, const std::string& value) {
     impl_->http_client_.add_header(key, value);
 }

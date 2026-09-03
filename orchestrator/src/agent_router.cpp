@@ -11,6 +11,7 @@
 #include <agent_rpc/mcp/rag/embedding_service.h>
 #include <agent_rpc/mcp/rag/vector_index.h>
 #include <agent_rpc/mcp/rag/embedding_cache.h>
+#include <agent_rpc/mcp/rag/semantic_cache_index.h>
 #endif
 #include <a2a/llm_client.hpp>
 #include <algorithm>
@@ -164,9 +165,15 @@ std::optional<AgentInfo> AgentRouter::selectAgent(
     bool used_fallback = false;
 
     if (skills_to_match.empty() && strategy_ == RoutingStrategy::SKILL_MATCH) {
-        // Tier 0: Embedding — high confidence only (≥ high_threshold)
+        // Tier 0: Embedding — high confidence only (≥ high_threshold).
+        // The query vector is kept so the P10(c) intent cache can reuse it
+        // (a cached intent costs zero extra embed calls).
+        std::vector<float> query_vector;
+        bool have_query_vector = false;
         if (isEmbeddingEnabled()) {
-            std::string emb_skill = analyzeRequiredSkillEmbedding(question);
+            std::string emb_skill =
+                analyzeRequiredSkillEmbedding(question, &query_vector);
+            have_query_vector = !query_vector.empty();
             if (!emb_skill.empty()) {
                 skills_to_match.push_back(emb_skill);
             }
@@ -177,6 +184,10 @@ std::optional<AgentInfo> AgentRouter::selectAgent(
             std::string llm_skill = analyzeIntentWithLLM(question);
             if (!llm_skill.empty()) {
                 skills_to_match.push_back(llm_skill);
+                // P10(c): cache the resolved intent for similar queries.
+                if (have_query_vector) {
+                    storeIntentCache(query_vector, llm_skill);
+                }
             }
         }
 
@@ -336,19 +347,54 @@ void AgentRouter::updateAgentList(const std::vector<AgentInfo>& agents) {
         agents_[agent.id] = agent;
     }
     rebuildSkillKeywordIndex();
+    // P10(c): the cache stores intents keyed by skill name (agent_id slot
+    // carries the skill); invalidate every known skill because the skill
+    // set just changed wholesale. (MCP-only member — no-op otherwise.)
+#ifdef AGENT_RPC_ENABLE_MCP
+    if (intent_cache_) {
+        for (const auto& [id, agent] : agents_) {
+            (void)id;
+            for (const auto& skill : agent.skills) {
+                intent_cache_->invalidateAgent(skill);
+            }
+        }
+    }
+#endif
 }
 
 void AgentRouter::addAgent(const AgentInfo& agent) {
     std::lock_guard<std::mutex> lock(agents_mutex_);
     agents_[agent.id] = agent;
     rebuildSkillKeywordIndex();
+    // P10(c): an agent's skill set may have changed — drop intents per skill.
+#ifdef AGENT_RPC_ENABLE_MCP
+    if (intent_cache_) {
+        for (const auto& skill : agent.skills) {
+            intent_cache_->invalidateAgent(skill);
+        }
+    }
+#endif
 }
 
 bool AgentRouter::removeAgent(const std::string& agent_id) {
     std::lock_guard<std::mutex> lock(agents_mutex_);
+    std::vector<std::string> removed_skills;
+    auto it = agents_.find(agent_id);
+    if (it != agents_.end()) {
+        removed_skills = it->second.skills;
+    }
     bool removed = agents_.erase(agent_id) > 0;
     if (removed) {
         rebuildSkillKeywordIndex();
+        // P10(c): intents cached for the removed agent's skills must not be
+        // reused.
+#ifdef AGENT_RPC_ENABLE_MCP
+        if (intent_cache_) {
+            for (const auto& skill : removed_skills) {
+                intent_cache_->invalidateAgent(skill);
+            }
+        }
+#endif
     }
     return removed;
 }
@@ -996,6 +1042,7 @@ bool AgentRouter::enableEmbedding(const EmbeddingRouterConfig& config) {
             embedding_service_.reset();
             skill_index_.reset();
             embedding_cache_.reset();
+            intent_cache_.reset();
             return true;
         }
 
@@ -1010,6 +1057,19 @@ bool AgentRouter::enableEmbedding(const EmbeddingRouterConfig& config) {
             skill_index_ = std::make_unique<agent_rpc::mcp::rag::VectorIndex>();
             skill_index_->setVersion(config.model);
 
+            // P10(c): intent cache (NEXUSAI_INTENT_CACHE=1, default off).
+            // Similar queries reuse the cached intent skill, skipping the
+            // LLM classification tier; the cache shares the tier's query
+            // vector so no extra embed call is paid. The cache is lazily
+            // cleaned before each store (bounded entry count keeps the
+            // scan cheap).
+            if (agent_rpc::common::envOrDefault("NEXUSAI_INTENT_CACHE", "0") == "1") {
+                intent_cache_ = std::make_unique<agent_rpc::mcp::SemanticCacheIndex>(
+                    embedding_service_.get());
+            } else {
+                intent_cache_.reset();
+            }
+
             agent_rpc::mcp::rag::CacheConfig cache_config;
             cache_config.max_size = 500;
             cache_config.ttl_seconds = 3600;
@@ -1019,6 +1079,7 @@ bool AgentRouter::enableEmbedding(const EmbeddingRouterConfig& config) {
             embedding_service_.reset();
             skill_index_.reset();
             embedding_cache_.reset();
+            intent_cache_.reset();
             embedding_config_.enabled = false;
             return false;
         }
@@ -1028,6 +1089,7 @@ bool AgentRouter::enableEmbedding(const EmbeddingRouterConfig& config) {
             embedding_service_.reset();
             skill_index_.reset();
             embedding_cache_.reset();
+            intent_cache_.reset();
             embedding_config_.enabled = false;
             return false;
         }
@@ -1114,6 +1176,18 @@ AgentRouter::searchBestSkillEmbeddingLocked(const std::string& question) {
     // Requires embedding_mutex_ held.
     try {
         std::vector<float> query_embedding = embedding_service_->embed(question);
+        return searchBestSkillEmbeddingLockedWithVector(query_embedding);
+    } catch (const std::exception&) {
+        // Embedding failed, caller falls through to next tier
+    }
+    return std::nullopt;
+}
+
+std::optional<std::pair<std::string, double>>
+AgentRouter::searchBestSkillEmbeddingLockedWithVector(
+    const std::vector<float>& query_embedding) {
+    // Requires embedding_mutex_ held.
+    try {
         auto search_results = skill_index_->search(query_embedding, 1, 0.0f);
         if (!search_results.empty()) {
             const auto& best = search_results[0];
@@ -1121,25 +1195,60 @@ AgentRouter::searchBestSkillEmbeddingLocked(const std::string& question) {
                                   static_cast<double>(best.similarity));
         }
     } catch (const std::exception&) {
-        // Embedding failed, caller falls through to next tier
+        // Search failed, caller falls through to next tier
     }
     return std::nullopt;
 }
 
-std::string AgentRouter::analyzeRequiredSkillEmbedding(const std::string& question) {
+std::string AgentRouter::analyzeRequiredSkillEmbedding(
+    const std::string& question,
+    std::vector<float>* out_query_vector) {
     if (!isEmbeddingEnabled()) return {};
 
     embedding_query_count_.fetch_add(1);
 
     std::lock_guard<std::mutex> lock(embedding_mutex_);
 
-    auto best = searchBestSkillEmbeddingLocked(question);
+    std::vector<float> query_embedding;
+    try {
+        query_embedding = embedding_service_->embed(question);
+    } catch (const std::exception&) {
+        return {};  // embedding failed, caller falls through to next tier
+    }
+    if (out_query_vector) {
+        *out_query_vector = query_embedding;
+    }
+
+    // P10(c): intent cache lookup BEFORE the LLM tier. A high-similarity
+    // hit (≥ 0.92, the cache's own threshold) reuses the previously
+    // resolved intent skill — no LLM classification call.
+    if (intent_cache_) {
+        auto cached = intent_cache_->lookup(query_embedding);
+        if (cached && !cached->agent_id.empty()) {
+            return cached->agent_id;
+        }
+    }
+
+    auto best = searchBestSkillEmbeddingLockedWithVector(query_embedding);
     if (best && best->second >= embedding_config_.high_threshold) {
         embedding_hit_count_.fetch_add(1);
         return best->first;
     }
 
     return {};
+}
+
+void AgentRouter::storeIntentCache(const std::vector<float>& query_vector,
+                                   const std::string& skill) {
+    // P10(c): lazy cleanup keeps expired entries bounded (the semantic cache
+    // has a 24h TTL; no periodic scheduler owns this instance). The cache
+    // pointer is configured ONLY during startup enableEmbedding() but is
+    // still accessed under embedding_mutex_ here, mirroring the lookup path
+    // and avoiding any pointer-level data race.
+    std::lock_guard<std::mutex> lock(embedding_mutex_);
+    if (!intent_cache_ || skill.empty()) return;
+    intent_cache_->cleanup();
+    intent_cache_->store(query_vector, skill, skill, true);
 }
 
 std::optional<AgentRouter::HighConfidenceSkill>
@@ -1168,10 +1277,18 @@ bool AgentRouter::isEmbeddingEnabled() const { return false; }
 
 void AgentRouter::buildSkillEmbeddingIndex() {}
 
-std::string AgentRouter::analyzeRequiredSkillEmbedding(const std::string&) { return {}; }
+std::string AgentRouter::analyzeRequiredSkillEmbedding(const std::string&,
+                                                       std::vector<float>*) { return {}; }
+
+void AgentRouter::storeIntentCache(const std::vector<float>&,
+                                   const std::string&) {}
 
 std::optional<std::pair<std::string, double>>
 AgentRouter::searchBestSkillEmbeddingLocked(const std::string&) { return std::nullopt; }
+
+std::optional<std::pair<std::string, double>>
+AgentRouter::searchBestSkillEmbeddingLockedWithVector(
+    const std::vector<float>&) { return std::nullopt; }
 
 std::optional<AgentRouter::HighConfidenceSkill>
 AgentRouter::resolveHighConfidenceSkill(const std::string&) { return std::nullopt; }

@@ -31,6 +31,11 @@ struct SubTaskResult {
     bool success = false;
     int64_t duration_ms = 0;
     std::string error_message;
+    // Actual agent that executed the subtask (preferred agent when it was
+    // healthy, otherwise the routing fallback pick). Populated by
+    // executeSubtask so server-layer callers can record per-agent metrics
+    // without depending on the registry module.
+    std::string agent_id;
     // Spans captured in the subtask worker thread (P5: merged back into the
     // parent TraceContext after all futures of a layer are collected).
     // Empty for timed-out/abandoned tasks and when trace propagation is off.
@@ -63,6 +68,12 @@ using ProgressCallback = std::function<void(const SubTaskEvent&)>;
 using AgentCallFn = std::function<std::string(const std::string& agent_url,
                                                const std::string& prompt)>;
 
+// P20: cancellation hook for in-flight subtask calls. Invoked with the
+// pre-resolved agent URL when a subtask times out or the global deadline
+// is exhausted, so the caller can abort the blocked A2A HTTP call instead
+// of leaving a zombie thread behind.
+using CancelFn = std::function<void(const std::string& agent_url)>;
+
 // ── TaskExecutor class ─────────────────────────────────────────────────────
 
 class TaskExecutor {
@@ -74,12 +85,16 @@ public:
      * @param plan              The execution plan from TaskPlanner
      * @param call_agent        Function that sends a prompt to an agent by skill
      * @param on_progress       Optional callback for real-time subtask events
+     * @param on_cancel         Optional callback invoked with the agent URL of
+     *                          a subtask whose execution timed out (P20); null
+     *                          keeps the legacy no-cancel behavior
      * @return Map of subtask_id → SubTaskResult
      */
     std::unordered_map<std::string, SubTaskResult> execute(
         const ExecutionPlan& plan,
         const AgentCallFn& call_agent,
-        const ProgressCallback& on_progress = nullptr);
+        const ProgressCallback& on_progress = nullptr,
+        const CancelFn& on_cancel = nullptr);
 
 private:
     // Topological sort into layers (same-layer = parallel, cross-layer = serial)
@@ -91,11 +106,24 @@ private:
         const SubTask& subtask,
         const std::unordered_map<std::string, SubTaskResult>& results) const;
 
-    // Execute one subtask (called inside std::async)
+    // Resolve the execution target for a subtask: preferred (healthy) agent
+    // first, four-tier routing fallback second. Throws when no agent is
+    // available. Extracted so the single/parallel branches and the P20
+    // cancellation hook share one resolution path.
+    std::pair<std::string /*url*/, std::string /*agent_id*/> resolveAgent(
+        const SubTask& subtask) const;
+
+    // Execute one subtask (called inside std::async). When pre_resolved_url
+    // is non-empty the pre-resolved target is used directly instead of
+    // re-routing — the caller resolves once so the timeout cancellation
+    // target matches the actually executed agent (routing fallbacks are
+    // non-deterministic across calls).
     SubTaskResult executeSubtask(
         const SubTask& subtask,
         const std::string& enriched_prompt,
-        const AgentCallFn& call_agent);
+        const AgentCallFn& call_agent,
+        const std::string& pre_resolved_url = "",
+        const std::string& pre_resolved_agent_id = "");
 
     AgentRouter& router_;
     ExecutorConfig config_;

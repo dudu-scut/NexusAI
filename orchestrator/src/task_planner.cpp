@@ -7,6 +7,7 @@
 #include "agent_rpc/orchestrator/agent_router.h"
 #include "agent_rpc/common/trace_context.h"
 #include "agent_rpc/common/cost_tracker.h"
+#include "agent_rpc/common/logger.h"
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <stdexcept>
@@ -18,8 +19,12 @@ namespace orchestrator {
 using json = nlohmann::json;
 
 TaskPlanner::TaskPlanner(const TaskPlannerConfig& config)
+    : TaskPlanner(config, std::make_unique<LLMClient>(config.api_key, config.model, config.api_url))
+{}
+
+TaskPlanner::TaskPlanner(const TaskPlannerConfig& config, std::unique_ptr<LLMClient> llm_client)
     : config_(config)
-    , llm_client_(std::make_unique<LLMClient>(config.api_key, config.model, config.api_url))
+    , llm_client_(std::move(llm_client))
 {}
 
 ExecutionPlan TaskPlanner::plan(
@@ -39,40 +44,88 @@ ExecutionPlan TaskPlanner::plan(
 
     // Start planning trace span
     auto* trace = agent_rpc::common::TraceContext::current();
-    auto plan_start = std::chrono::steady_clock::now();
     if (trace) {
         trace->startSpan("planning", "planner");
     }
 
     try {
-        std::string response = llm_client_->chat(
-            "你是一个任务规划器，严格按照 JSON 格式返回结果，不要输出其他内容。",
-            prompt);
+        int dropped_count = 0;
+        // Worst drop count observed across attempts: even when the retry
+        // recovers every task, the first attempt's silent loss stays
+        // visible in the span metadata for post-hoc inspection.
+        int observed_drops = 0;
+        // Retry exactly once when the LLM response contains subtasks with
+        // missing critical fields (empty id/description): the retry prompt
+        // tells the model what went wrong. The hard cap of two attempts
+        // prevents unbounded loops; if the retry still drops tasks we accept
+        // the result (fail-soft baseline unchanged).
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            std::string attempt_prompt = prompt;
+            if (attempt > 0) {
+                attempt_prompt += "\n\n注意：上次输出有 " + std::to_string(dropped_count) +
+                    " 个任务缺少 description 字段（或缺少 id），被平台丢弃。"
+                    "请确保每个任务都包含 id、skill 和 description 字段后重新输出。";
+            }
 
-        // End planning span and record token usage
+            auto attempt_start = std::chrono::steady_clock::now();
+
+            std::string response = llm_client_->chat(
+                "你是一个任务规划器，严格按照 JSON 格式返回结果，不要输出其他内容。",
+                attempt_prompt);
+            auto attempt_end = std::chrono::steady_clock::now();
+
+            // Estimate-based accounting: LLMClient::chat() does not expose
+            // provider token usage, so tokens are estimated (64 message-skeleton
+            // tokens + ~4 bytes per token). Passing through provider usage is a
+            // long-term direction. Every attempt is a real LLM call, so every
+            // attempt is recorded with its own latency.
+            int64_t attempt_latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                attempt_end - attempt_start).count();
+            agent_rpc::common::CostTracker::instance().recordLLMCall(
+                trace ? trace->traceId() : "",
+                "",            // user_id — not available at planner level
+                "",            // context_id — not available at planner level
+                "",            // no specific agent
+                "planning",
+                static_cast<int>(64 + attempt_prompt.size() / 4),  // prompt_tokens (estimate)
+                static_cast<int>(response.size() / 4),             // completion_tokens (estimate)
+                llm_client_->model(),
+                attempt_latency_ms
+            );
+
+            dropped_count = 0;
+            plan = parsePlanResponse(response, query, dropped_count);
+            observed_drops = std::max(observed_drops, dropped_count);
+
+            if (dropped_count == 0) {
+                break;  // nothing dropped — no retry
+            }
+            if (attempt == 0) {
+                LOG_WARN("parsePlanResponse dropped " + std::to_string(dropped_count) +
+                         " subtasks (missing id/description), retrying once with corrected prompt");
+            } else {
+                LOG_WARN("parsePlanResponse dropped " + std::to_string(dropped_count) +
+                         " subtasks (missing id/description) after retry; accepting result (fail-soft)");
+                break;
+            }
+        }
+
+        // End the planning span exactly once (started above, outside the
+        // retry loop); attach the worst observed dropped-task count as span
+        // metadata so the silent loss becomes visible in trace inspection.
         if (trace) {
+            if (observed_drops > 0) {
+                for (auto it = trace->mutableSpans().rbegin();
+                     it != trace->mutableSpans().rend(); ++it) {
+                    if (it->name == "planning") {
+                        it->metadata_json =
+                            "{\"dropped_tasks\":" + std::to_string(observed_drops) + "}";
+                        break;
+                    }
+                }
+            }
             trace->endSpan();
         }
-        auto plan_end = std::chrono::steady_clock::now();
-        int64_t plan_latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            plan_end - plan_start).count();
-        // Estimate-based accounting: LLMClient::chat() does not expose
-        // provider token usage, so tokens are estimated (64 message-skeleton
-        // tokens + ~4 bytes per token). Passing through provider usage is a
-        // long-term direction.
-        agent_rpc::common::CostTracker::instance().recordLLMCall(
-            trace ? trace->traceId() : "",
-            "",            // user_id — not available at planner level
-            "",            // context_id — not available at planner level
-            "",            // no specific agent
-            "planning",
-            static_cast<int>(64 + prompt.size() / 4),     // prompt_tokens (estimate)
-            static_cast<int>(response.size() / 4),        // completion_tokens (estimate)
-            llm_client_->model(),
-            plan_latency_ms
-        );
-
-        plan = parsePlanResponse(response, query);
     } catch (const std::exception&) {
         // End planning span on error
         if (trace) {
@@ -123,8 +176,18 @@ ExecutionPlan TaskPlanner::parsePlanResponse(
     const std::string& response,
     const std::string& query) const {
 
+    int ignored = 0;
+    return parsePlanResponse(response, query, ignored);
+}
+
+ExecutionPlan TaskPlanner::parsePlanResponse(
+    const std::string& response,
+    const std::string& query,
+    int& dropped_count) const {
+
     ExecutionPlan plan;
     plan.original_query = query;
+    dropped_count = 0;
 
     // Strip markdown code fences if present (LLM sometimes wraps JSON in ```)
     std::string clean = response;
@@ -189,6 +252,7 @@ ExecutionPlan TaskPlanner::parsePlanResponse(
 
         // Skip subtasks with missing critical fields
         if (st.id.empty() || st.description.empty()) {
+            ++dropped_count;
             continue;
         }
 

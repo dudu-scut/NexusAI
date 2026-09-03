@@ -17,6 +17,20 @@ namespace {
     std::mutex live_metrics_mutex_;
     const double kEMALatencyAlpha = 0.1;
     const size_t kSuccessBufferSize = 100;
+    // Minimum recorded samples before metric-based health evaluation is
+    // trusted (cold-start protection: a mostly-uninitialized ring buffer is
+    // noise and must not take an agent down).
+    const int kMinHealthSamples = 20;
+
+    HealthStatus classifyHealth(double success_rate, double latency_ms) {
+        if (success_rate >= 0.95 && latency_ms < 5000) {
+            return HealthStatus::HEALTHY;
+        }
+        if (success_rate >= 0.80 && latency_ms < 30000) {
+            return HealthStatus::DEGRADED;
+        }
+        return HealthStatus::UNHEALTHY;
+    }
 } // anonymous namespace
 
 void ServiceRegistry::recordAgentCall(const std::string& agent_id,
@@ -78,47 +92,99 @@ HealthStatus ServiceRegistry::evaluateHealth(const std::string& agent_id) {
     double latency = m.ema_latency_ms;
 
     // Classification
-    if (success_rate >= 0.95 && latency < 5000) {
-        return HealthStatus::HEALTHY;
-    } else if (success_rate >= 0.80 && latency < 30000) {
-        return HealthStatus::DEGRADED;
-    } else {
-        return HealthStatus::UNHEALTHY;
-    }
+    return classifyHealth(success_rate, latency);
 }
 
 void ServiceRegistry::evaluateAllHealth() {
-    // Collect agent IDs under lock, then evaluate each without the lock.
-    std::vector<std::string> agent_ids;
+    // No-argument overload keeps the logging-only behavior; the callback
+    // overload below shares the same evaluation loop.
+    evaluateAllHealth(nullptr);
+}
+
+void ServiceRegistry::evaluateAllHealth(
+    const std::function<void(const std::string&, HealthStatus)>& callback) {
+    // Snapshot (agent_id, status, dashboard fields) under the metrics lock,
+    // then invoke the callback AFTER releasing the lock. The callback is
+    // expected to take router locks (agents_mutex_) — holding live_metrics_
+    // mutex_ while doing so would create an AB-BA deadlock with any path
+    // that takes router locks before calling recordAgentCall.
+    struct Snapshot {
+        std::string agent_id;
+        HealthStatus status;
+        double success_rate;
+        double ema_latency_ms;
+        int active_requests;
+    };
+    std::vector<Snapshot> snapshots;
     {
         std::lock_guard<std::mutex> lock(live_metrics_mutex_);
         for (const auto& pair : live_metrics_) {
-            agent_ids.push_back(pair.first);
+            const auto& m = pair.second;
+            // Cold-start protection: skip agents without enough samples.
+            if (m.total_writes < kMinHealthSamples) {
+                continue;
+            }
+            int valid_count = (m.total_writes >= 100) ? 100 : m.buffer_idx;
+            if (valid_count <= 0) valid_count = 1;
+            int success_count = 0;
+            for (int i = 0; i < valid_count && i < 100; ++i) {
+                if (m.recent_results[i]) success_count++;
+            }
+            double success_rate = static_cast<double>(success_count) / valid_count;
+            snapshots.push_back(Snapshot{
+                pair.first,
+                classifyHealth(success_rate, m.ema_latency_ms),
+                success_rate,
+                m.ema_latency_ms,
+                m.active_requests.load()});
         }
     }
 
-    for (const auto& agent_id : agent_ids) {
-        auto status = evaluateHealth(agent_id);
-        std::lock_guard<std::mutex> lock(live_metrics_mutex_);
-        auto it = live_metrics_.find(agent_id);
-        if (it == live_metrics_.end()) continue;
-        const auto& m = it->second;
-
-        // Compute success rate using total_writes for correct valid_count
-        int valid_count = (m.total_writes >= 100) ? 100 : m.buffer_idx;
-        if (valid_count <= 0) valid_count = 1;
-        int success_count = 0;
-        for (int i = 0; i < valid_count && i < 100; ++i) {
-            if (m.recent_results[i]) success_count++;
+    for (const auto& s : snapshots) {
+        LOG_INFO("[HealthDashboard] Agent " + s.agent_id +
+                 " status=" + (s.status == HealthStatus::HEALTHY ? "HEALTHY" :
+                               s.status == HealthStatus::DEGRADED ? "DEGRADED" : "UNHEALTHY") +
+                 " success_rate=" + std::to_string(s.success_rate) +
+                 " ema_latency=" + std::to_string(s.ema_latency_ms) + "ms" +
+                 " active_requests=" + std::to_string(s.active_requests));
+        if (callback) {
+            callback(s.agent_id, s.status);
         }
-        double success_rate = static_cast<double>(success_count) / valid_count;
+    }
+}
 
-        LOG_INFO("[HealthDashboard] Agent " + agent_id +
-                 " status=" + (status == HealthStatus::HEALTHY ? "HEALTHY" :
-                               status == HealthStatus::DEGRADED ? "DEGRADED" : "UNHEALTHY") +
-                 " success_rate=" + std::to_string(success_rate) +
-                 " ema_latency=" + std::to_string(m.ema_latency_ms) + "ms" +
-                 " active_requests=" + std::to_string(m.active_requests.load()));
+void ServiceRegistry::recordHeartbeat(const std::string& agent_id) {
+    std::lock_guard<std::mutex> lock(live_metrics_mutex_);
+    live_metrics_[agent_id].last_heartbeat = std::chrono::steady_clock::now();
+}
+
+void ServiceRegistry::evaluateHeartbeatTimeouts(
+    std::chrono::seconds timeout,
+    const std::function<void(const std::string&, bool timed_out)>& callback) {
+    if (!callback) {
+        return;
+    }
+
+    std::vector<std::pair<std::string, bool>> results;
+    {
+        std::lock_guard<std::mutex> lock(live_metrics_mutex_);
+        auto now = std::chrono::steady_clock::now();
+        for (const auto& pair : live_metrics_) {
+            const auto& m = pair.second;
+            // Entries created by recordAgentCall before heartbeat wiring
+            // existed always carry a heartbeat timestamp; treat the epoch
+            // default (never stamped) as "not a timeout" to avoid killing
+            // agents based on a missing timestamp.
+            if (m.last_heartbeat == std::chrono::steady_clock::time_point{}) {
+                continue;
+            }
+            bool timed_out = (now - m.last_heartbeat) > timeout;
+            results.emplace_back(pair.first, timed_out);
+        }
+    }
+
+    for (const auto& [agent_id, timed_out] : results) {
+        callback(agent_id, timed_out);
     }
 }
 

@@ -100,7 +100,18 @@ private:
         return out;
     }
 
-    // Redis key helpers — all components sanitized to prevent injection
+    // Redis key helpers — all components sanitized to prevent injection.
+    //
+    // P23 键分类约定（存储分层治理，2026-09-03）：
+    //   - [事实源]（PG 无表、暂居 Redis，待 V014 迁移）——
+    //       nexusai:memory:<uid>（Tier-2 长期记忆 hints）
+    //       nexusai:summary:*（Tier-3 跨 Agent 摘要，7 天 TTL）
+    //       user_profile:<uid>（用户画像）
+    //   - [cache-only]（PG 为事实源的投影，丢失可重建）——
+    //       nexusai:conv:*（Tier-1 会话镜像，主查询读 PG）
+    //   - [transient]（无业务后果的瞬态/协调键）——
+    //       nexusai:last_agent:*、限流计数、分布式短锁、预算实时计数面
+    //   约定：不再新增事实源键；新增键必须按上述三类标注归类。
     static std::string convKey(const std::string& ctx, const std::string& agent) {
         return "nexusai:conv:" + sanitizeKeyComponent(ctx) + ":" + sanitizeKeyComponent(agent);
     }
