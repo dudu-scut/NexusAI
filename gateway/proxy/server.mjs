@@ -295,15 +295,18 @@ function handleRequest(req, res) {
   const urlPath = req.url.split('?')[0]; // strip query string
   const parts = urlPath.split('/').filter(Boolean);
   if (parts.length !== 2) {
-    res.writeHead(400);
-    return res.end('Invalid path. Expected /<service>/<method>');
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ error: 'Invalid path. Expected /<service>/<method>' }));
   }
 
   const [serviceName, methodName] = parts;
 
   // Check service exists
   if (!clients[serviceName]) {
-    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.writeHead(404, {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+    });
     return res.end(JSON.stringify({ error: `Unknown service: ${serviceName}` }));
   }
 
@@ -315,22 +318,31 @@ function handleRequest(req, res) {
     return res.end(JSON.stringify({ error: 'Request body too large (max 1MB)' }));
   }
 
-  let body = '';
+  // Collect Buffers and decode once: string-concatenating chunks splits
+  // multi-byte UTF-8 characters (e.g. Chinese text) at chunk boundaries.
+  const bodyChunks = [];
   let bodySize = 0;
+  let bodyRejected = false;
   req.on('data', (chunk) => {
     bodySize += chunk.length;
     if (bodySize > MAX_BODY_SIZE) {
+      if (bodyRejected) return;
+      bodyRejected = true;
       res.writeHead(413, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Request body too large (max 1MB)' }));
-      req.destroy();
+      // Destroy only after the response has flushed, or the client may see
+      // a connection reset instead of the 413.
+      res.end(JSON.stringify({ error: 'Request body too large (max 1MB)' }), () => {
+        req.destroy();
+      });
       return;
     }
-    body += chunk;
+    bodyChunks.push(chunk);
   });
   req.on('end', async () => {
-    if (bodySize > MAX_BODY_SIZE) return; // already responded
+    if (bodyRejected) return;
     let parsed;
     try {
+      const body = Buffer.concat(bodyChunks).toString('utf8');
       parsed = body ? JSON.parse(body) : {};
     } catch (e) {
       res.writeHead(400, { 'Content-Type': 'application/json' });

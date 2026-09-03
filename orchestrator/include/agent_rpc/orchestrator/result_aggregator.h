@@ -34,7 +34,7 @@ struct AggregatedResult {
 struct AggregatorConfig {
     std::string default_strategy = "concat";   // "concat" | "llm_synthesize"
     std::string api_key;
-    std::string model    = agent_rpc::common::envOrDefault("LLM_MODEL", "deepseek-v4-pro");
+    std::string model    = agent_rpc::common::envOrDefault("LLM_MODEL", "deepseek-v4-flash");
     std::string api_url  = agent_rpc::common::envOrDefault("LLM_API_URL", "https://api.deepseek.com/v1/chat/completions");
 };
 

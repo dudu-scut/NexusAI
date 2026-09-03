@@ -11,7 +11,6 @@ set(ORCHESTRATOR_SOURCES
     src/result_aggregator.cpp
     src/feedback_aggregator.cpp
     src/replay_service.cpp
-    src/cron_scheduler.cpp           # Batch 6
     src/export_service.cpp           # Batch 6
 )
 
@@ -23,7 +22,6 @@ set(ORCHESTRATOR_HEADERS
     include/agent_rpc/orchestrator/task_executor.h
     include/agent_rpc/orchestrator/result_aggregator.h
     include/agent_rpc/orchestrator/feedback_aggregator.h
-    include/agent_rpc/orchestrator/cron_scheduler.h    # Batch 6
     include/agent_rpc/orchestrator/export_service.h    # Batch 6
 )
 

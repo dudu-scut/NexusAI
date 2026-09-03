@@ -149,8 +149,15 @@ void ProfileSummarizer::processPending(QueryDomainRepository* domain_repo) {
         return;
     }
 
-    // 4. Process each pending user
-    for (const auto& user_id : pending_users) {
+    // 4. Pop one user at a time so IDs pushed while this run is in flight
+    //    survive for the next run. The dedup guard is released at the end of
+    //    every iteration regardless of outcome, so a failed user can be
+    //    re-enqueued by a later trigger.
+    for (;;) {
+        std::string user_id;
+        if (!redis.lpop("profile:pending", user_id) || user_id.empty()) {
+            break;  // queue drained
+        }
         try {
             // 4a. Gather conversation data from Redis hash
             //     Key pattern: "nexusai:memory:<user_id>" (user long-term memory)
@@ -216,8 +223,7 @@ void ProfileSummarizer::processPending(QueryDomainRepository* domain_repo) {
             }
 
             if (conversation_history.empty()) {
-                // No data to extract — remove from pending and continue
-                redis.ltrim("profile:pending", 1, 0);  // pop first element below
+                // No data to extract — skip this user (guard released below)
                 continue;
             }
 
@@ -247,7 +253,8 @@ void ProfileSummarizer::processPending(QueryDomainRepository* domain_repo) {
             CURL* curl = curl_easy_init();
             if (!curl) {
                 LOG_ERROR("ProfileSummarizer: curl_easy_init() failed");
-                break;  // curl unavailable — stop processing
+                redis.rpush("profile:pending", user_id);  // retry on the next run
+                break;
             }
 
             struct curl_slist* headers = nullptr;
@@ -262,7 +269,11 @@ void ProfileSummarizer::processPending(QueryDomainRepository* domain_repo) {
             curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
             curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_body);
             curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
-            curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);  // dev only
+            // TLS peer verification is on by default; opt out only for local
+            // development against self-signed endpoints.
+            if (envOrDefault("LLM_TLS_INSECURE", "0") == "1") {
+                curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+            }
 
             CURLcode res = curl_easy_perform(curl);
             curl_slist_free_all(headers);
@@ -325,18 +336,15 @@ void ProfileSummarizer::processPending(QueryDomainRepository* domain_repo) {
                          user_id + " (raw text kept under user_profile_raw)");
             }
 
-            // Release the queue dedup guard for this user so a future
-            // trigger can enqueue again.
-            redis.hdel("profile:queued", user_id);
-
         } catch (const std::exception& e) {
             LOG_ERROR("ProfileSummarizer: Failed for user " + user_id + ": " +
                       e.what());
         }
-    }
 
-    // 5. Clear the pending list (all users processed or skipped)
-    redis.del("profile:pending");
+        // Release the queue dedup guard so a future trigger can enqueue this
+        // user again, whatever the outcome was.
+        redis.hdel("profile:queued", user_id);
+    }
 }
 
 }  // namespace common

@@ -1,7 +1,7 @@
 #include <a2a/models/message_part.hpp>
+#include <nlohmann/json.hpp>
 #include <sstream>
 #include <iomanip>
-#include <algorithm>
 
 namespace a2a {
 
@@ -95,8 +95,8 @@ std::string FilePart::to_json() const {
     oss << "{"
         << "\"kind\":\"file\","
         << "\"file\":{"
-        << "\"filename\":\"" << filename_ << "\","
-        << "\"mimeType\":\"" << mime_type_ << "\","
+        << "\"filename\":\"" << escape_json_string(filename_) << "\","
+        << "\"mimeType\":\"" << escape_json_string(mime_type_) << "\","
         << "\"data\":\"" << base64_encode(data_) << "\""
         << "}}";
     return oss.str();
@@ -114,55 +114,39 @@ std::string DataPart::to_json() const {
 
 // Part factory method
 std::unique_ptr<Part> Part::from_json(const std::string& json) {
-    // Simplified parsing - in production use nlohmann/json
-    
-    // Determine kind — accept "kind" (C++/camelCase) or "type" (Python/snake_case)
-    size_t kind_pos = json.find("\"kind\":");
-    if (kind_pos == std::string::npos) {
-        kind_pos = json.find("\"type\":");
-    }
-    if (kind_pos == std::string::npos) {
+    nlohmann::json parsed = nlohmann::json::parse(json, nullptr, false);
+    if (parsed.is_discarded() || !parsed.is_object()) {
         return nullptr;
     }
-    
-    size_t kind_start = json.find("\"", kind_pos + 7) + 1;
-    size_t kind_end = json.find("\"", kind_start);
-    std::string kind = json.substr(kind_start, kind_end - kind_start);
-    
+
+    // Accept "kind" (v1.0) or "type" (v1.1) as the part discriminator
+    const auto kind_it = parsed.contains("kind") ? parsed.find("kind") : parsed.find("type");
+    if (kind_it == parsed.end() || !kind_it->is_string()) {
+        return nullptr;
+    }
+    const std::string kind = kind_it->get<std::string>();
+
     if (kind == "text") {
-        size_t text_pos = json.find("\"text\":");
-        if (text_pos != std::string::npos) {
-            size_t text_start = json.find("\"", text_pos + 7) + 1;
-            size_t text_end = json.find("\"", text_start);
-            std::string text = json.substr(text_start, text_end - text_start);
-            return std::make_unique<TextPart>(text);
+        const auto text_it = parsed.find("text");
+        if (text_it != parsed.end() && text_it->is_string()) {
+            return std::make_unique<TextPart>(text_it->get<std::string>());
         }
     } else if (kind == "file") {
-        // Simplified file parsing
+        const auto file_it = parsed.find("file");
+        if (file_it != parsed.end() && file_it->is_object()) {
+            return std::make_unique<FilePart>(
+                file_it->value("filename", "file.dat"),
+                file_it->value("mimeType", "application/octet-stream"),
+                std::vector<uint8_t>());
+        }
         return std::make_unique<FilePart>("file.dat", "application/octet-stream", std::vector<uint8_t>());
     } else if (kind == "data") {
-        size_t data_pos = json.find("\"data\":");
-        if (data_pos != std::string::npos) {
-            size_t data_start = data_pos + 7;
-            size_t brace_count = 0;
-            size_t data_end = data_start;
-            
-            for (size_t i = data_start; i < json.length(); ++i) {
-                if (json[i] == '{' || json[i] == '[') brace_count++;
-                else if (json[i] == '}' || json[i] == ']') {
-                    if (brace_count > 0) brace_count--;
-                    else {
-                        data_end = i;
-                        break;
-                    }
-                }
-            }
-            
-            std::string data = json.substr(data_start, data_end - data_start);
-            return std::make_unique<DataPart>(data);
+        const auto data_it = parsed.find("data");
+        if (data_it != parsed.end() && data_it->is_object()) {
+            return std::make_unique<DataPart>(data_it->dump());
         }
     }
-    
+
     return nullptr;
 }
 

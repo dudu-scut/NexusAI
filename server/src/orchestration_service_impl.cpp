@@ -9,6 +9,7 @@
  */
 
 #include "agent_rpc/server/orchestration_service_impl.h"
+#include "agent_rpc/server/ai_query_service.h"
 #include "agent_rpc/server/auth_interceptor.h"
 #include "agent_rpc/server/query_helpers.h"
 #include "agent_rpc/common/logger.h"
@@ -91,7 +92,9 @@ grpc::Status OrchestrationServiceImpl::executePlan(
     // the memory assembly below all live inside this try.
     try {
     if (durable) {
-        domain_repo_->ensureConversation(user_id, context_id, "");
+        if (!domain_repo_->ensureConversation(user_id, context_id, "")) {
+            throw std::runtime_error("ensureConversation failed for " + context_id);
+        }
 
         nlohmann::json plan_snapshot = nlohmann::json::array();
         for (int i = 0; i < dag.nodes_size(); ++i) {
@@ -115,21 +118,27 @@ grpc::Status OrchestrationServiceImpl::executePlan(
         log.route_decision = "execute-plan";
         log.execution_plan = plan_snapshot.dump();
         log.status = "running";
-        domain_repo_->createQueryLog(log);
+        if (!domain_repo_->createQueryLog(log)) {
+            throw std::runtime_error("createQueryLog failed for " + request_id);
+        }
 
         common::TraceRecord trace_row;
         trace_row.id = "trace-" + request_id;
         trace_row.owner_id = user_id;
         trace_row.query_log_id = request_id;
         trace_row.status = "running";
-        domain_repo_->createTrace(trace_row);
+        if (!domain_repo_->createTrace(trace_row)) {
+            throw std::runtime_error("createTrace failed for " + request_id);
+        }
 
         // Budget reservation (idempotent per request_id); rejection ends
-        // the run with a persisted "rejected" terminal state.
+        // the run with a persisted "rejected" terminal state. Same four-layer
+        // limits as the Query pipeline — an all-zero BudgetLimits would mean
+        // "unlimited" and silently bypass the configured budgets.
         const auto reserve = budget_repo_->reserve(
             user_id, context_id, request_id,
             static_cast<std::int64_t>(64 + dag.nodes_size() * 128),
-            common::BudgetLimits{});
+            AIQueryServiceImpl::budgetLimitsFromEnvironment());
         if (!reserve.accepted) {
             log.status = "rejected";
             log.response_text = "Budget exhausted";
@@ -255,16 +264,6 @@ grpc::Status OrchestrationServiceImpl::executePlan(
     };
 
     try {
-        // Resolve agents from the DAG
-        for (auto& task : plan.tasks) {
-            if (!task.preferred_agent_id.empty() && agent_router_) {
-                auto agent = agent_router_->getAgent(task.preferred_agent_id);
-                if (agent.has_value() && agent->is_healthy) {
-                    // preferred_agent_id remains as-is; the call_agent
-                    // lambda receives the agent_url from the executor
-                }
-            }
-        }
         auto results = task_executor_->execute(plan, call_agent);
 
         // P15 P2(g): terminal finalize (durable mode) — same shape as the
@@ -357,11 +356,12 @@ grpc::Status OrchestrationServiceImpl::executePlan(
         }
         auto* status = response->mutable_status();
         status->set_code(-1);
-        status->set_message(
-            std::string("ExecutePlan infrastructure unavailable: ") + e.what());
+        // Fixed client-facing text: pqxx exception details embed SQL and must
+        // never reach the client (same rule as Query/Replay/Export).
+        status->set_message("ExecutePlan infrastructure unavailable");
         return grpc::Status(
             grpc::StatusCode::UNAVAILABLE,
-            std::string("ExecutePlan infrastructure unavailable: ") + e.what());
+            "ExecutePlan infrastructure unavailable");
     }
 }
 

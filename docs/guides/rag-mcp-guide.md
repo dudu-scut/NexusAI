@@ -372,16 +372,16 @@ try {
 
 ## 监控指标
 
-RAG-MCP 提供以下监控指标：
+RAG-MCP 的 Prometheus 风格指标为**未来规划（未实现）**——当前可观测性经 PG 事实表（`token_usage_ledger`、`traces`、`agent_invocations`）与 AdminView 呈现：
 
-| 指标 | 描述 |
-|------|------|
-| rag_embedding_requests_total | 向量化请求总数 |
-| rag_embedding_latency_ms | 向量化延迟 |
-| rag_cache_hits_total | 缓存命中次数 |
-| rag_cache_misses_total | 缓存未命中次数 |
-| rag_search_latency_ms | 搜索延迟 |
-| rag_tools_retrieved | 检索到的工具数量 |
+| 指标 | 描述 | 状态 |
+|------|------|------|
+| rag_embedding_requests_total | 向量化请求总数 | 规划，未实现 |
+| rag_embedding_latency_ms | 向量化延迟 | 规划，未实现 |
+| rag_cache_hits_total | 缓存命中次数 | 规划，未实现 |
+| rag_cache_misses_total | 缓存未命中次数 | 规划，未实现 |
+| rag_search_latency_ms | 搜索延迟 | 规划，未实现 |
+| rag_tools_retrieved | 检索到的工具数量 | 规划，未实现 |
 
 ## 最佳实践
 

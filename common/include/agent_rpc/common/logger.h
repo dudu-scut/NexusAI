@@ -168,7 +168,7 @@ public:
 
     void flush() override;
     void setLogLevel(LogLevel level) override;
-    LogLevel getLogLevel() const override { return config_.level; }
+    LogLevel getLogLevel() const override { return min_level_.load(std::memory_order_relaxed); }
 
 private:
     void logImpl(LogLevel level,
@@ -180,6 +180,9 @@ private:
     void writeEntry(const LogEntry& entry);
 
     LogConfig config_;
+    // Atomic mirror of config_.level: logImpl is called on hot paths from
+    // many threads while setLogLevel can change it concurrently.
+    std::atomic<LogLevel> min_level_{LogLevel::Level_INFO};
     std::vector<std::unique_ptr<LogAppender>> appenders_;
     std::queue<LogEntry> log_queue_;
     std::mutex queue_mutex_;

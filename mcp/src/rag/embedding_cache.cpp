@@ -15,6 +15,7 @@ EmbeddingCache::EmbeddingCache(const CacheConfig& config)
 
 std::optional<std::vector<float>> EmbeddingCache::get(const std::string& text) {
     if (!config_.enabled) {
+        std::lock_guard<std::mutex> lock(mutex_);
         stats_.misses++;
         return std::nullopt;
     }

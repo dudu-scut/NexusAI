@@ -15,10 +15,12 @@
 
 | 工具 | 最低版本 | 安装方式 |
 |------|---------|---------|
-| CMake | 3.15+ | `sudo apt install cmake` |
+| CMake | 3.20+ | `sudo apt install cmake` |
 | GCC | 10+（C++20） | `sudo apt install build-essential` |
 | gRPC + Protobuf | 1.51.1+ | `sudo apt install libgrpc++-dev protobuf-compiler-grpc` |
-| Redis | 6.0+ | `sudo apt install redis-server` |
+| Redis | 7.0+ | `sudo apt install redis-server` |
+| PostgreSQL 16 + libpq | 16+ | `sudo apt install postgresql libpq-dev`（Docker 方式见第五节） |
+| libpqxx | 8.0.1（pin） | `./scripts/bootstrap-wsl.sh` 自动安装 |
 | hiredis | - | `sudo apt install libhiredis-dev` |
 | nlohmann-json | 3.x | 项目自带（`a2a/third_party/json.hpp`） |
 | Node.js | 18+ | Windows 安装或 `nvm` |
@@ -42,14 +44,14 @@ sudo apt-get install -y \
 
 ```bash
 LLM_API_KEY=your-api-key-here
-LLM_MODEL=deepseek-v4-pro
+LLM_MODEL=deepseek-v4-flash
 LLM_API_URL=https://api.deepseek.com
 ```
 
 | 变量 | 必填 | 说明 |
 |------|------|------|
 | `LLM_API_KEY` | ✅ | LLM API 密钥（OpenAI 兼容格式） |
-| `LLM_MODEL` | 否 | 模型名称，默认 `deepseek-v4-pro` |
+| `LLM_MODEL` | 否 | 模型名称，默认 `deepseek-v4-flash` |
 | `LLM_API_URL` | 否 | API 端点 |
 
 > ⚠️ 不配置 `LLM_API_KEY` 会导致 Orchestrator 的路由 Tier 2（LLM 意图分类）和 DAG 任务分解不可用，但服务本身可以启动，基础查询走 Tier 1 Embedding 路由。
@@ -80,23 +82,24 @@ cd build && make -j$(nproc)
 | 产物 | 路径 | 说明 |
 |------|------|------|
 | gRPC Server | `build/server/rpc_server` | 核心服务端，监听 :50051 |
-| 测试套件 | `build/tests/test_*` | 17 套 GTest + RapidCheck 测试 |
+| 测试套件 | `build/tests/test_*` | 37 套 GTest + RapidCheck 测试 |
 
 ---
 
 ## 三、启动后端服务
 
-NexusAI 运行时依赖 5 个服务：
+NexusAI 运行时依赖 6 个服务：
 
 | 服务 | 端口 | 类型 | 路径 |
 |------|------|------|------|
-| Redis | 6379 | 系统服务 | `redis-server` |
+| PostgreSQL | 5432 | Docker（推荐） | `docker compose up -d postgres redis` |
+| Redis | 6379 | Docker / 系统服务 | `redis-server` |
 | Mock Agent | 5100 | Python A2A | `verify/mock-agent/mock_agent_server.py` |
 | gRPC Server | 50051 | C++ 二进制 | `build/server/rpc_server` |
 | Orchestrator | 5000 | Python A2A | `examples/orchestrator_agent.py` |
 | Node.js Proxy | 8081 | Node.js | `gateway/proxy/server.mjs`（Windows） |
 
-### 方式一：`run.sh start-all`（推荐，一键全包）
+### 方式一：`run.sh start-all`（推荐，一键全包，等同 `run.sh gateway`，以 Docker 启动后端栈）
 
 ```bash
 # WSL 内
@@ -166,7 +169,7 @@ NexusAI gRPC-JSON proxy listening on :8081
 ```powershell
 # Windows PowerShell，新窗口
 cd frontend
-npm install    # 首次
+npm ci         # 首次（与 README/CI 一致）
 npm run dev    # Vite :5173
 ```
 
@@ -211,7 +214,7 @@ npm run dev    # Vite :5173
 
 ### 手动验证清单
 
-详见 [docs/reports/verification-checklist.md](../reports/verification-checklist.md)（17 个 UI 确认项，覆盖 8 批次全部可观测变更）。
+
 
 ---
 
@@ -276,7 +279,7 @@ ss -tlnp | grep :5000    # Orchestrator
                │ gRPC/Protobuf
 ┌──────────────▼─────────────────────────────┐
 │  gRPC Server  :50051  (WSL)                │
-│  C++ — 9 Services, 35 RPCs                 │
+│  C++ — 9 Services, 41 RPCs                 │
 │  AuthInterceptor | CostInterceptor          │
 └─────┬──────────┬──────────┬────────────────┘
       │          │          │

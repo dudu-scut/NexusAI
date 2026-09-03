@@ -197,19 +197,11 @@ struct TaskStatus {
 
 **请求:** 同 message/send
 
-**响应:** Server-Sent Events (SSE)
+**响应:** Server-Sent Events (SSE)——每帧一行 `data:`，载荷为 JSON-RPC 响应，事件类型由 `result.type` 区分（`status` 携带 state 与 message parts；`message`/`artifact` 携带内容）：
 ```
-event: thinking
-data: {"content": "正在分析问题..."}
+data: {"jsonrpc":"2.0","id":1,"result":{"type":"status","status":{"state":"working","message":{"role":"agent","parts":[{"type":"text","text":"正在分析问题..."}]}}}}
 
-event: content
-data: {"content": "123 + 456 = "}
-
-event: content
-data: {"content": "579"}
-
-event: done
-data: {"task_id": "task-001"}
+data: {"jsonrpc":"2.0","id":1,"result":{"type":"status","status":{"state":"completed","message":{"role":"agent","parts":[{"type":"text","text":"123 + 456 = 579"}]}}}}
 ```
 
 ### task/get
@@ -403,7 +395,7 @@ config.redis_url = "localhost:6379";
 ```cpp
 #include "agent_rpc/orchestrator/registry_client.h"
 
-RegistryClient client("http://localhost:8500");
+RegistryClient client("http://localhost:8500");  // 历史方案：当前生产注册走 gRPC RegisterAgent（ADMIN-only，PG agent_registry）
 client.connect();
 
 // 注册 Agent
@@ -475,12 +467,16 @@ router.markAgentHealthy("agent-001");
 
 ### 路由策略
 
+平台侧采用**四级渐进式路由**（Embedding 向量匹配 → LLM 意图分类 → IDF 关键词 → 反馈加权兜底）。候选 Agent 间的最终选择支持以下负载均衡策略（经 `NEXUSAI_ROUTER_LB_STRATEGY` 接入）：
+
 | 策略 | 描述 |
 |------|------|
 | ROUND_ROBIN | 轮询选择 |
 | RANDOM | 随机选择 |
-| SKILL_MATCH | 技能匹配 |
-| LEAST_LOAD | 最少负载 |
+| LEAST_CONNECTIONS | 最少连接 |
+| WEIGHTED_ROUND_ROBIN | 加权轮询 |
+| LEAST_RESPONSE_TIME | 最短响应时间 |
+| CONSISTENT_HASH | FNV-1a 一致性哈希 |
 
 ## 配置
 
@@ -529,13 +525,15 @@ try {
 
 ## 监控指标
 
-| 指标 | 描述 |
-|------|------|
-| a2a_requests_total | A2A 请求总数 |
-| a2a_request_latency_ms | 请求延迟 |
-| a2a_errors_total | 错误总数 |
-| a2a_tasks_active | 活跃任务数 |
-| a2a_agents_healthy | 健康 Agent 数 |
+> 注：Prometheus metrics endpoint 属于未来规划（见 deployment.md），当前尚未实现。现有可观测性经 PG `agent_invocations` / `traces` 事实表 + Redis 缓存 + AdminView 呈现。
+
+| 指标 | 描述 | 状态 |
+|------|------|------|
+| a2a_requests_total | A2A 请求总数 | 规划，未实现 |
+| a2a_request_latency_ms | 请求延迟 | 规划，未实现 |
+| a2a_errors_total | 错误总数 | 规划，未实现 |
+| a2a_tasks_active | 活跃任务数 | 规划，未实现 |
+| a2a_agents_healthy | 健康 Agent 数 | 规划，未实现 |
 
 ## 最佳实践
 

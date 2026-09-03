@@ -67,9 +67,8 @@ void AuthInterceptor::setRedisClient(common::RedisClient* redis) {
 }
 
 AuthInterceptor::AuthInterceptor(AuthServiceImpl* auth_service,
-                                  grpc::ServerContextBase* context,
                                   const std::string& method_path)
-    : auth_service_(auth_service), context_(context), method_path_(method_path) {}
+    : auth_service_(auth_service), method_path_(method_path) {}
 
 void AuthInterceptor::Intercept(
     grpc::experimental::InterceptorBatchMethods* methods) {

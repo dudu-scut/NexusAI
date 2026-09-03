@@ -20,6 +20,46 @@ TaskExecutor::TaskExecutor(AgentRouter& router, const ExecutorConfig& config)
     , config_(config)
 {}
 
+TaskExecutor::~TaskExecutor() {
+    // Join any worker threads left behind by timed-out subtasks. Each is
+    // bounded by its HTTP timeout, so this cannot block indefinitely.
+    std::vector<ParkedThread> zombies;
+    {
+        std::lock_guard<std::mutex> lock(zombie_mutex_);
+        zombies.swap(zombie_threads_);
+    }
+    for (auto& z : zombies) {
+        if (z.thread.joinable()) z.thread.join();
+    }
+}
+
+std::future<SubTaskResult> TaskExecutor::launchSubtask(
+    std::function<SubTaskResult()> fn) {
+    auto task = std::make_shared<std::packaged_task<SubTaskResult()>>(
+        std::move(fn));
+    std::future<SubTaskResult> fut = task->get_future();
+
+    auto done = std::make_shared<std::atomic<bool>>(false);
+    std::thread worker([task, done]() {
+        (*task)();
+        done->store(true);
+    });
+
+    std::lock_guard<std::mutex> lock(zombie_mutex_);
+    // Reap workers that already finished (their join returns instantly).
+    auto it = zombie_threads_.begin();
+    while (it != zombie_threads_.end()) {
+        if (it->done->load()) {
+            it->thread.join();
+            it = zombie_threads_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    zombie_threads_.push_back(ParkedThread{std::move(worker), done});
+    return fut;
+}
+
 std::unordered_map<std::string, SubTaskResult> TaskExecutor::execute(
     const ExecutionPlan& plan,
     const AgentCallFn& call_agent,
@@ -144,8 +184,15 @@ std::unordered_map<std::string, SubTaskResult> TaskExecutor::execute(
             const bool trace_propagation =
                 agent_rpc::common::envOrDefault("NEXUSAI_TRACE_PARENT_PROPAGATION", "1") != "0";
 
-            auto fut = std::async(std::launch::async,
-                [this, &st, p = std::move(prompt), &call_agent,
+            // launchSubtask instead of std::async: abandoning the future
+            // after the wait timeout must not block the layer on task
+            // completion (std::async futures block in their destructor).
+            // st / call_agent are captured BY VALUE: a timed-out task keeps
+            // running after execute() returns, so capturing them by reference
+            // would dangle once the caller destroys the plan and the call
+            // lambda. The copy makes the abandoned worker self-contained.
+            auto fut = launchSubtask(
+                [this, st, p = std::move(prompt), call_agent,
                  cancel_url, cancel_agent_id,
                  parent_trace_id, parent_user_id, trace_propagation]() {
                     if (trace_propagation) {
@@ -257,9 +304,11 @@ std::unordered_map<std::string, SubTaskResult> TaskExecutor::execute(
 
                 // Capture st by reference (valid throughout layer execution)
                 // and prompt by value (moved into lambda)
+                // By-value capture as in the single-subtask branch: the
+                // worker may outlive this execute() call after a timeout.
                 futures.emplace_back(tid,
-                    std::async(std::launch::async,
-                        [this, &st, p = std::move(prompt), &call_agent,
+                    launchSubtask(
+                        [this, st, p = std::move(prompt), call_agent,
                          cancel_url, cancel_agent_id,
                          parent_trace_id, parent_user_id, trace_propagation]() {
                             // Propagate trace context to subtask thread: reuse

@@ -1,115 +1,73 @@
 #include <a2a/models/agent_message.hpp>
+#include <nlohmann/json.hpp>
+#include <optional>
 #include <sstream>
 
 namespace a2a {
 
 std::string AgentMessage::to_json() const {
-    std::ostringstream oss;
-    oss << "{";
-    
-    // Required fields
-    oss << "\"messageId\":\"" << message_id_ << "\",";
-    oss << "\"role\":\"" << to_string(role_) << "\"";
-    
-    // Optional fields
-    if (context_id_.has_value()) {
-        oss << ",\"contextId\":\"" << *context_id_ << "\"";
+    nlohmann::json j;
+    j["messageId"] = message_id_;
+    j["role"] = to_string(role_);
+    if (context_id_) {
+        j["contextId"] = *context_id_;
     }
-    
-    if (task_id_.has_value()) {
-        oss << ",\"taskId\":\"" << *task_id_ << "\"";
+    if (task_id_) {
+        j["taskId"] = *task_id_;
     }
-    
-    // Parts array
-    oss << ",\"parts\":[";
-    for (size_t i = 0; i < parts_.size(); ++i) {
-        if (i > 0) oss << ",";
-        oss << parts_[i]->to_json();
+    nlohmann::json parts = nlohmann::json::array();
+    for (const auto& part : parts_) {
+        nlohmann::json part_json = nlohmann::json::parse(part->to_json(), nullptr, false);
+        if (!part_json.is_discarded()) {
+            parts.push_back(std::move(part_json));
+        }
     }
-    oss << "]";
-    
-    oss << "}";
-    return oss.str();
+    j["parts"] = std::move(parts);
+    return j.dump();
 }
 
 AgentMessage AgentMessage::from_json(const std::string& json) {
     AgentMessage msg;
-    
-    // Extract messageId (camelCase) or message_id (snake_case)
-    size_t msg_id_pos = json.find("\"messageId\":");
-    if (msg_id_pos == std::string::npos) {
-        msg_id_pos = json.find("\"message_id\":");
+
+    nlohmann::json parsed = nlohmann::json::parse(json, nullptr, false);
+    if (parsed.is_discarded() || !parsed.is_object()) {
+        return msg;
     }
-    if (msg_id_pos != std::string::npos) {
-        size_t start = json.find("\"", msg_id_pos + 12) + 1;
-        // Re-calculate start based on which variant was found
-        size_t field_end = json.find("\":", msg_id_pos);
-        start = json.find("\"", field_end + 2) + 1;
-        size_t end = json.find("\"", start);
-        msg.message_id_ = json.substr(start, end - start);
+
+    // Accept camelCase (v1.0) or snake_case field names
+    auto str_field = [&parsed](const char* camel, const char* snake) -> std::optional<std::string> {
+        auto it = parsed.contains(camel) ? parsed.find(camel) : parsed.find(snake);
+        if (it != parsed.end() && it->is_string()) {
+            return it->get<std::string>();
+        }
+        return std::nullopt;
+    };
+
+    if (auto id = str_field("messageId", "message_id")) {
+        msg.message_id_ = *id;
     }
-    
-    // Extract role
-    size_t role_pos = json.find("\"role\":");
-    if (role_pos != std::string::npos) {
-        size_t start = json.find("\"", role_pos + 7) + 1;
-        size_t end = json.find("\"", start);
-        std::string role_str = json.substr(start, end - start);
-        msg.role_ = message_role_from_string(role_str);
+    if (auto ctx = str_field("contextId", "context_id")) {
+        msg.context_id_ = *ctx;
     }
-    
-    // Extract contextId (camelCase) or context_id (snake_case) - optional
-    size_t ctx_id_pos = json.find("\"contextId\":");
-    if (ctx_id_pos == std::string::npos) {
-        ctx_id_pos = json.find("\"context_id\":");
+    if (auto tid = str_field("taskId", "task_id")) {
+        msg.task_id_ = *tid;
     }
-    if (ctx_id_pos != std::string::npos) {
-        size_t field_end = json.find("\":", ctx_id_pos);
-        size_t start = json.find("\"", field_end + 2) + 1;
-        size_t end = json.find("\"", start);
-        msg.context_id_ = json.substr(start, end - start);
+
+    const auto role_it = parsed.find("role");
+    if (role_it != parsed.end() && role_it->is_string()) {
+        msg.role_ = message_role_from_string(role_it->get<std::string>());
     }
-    
-    // Extract taskId (camelCase) or task_id (snake_case) - optional
-    size_t task_id_pos = json.find("\"taskId\":");
-    if (task_id_pos == std::string::npos) {
-        task_id_pos = json.find("\"task_id\":");
-    }
-    if (task_id_pos != std::string::npos) {
-        size_t field_end = json.find("\":", task_id_pos);
-        size_t start = json.find("\"", field_end + 2) + 1;
-        size_t end = json.find("\"", start);
-        msg.task_id_ = json.substr(start, end - start);
-    }
-    
-    // Extract parts array (simplified)
-    size_t parts_pos = json.find("\"parts\":[");
-    if (parts_pos != std::string::npos) {
-        size_t array_start = parts_pos + 9;
-        size_t array_end = json.find("]", array_start);
-        std::string parts_json = json.substr(array_start, array_end - array_start);
-        
-        // Parse each part (very simplified)
-        int brace_count = 0;
-        size_t part_start = 0;
-        
-        for (size_t i = 0; i < parts_json.length(); ++i) {
-            if (parts_json[i] == '{') {
-                if (brace_count == 0) part_start = i;
-                brace_count++;
-            } else if (parts_json[i] == '}') {
-                brace_count--;
-                if (brace_count == 0) {
-                    std::string part_json = parts_json.substr(part_start, i - part_start + 1);
-                    auto part = Part::from_json(part_json);
-                    if (part) {
-                        msg.parts_.push_back(std::move(part));
-                    }
-                }
+
+    const auto parts_it = parsed.find("parts");
+    if (parts_it != parsed.end() && parts_it->is_array()) {
+        for (const auto& part_json : *parts_it) {
+            auto part = Part::from_json(part_json.dump());
+            if (part) {
+                msg.parts_.push_back(std::move(part));
             }
         }
     }
-    
+
     return msg;
 }
 

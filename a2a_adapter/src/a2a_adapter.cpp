@@ -15,6 +15,7 @@
 #include <a2a/core/exception.hpp>
 #include <nlohmann/json.hpp>
 #include <chrono>
+#include <optional>
 #include <thread>
 
 namespace agent_rpc {
@@ -35,31 +36,26 @@ bool A2AAdapter::initialize(const A2AConfig& config) {
     if (initialized_) {
         return true;
     }
-    
+
     // Validate and store configuration
     config_ = config;
     if (!config_.validate()) {
         LOG_WARN("A2A configuration had invalid values, defaults were applied");
     }
-    
-    // Create A2A client
-    try {
-        a2a_client_ = std::make_unique<a2a::A2AClient>(config_.orchestrator_url);
-        a2a_client_->set_timeout(config_.request_timeout_seconds);
-        initialized_ = true;
-        return true;
-    } catch (const std::exception& e) {
-        LOG_ERROR("Failed to create A2A client for orchestrator at " + config_.orchestrator_url + ": " + e.what());
-        return false;
-    }
+
+    // Each call creates its own A2AClient (a bare URL + options holder), so
+    // there is no shared connection state to guard; keep only the timeout
+    // knob for per-query deadline propagation.
+    request_timeout_seconds_ = config_.request_timeout_seconds;
+    initialized_ = true;
+    return true;
 }
 
 void A2AAdapter::shutdown() {
     if (!initialized_) {
         return;
     }
-    
-    a2a_client_.reset();
+
     initialized_ = false;
 }
 
@@ -77,14 +73,7 @@ bool A2AAdapter::processQuery(
         status->set_message("A2A adapter not initialized");
         return false;
     }
-    
-    if (!a2a_client_) {
-        auto* status = response->mutable_status();
-        status->set_code(-1);
-        status->set_message("A2A client not available");
-        return false;
-    }
-    
+
     auto start_time = std::chrono::steady_clock::now();
 
     // Circuit breaker: check if orchestrator is healthy before attempting call
@@ -101,6 +90,11 @@ bool A2AAdapter::processQuery(
             status->set_message("Circuit breaker is OPEN — orchestrator is unavailable");
             return false;
         }
+
+        // Send via a per-request client (gRPC handlers run concurrently, so
+        // per-call headers/timeouts must not live on shared state).
+        a2a::A2AClient client(config_.orchestrator_url);
+        client.set_timeout(request_timeout_seconds_.load());
 
         // Inject trace headers into A2A HTTP call
         auto* trace = agent_rpc::common::TraceContext::current();
@@ -131,8 +125,8 @@ bool A2AAdapter::processQuery(
             }
             trace->incrementDepth();
 
-            a2a_client_->add_header("x-trace-id", trace->traceId());
-            a2a_client_->add_header("x-delegation-depth", std::to_string(depth + 1));
+            client.add_header("x-trace-id", trace->traceId());
+            client.add_header("x-delegation-depth", std::to_string(depth + 1));
         }
 
         // Autonomy-level header removed: the old Redis key
@@ -141,50 +135,30 @@ bool A2AAdapter::processQuery(
         // request body. To restore it, read via QueryDomainRepository::
         // getAutonomySetting(owner, agent_id) with the authenticated owner.
 
-        // Send message via A2A client with retry for transient network errors
+        // Send message via A2A client with retry for transient transport
+        // errors (curl/connect/timeout). Protocol errors are terminal and
+        // propagate to the outer ErrorMapper handler. Response conversion
+        // happens after the retry loop so a conversion failure can never
+        // re-execute the agent call.
         int max_retries = config_.max_retries > 0 ? config_.max_retries : 1;
         int retry_delay = config_.retry_delay_ms > 0 ? config_.retry_delay_ms : 1000;
         std::string last_error;
+        std::optional<a2a::A2AResponse> a2a_response;
 
-        for (int attempt = 0; attempt < max_retries; ++attempt) {
+        for (int attempt = 0; attempt < max_retries && !a2a_response; ++attempt) {
             try {
-                a2a::A2AResponse a2a_response = a2a_client_->send_message(params);
-
-                // Convert A2A response to RPC format FIRST — if this throws,
-                // we haven't corrupted trace/CB state yet. Only on success do
-                // we finalize the trace, clear headers, and record success.
-                response_adapter_->convertFromA2A(a2a_response, request.request_id(), "", response);
-
-                // Record agent call result (only after successful conversion)
-                if (trace) {
-                    trace->endSpan();
-                    a2a_client_->clear_headers();
-                }
-
-                // Record success
-                cb->recordSuccess();
-
-                // Calculate processing time
-                auto end_time = std::chrono::steady_clock::now();
-                auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    end_time - start_time);
-                response->set_processing_time_ms(duration.count());
-
-                // Record agent call for health dashboard metrics
-                agent_rpc::registry::ServiceRegistry::recordAgentCall(
-                    "orchestrator", true, static_cast<double>(duration.count()));
-
-                // Success if we got any valid response (Task or Message)
-                return true;
-
+                a2a_response = client.send_message(params);
             } catch (const a2a::A2AException& e) {
-                // Protocol errors are not transient — do not retry.
-                // Re-throw so the outer A2AException handler applies the
-                // correct ErrorMapper::mapToGrpcStatus for the error code.
-                LOG_ERROR("A2A protocol error calling orchestrator: " + std::string(e.what()));
-                throw;
-            } catch (const std::exception& e) {
-                last_error = e.what();
+                // Transport failures thrown by the HTTP layer are transient;
+                // JSON-RPC/protocol errors are not — do not retry.
+                const std::string what = e.what();
+                const bool transport = what.rfind("CURL error:", 0) == 0 ||
+                                       what.rfind("HTTP request failed:", 0) == 0;
+                if (!transport) {
+                    LOG_ERROR("A2A protocol error calling orchestrator: " + what);
+                    throw;
+                }
+                last_error = what;
                 if (attempt < max_retries - 1) {
                     LOG_WARN("A2A call attempt " + std::to_string(attempt + 1) + "/" +
                              std::to_string(max_retries) + " failed: " + last_error +
@@ -194,10 +168,36 @@ bool A2AAdapter::processQuery(
             }
         }
 
-        // All retries exhausted, fall through to error handling below
-        LOG_ERROR("A2A call failed after " + std::to_string(max_retries) +
-                  " attempt(s): " + last_error);
-        throw std::runtime_error(last_error);
+        if (!a2a_response) {
+            // All retries exhausted
+            LOG_ERROR("A2A call failed after " + std::to_string(max_retries) +
+                      " attempt(s): " + last_error);
+            throw std::runtime_error(
+                last_error.empty() ? "A2A transport failure" : last_error);
+        }
+
+        response_adapter_->convertFromA2A(*a2a_response, request.request_id(), "", response);
+
+        // Finalize trace state (only after successful conversion)
+        if (trace) {
+            trace->endSpan();
+        }
+
+        // Record success
+        cb->recordSuccess();
+
+        // Calculate processing time
+        auto end_time = std::chrono::steady_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+            end_time - start_time);
+        response->set_processing_time_ms(duration.count());
+
+        // Record agent call for health dashboard metrics
+        agent_rpc::registry::ServiceRegistry::recordAgentCall(
+            "orchestrator", true, static_cast<double>(duration.count()));
+
+        // Success if we got any valid response (Task or Message)
+        return true;
 
     } catch (const a2a::A2AException& e) {
         LOG_ERROR("A2A protocol error calling orchestrator: " + std::string(e.what()));
@@ -292,12 +292,13 @@ void A2AAdapter::processQueryStreaming(
         // Inject trace headers into A2A HTTP streaming call
         auto* trace = agent_rpc::common::TraceContext::current();
         std::string trace_id;
+        int depth = 0;
         if (trace) {
             trace->startSpan("agent_call_streaming", "a2a_adapter");
 
             // Delegation depth limit check for streaming
             constexpr int MAX_DEPTH = 5;
-            int depth = trace->depth();
+            depth = trace->depth();
             if (depth >= MAX_DEPTH) {
                 agent_communication::AIStreamEvent depth_event;
                 response_adapter_->buildStreamEvent(
@@ -310,13 +311,20 @@ void A2AAdapter::processQueryStreaming(
             trace->incrementDepth();
 
             trace_id = trace->traceId();
-            a2a_client_->add_header("x-trace-id", trace_id);
-            a2a_client_->add_header("x-delegation-depth", std::to_string(depth + 1));
         }
 
         // Autonomy-level header removed (see processQuery).
 
-        a2a_client_->send_message_streaming(params,
+        // Per-request client: concurrent gRPC handlers must not share
+        // header/timeout state.
+        a2a::A2AClient client(config_.orchestrator_url);
+        client.set_timeout(request_timeout_seconds_.load());
+        if (!trace_id.empty()) {
+            client.add_header("x-trace-id", trace_id);
+            client.add_header("x-delegation-depth", std::to_string(depth + 1));
+        }
+
+        client.send_message_streaming(params,
             [this, &callback, &context_id, trace_id](const std::string& event_line) {
                 // Skip empty lines
                 if (event_line.empty() || event_line == "\n" || event_line == "\r\n") {
@@ -452,7 +460,6 @@ void A2AAdapter::processQueryStreaming(
         // End streaming trace span
         if (trace) {
             trace->endSpan();
-            a2a_client_->clear_headers();
         }
 
         // Record streaming success to circuit breaker
@@ -481,12 +488,14 @@ void A2AAdapter::setRedisClient(std::shared_ptr<common::RedisClient> redis) {
 }
 
 bool A2AAdapter::cancelTask(const std::string& task_id) {
-    if (!initialized_ || !a2a_client_ || task_id.empty()) {
+    if (!initialized_ || task_id.empty()) {
         return false;
     }
 
     try {
-        a2a_client_->cancel_task(task_id);
+        a2a::A2AClient client(config_.orchestrator_url);
+        client.set_timeout(request_timeout_seconds_.load());
+        client.cancel_task(task_id);
         return true;
     } catch (...) {
         return false;
@@ -494,8 +503,8 @@ bool A2AAdapter::cancelTask(const std::string& task_id) {
 }
 
 void A2AAdapter::setRequestTimeout(long seconds) {
-    if (a2a_client_ && seconds > 0) {
-        a2a_client_->set_timeout(seconds);
+    if (seconds > 0) {
+        request_timeout_seconds_ = seconds;
     }
 }
 
@@ -653,7 +662,7 @@ void A2AAdapter::processQueryStreamingDirect(
     std::function<void(const agent_communication::AIStreamEvent&)> callback,
     const std::string& agent_url) {
 
-    if (!initialized_ || !callback) {
+    if (!initialized_ || !callback || !config_.enable_streaming) {
         return;
     }
 
@@ -703,7 +712,7 @@ void A2AAdapter::processQueryStreamingDirect(
         std::string context_id = params.context_id().value_or("");
 
         a2a::A2AClient client(agent_url);
-        client.set_timeout(config_.request_timeout_seconds);
+        client.set_timeout(request_timeout_seconds_.load());
 
         // Inject trace headers into direct A2A HTTP streaming call
         auto* trace = agent_rpc::common::TraceContext::current();

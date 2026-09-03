@@ -231,7 +231,9 @@ public:
     std::string exportJson() const;
 
 private:
-    Metrics() = default;
+    // Initialize the default metric handles eagerly: record* methods are
+    // called concurrently from gRPC threads, so lazy init would race.
+    Metrics() { initializeDefaultMetrics(); }
 
     void initializeDefaultMetrics();
 

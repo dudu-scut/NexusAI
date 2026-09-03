@@ -34,8 +34,7 @@ public:
 
     grpc::experimental::Interceptor* CreateServerInterceptor(
         grpc::experimental::ServerRpcInfo* info) override {
-        return new AuthInterceptor(
-            auth_service_, info->server_context(), info->method());
+        return new AuthInterceptor(auth_service_, info->method());
     }
 
 private:

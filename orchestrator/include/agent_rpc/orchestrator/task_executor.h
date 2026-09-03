@@ -13,9 +13,14 @@
 #include "agent_rpc/orchestrator/agent_router.h"
 #include "agent_rpc/common/trace_context.h"
 #include <a2a/llm_client.hpp>
+#include <atomic>
 #include <chrono>
 #include <functional>
+#include <future>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -79,6 +84,7 @@ using CancelFn = std::function<void(const std::string& agent_url)>;
 class TaskExecutor {
 public:
     TaskExecutor(AgentRouter& router, const ExecutorConfig& config);
+    ~TaskExecutor();
 
     /**
      * Execute the full DAG plan and collect results.
@@ -113,11 +119,11 @@ private:
     std::pair<std::string /*url*/, std::string /*agent_id*/> resolveAgent(
         const SubTask& subtask) const;
 
-    // Execute one subtask (called inside std::async). When pre_resolved_url
-    // is non-empty the pre-resolved target is used directly instead of
-    // re-routing — the caller resolves once so the timeout cancellation
-    // target matches the actually executed agent (routing fallbacks are
-    // non-deterministic across calls).
+    // Execute one subtask (called inside the subtask worker thread). When
+    // pre_resolved_url is non-empty the pre-resolved target is used directly
+    // instead of re-routing — the caller resolves once so the timeout
+    // cancellation target matches the actually executed agent (routing
+    // fallbacks are non-deterministic across calls).
     SubTaskResult executeSubtask(
         const SubTask& subtask,
         const std::string& enriched_prompt,
@@ -125,8 +131,24 @@ private:
         const std::string& pre_resolved_url = "",
         const std::string& pre_resolved_agent_id = "");
 
+    // Launch fn on a background thread whose handle is parked internally.
+    // Unlike std::async(std::launch::async), abandoning the returned future
+    // after a timeout never blocks the caller on task completion; parked
+    // threads are joined in the destructor (bounded by the HTTP timeout).
+    std::future<SubTaskResult> launchSubtask(
+        std::function<SubTaskResult()> fn);
+
     AgentRouter& router_;
     ExecutorConfig config_;
+
+    // Worker threads of timed-out subtasks. `done` lets finished threads be
+    // reaped lazily; the rest are joined in the destructor.
+    struct ParkedThread {
+        std::thread thread;
+        std::shared_ptr<std::atomic<bool>> done;
+    };
+    std::mutex zombie_mutex_;
+    std::vector<ParkedThread> zombie_threads_;
 };
 
 } // namespace orchestrator

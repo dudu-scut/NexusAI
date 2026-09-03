@@ -1,6 +1,6 @@
 # AGENTS.md
 
-This file provides guidance to Lingma (lingma.aliyun.com) when working with code in this repository.
+This file provides guidance to AI coding agents (ZCode / Lingma / Claude Code) when working with code in this repository.
 
 ## 环境约束（最重要）
 
@@ -38,6 +38,13 @@ cd gateway/proxy && npm test
 # E2E
 ./run.sh verify                       # 8 批 32 个场景
 python3 tests/e2e/e2e_pr_g_release.py # 发布 E2E（WSL）：真实 rpc_server + 真实 Docker PG/Redis，断言全部经 psql 直查，缺前置时明确 SKIP
+
+# WSL 直调辅助脚本（Windows 侧用 wsl -e bash scripts/<name>，内含 LD_LIBRARY_PATH 与 .env 注入）
+scripts/run_full_gate.sh [ctest args]              # 全量 ctest 门禁（--timeout 60）
+CTEST_REGEX='A|B' scripts/run_ctest_group.sh [..]  # 任意 ctest 正则分组
+scripts/run_test_group.sh                          # 基线回归组：RedisServices|DurableQueryPipeline|WorkflowControlContract
+scripts/build_mcp.sh [make targets]                # 备用构建树 build-mcp/（-DENABLE_MCP=ON）
+CTEST_REGEX='A|B' scripts/run_ctest_group_mcp.sh   # 对 build-mcp/ 跑 ctest 分组
 ```
 
 Docker 一键栈（仓库根目录）：`docker compose up --build` 启动 PostgreSQL、Redis、rpc-server、Node 代理、Nginx 前端，浏览器入口 `http://127.0.0.1:8080`（生产端口是 8080，不是开发模式的 5173）。
@@ -46,7 +53,7 @@ Docker 一键栈（仓库根目录）：`docker compose up --build` 启动 Postg
 
 - 修改核心源码（如 `ai_query_service.cpp`、`agent_router.cpp`、`multi_agent_handler.cpp`）前先跑 `scripts/redline_check.sh` —— 静态契约测试会以文本断言锁定源码内容，误改锁定文本会导致测试失败。
 - 新测试用例必须追加到既有测试文件（如 `test_redis_services.cpp`），**严禁修改 `tests/CMakeLists.txt`**。
-- 需要 Redis 在 `localhost:6379` 运行的测试：auth / memory / agent-communication 相关。PG 相关用例连真实数据库，缺环境变量时按约定 SKIP 而不是伪造通过。
+- 需要 Redis 在 `localhost:6379` 运行的测试：auth / memory / agent-communication 相关。PG 相关用例连真实数据库，缺环境变量时按约定 SKIP 而不是伪造通过。PG/Redis 可用 `docker compose up -d postgres redis` 启动（`docker-compose.override.yml` 发布 5432/6379 宿主端口供 WSL ctest 使用）；全量门禁用 `scripts/run_full_gate.sh`。
 - 前端类型 `frontend/src/types/proto.ts` 与 `proto/` 字段级对齐，改动 proto 后必须同步，网关契约测试里有防漂移断言。
 - `db/migrations/VNNN__name.sql` 是权威 schema（只追加）；RPC 服务端启动时自行执行迁移（`NEXUSAI_MIGRATIONS_DIR`），没有独立 migrate 服务；`sql/` 是旧参考 schema，永不执行。
 
@@ -55,7 +62,7 @@ Docker 一键栈（仓库根目录）：`docker compose up --build` 启动 Postg
 数据流：`Browser → Nginx :8080（生产）/ Vite :5173（开发）→ Node JSON 代理 :8081 → gRPC Server :50051 → A2AAdapter → Orchestrator :5000 → 各 Agent`
 
 ```text
-proto/          → 9 个 proto，9 个 gRPC Service，35 个 RPC
+proto/          → 9 个 proto，9 个 gRPC Service，41 个 RPC
 server/         → gRPC Server :50051（AuthInterceptor、CostInterceptor、durable 查询管线）
 orchestrator/   → AgentRouter（四级路由）+ TaskPlanner/TaskExecutor（DAG）+ ResultAggregator + replay/export/feedback
 a2a/            → 纯 A2A 协议库（HTTP/JSON-RPC 2.0，AgentCard、message/send、message/stream SSE）
@@ -88,6 +95,12 @@ db/             → PostgreSQL 迁移 V001–V013（PostgreSQL 是唯一持久�
 - C++20（根 CMakeLists.txt `CMAKE_CXX_STANDARD 20`），CMake 3.20+，依赖经 pkg-config / find_package（gRPC、protobuf、libpqxx、jsoncpp、hiredis、GTest、RapidCheck）。
 - 测试：GTest 集成 + RapidCheck 属性测试（属性测试命名 `test_*_properties.cpp`）。
 - `ai_interface/` 模块已在根 CMakeLists.txt 中注释掉。
+- **a2a/libcurl 红线**：`CurlHandle`/`CurlSList`（http_client.cpp）禁止隐式转换后传入 `curl_easy_setopt` 等变参函数——变参传参会按位拷贝对象并在调用表达式末析构副本，导致句柄/slist 在传输期间被释放（heap-use-after-free）。必须用 `.get()` 取裸指针。
+- LLM_MODEL 代码兜底值统一为 `deepseek-v4-flash`（与 .env.example 一致）；`EMBEDDING_MODEL` 兜底 `deepseek-v4-pro`。
+
+## 关键文档（改敏感区前先读）
+
+`docs/guides/` 下的权威指南：`durable-query-pipeline-guide.md`（改 server/ 查询管线前必读）、`workflow-control-guide.md`、`a2a-protocol.md`、`mcp-plugin-development.md`、`rag-mcp-guide.md`、`sharing-and-assets-guide.md`、`startup-guide.md`、`deployment.md`。
 
 ## 外部依赖与环境变量
 

@@ -11,7 +11,9 @@ services:
       # teardown. The directory is ignored by Git (see .gitignore).
       - ./.nexusai-data/postgres:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      # -h 127.0.0.1 forces TCP: the socket-only check passes during the
+      # initdb temp-server phase and would let dependents start too early.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -49,12 +51,22 @@ services:
       # Admin user for agent management RPCs (RegisterAgent/UnregisterAgent);
       # empty means no user gets the ADMIN role. Pass through from .env.
       NEXUSAI_ADMIN_USERNAME: ${NEXUSAI_ADMIN_USERNAME:-}
+      # LLM/embedding credentials pass through from .env; without a key the
+      # server still starts, with routing tier-2 / DAG planning degraded.
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-deepseek-v4-flash}
+      LLM_API_URL: ${LLM_API_URL:-https://api.deepseek.com/v1/chat/completions}
+      EMBEDDING_API_URL: ${EMBEDDING_API_URL:-}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-deepseek-v4-pro}
       RPC_SERVER_PORT: "50051"
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+    # Migrations fail closed when PostgreSQL is briefly unreachable (e.g.
+    # first-boot initdb); restart until the stack is up instead of dying.
+    restart: unless-stopped
     expose: ["50051"]
     healthcheck:
       test: ["CMD-SHELL", "nc -z -w 1 127.0.0.1 50051"]

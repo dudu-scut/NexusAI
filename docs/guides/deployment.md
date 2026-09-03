@@ -1,5 +1,7 @@
 # 生产环境部署指南
 
+> ⚠️ **历史方案说明**：本文描述的 systemd / 自研 Registry(:8500) / 独立二进制（`ai_registry_server`、`ai_math_agent`）等部署形态为早期参考方案，与当前仓库的推荐部署（`docker compose up --build` 一键栈：PostgreSQL + Redis + rpc-server + Node 代理 + Nginx 前端，浏览器入口 :8080）不一致。部署请以 README 与 startup-guide 为准；本文仅保留其中的容量规划、安全加固、备份策略等通用内容供参考。
+
 ## 概述
 
 本指南介绍如何在生产环境中部署 Agent Communication RPC Framework。

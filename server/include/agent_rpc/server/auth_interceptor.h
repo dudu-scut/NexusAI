@@ -24,7 +24,6 @@ class AuthServiceImpl;
 class AuthInterceptor : public grpc::experimental::Interceptor {
 public:
     AuthInterceptor(AuthServiceImpl* auth_service,
-                    grpc::ServerContextBase* context,
                     const std::string& method_path);
 
     void Intercept(grpc::experimental::InterceptorBatchMethods* methods) override;
@@ -78,7 +77,6 @@ private:
         const std::multimap<grpc::string_ref, grpc::string_ref>& metadata);
 
     AuthServiceImpl* auth_service_;
-    grpc::ServerContextBase* context_;
     std::string method_path_;
 
     static common::RedisClient* s_redis_;

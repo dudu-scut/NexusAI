@@ -112,7 +112,10 @@ public:
     /**
      * @brief Get the most recently evicted key (for testing)
      */
-    std::string getLastEvictedKey() const { return last_evicted_key_; }
+    std::string getLastEvictedKey() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return last_evicted_key_;
+    }
 
 private:
     struct CacheEntry {

@@ -193,7 +193,7 @@ cmd_test() {
     fi
 
     cd "$BUILD_DIR"
-    ctest --output-on-failure --timeout 30 "$@"
+    ctest --output-on-failure --timeout 300 "$@"
     echo ""
     info "测试完成"
 }

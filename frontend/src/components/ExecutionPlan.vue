@@ -51,7 +51,7 @@
           </span>
           <span class="task-id">{{ task.id }}</span>
           <span class="task-skill">{{ task.skill }}</span>
-          <span v-if="task.assigned_agent_id" class="task-agent">{{ task.assigned_agent_id }}</span>
+          <span v-if="task.agent_id" class="task-agent">{{ task.agent_name || task.agent_id }}</span>
         </div>
 
         <div class="task-description">{{ task.description }}</div>

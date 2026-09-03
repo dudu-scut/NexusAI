@@ -1,0 +1,6 @@
+# 迁移文件按字节级参与 schema_migrations 校验和（migration_runner.cpp 以文件
+# 原始字节做 SHA256）。行尾随 core.autocrlf / 检出方式漂移会让同一迁移在
+# 不同机器上算出不同校验和，导致 rpc-server 启动时 fail-closed：
+# "migration checksum mismatch"。这里固定迁移与脚本类文件一律 LF。
+*.sql text eol=lf
+*.sh text eol=lf

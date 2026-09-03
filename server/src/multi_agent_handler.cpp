@@ -440,8 +440,6 @@ grpc::Status MultiAgentHandler::handleQuery(
     LOG_INFO("Multi-agent plan: " + std::to_string(plan.tasks.size()) + " subtasks");
     update_status_(request_id, "working", "", "", "");
 
-    std::string memory_ctx = QueryHelpers::buildMemoryContext(request);
-
     auto call_agent = buildCallAgent(request, effective_timeout_seconds);
     // P20: a timed-out subtask aborts its in-flight A2A call.
     auto on_cancel = [this](const std::string& agent_url) {

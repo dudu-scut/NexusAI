@@ -214,7 +214,8 @@ void FileAppender::rotateFiles() {
     current_size_ = 0;
 }
 
-AsyncLogger::AsyncLogger(const LogConfig& config) : config_(config) {
+AsyncLogger::AsyncLogger(const LogConfig& config)
+    : config_(config), min_level_(config.level) {
     if (config_.console_output) {
         appenders_.push_back(std::make_unique<ConsoleAppender>(config_.color_output));
     }
@@ -305,6 +306,7 @@ void AsyncLogger::flush() {
 
 void AsyncLogger::setLogLevel(LogLevel level) {
     config_.level = level;
+    min_level_.store(level, std::memory_order_relaxed);
 }
 
 void AsyncLogger::logImpl(LogLevel level,
@@ -312,7 +314,7 @@ void AsyncLogger::logImpl(LogLevel level,
                           const std::string& source_file,
                           int line_number,
                           const std::string& function_name) {
-    if (level < config_.level) {
+    if (level < min_level_.load(std::memory_order_relaxed)) {
         return;
     }
 

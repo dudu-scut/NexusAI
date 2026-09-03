@@ -64,7 +64,6 @@ bool AIQueryServiceImpl::initialize(
 
     rpc_config_ = rpc_config;
     redis_client_ = redis;
-    store_ = &store;
     domain_repo_ = &domain;
     budget_repo_ = &budget;
     budget_limits_ = budgetLimitsFromEnvironment();
@@ -94,7 +93,7 @@ bool AIQueryServiceImpl::initialize(
     const char* api_key_env = std::getenv("LLM_API_KEY");
     if (api_key_env && api_key_env[0] != '\0') {
         std::string api_key(api_key_env);
-        std::string model = common::envOrDefault("LLM_MODEL", "deepseek-v4-pro");
+        std::string model = common::envOrDefault("LLM_MODEL", "deepseek-v4-flash");
         std::string api_url = common::envOrDefault("LLM_API_URL", "https://api.deepseek.com/v1/chat/completions");
 
         memory_llm_client_ = std::make_unique<LLMClient>(api_key, model, api_url);
@@ -237,9 +236,8 @@ bool AIQueryServiceImpl::beginDurableRows(DurableQueryRun& run, const std::strin
     log.execution_plan = plan_json;
     log.model = run.model;
     log.status = "running";
-    if (domain_repo_->createQueryLog(log)) {
-        run.first_attempt = true;
-    } else if (!domain_repo_->getQueryLogById(run.owner_id, run.request_id).has_value()) {
+    if (!domain_repo_->createQueryLog(log) &&
+        !domain_repo_->getQueryLogById(run.owner_id, run.request_id).has_value()) {
         LOG_ERROR("Failed to create query log for request " + run.request_id);
         return false;
     }
@@ -726,7 +724,7 @@ grpc::Status AIQueryServiceImpl::Query(
     run.conversation_id = context_id;
     run.request_id = request_id;
     run.question = request->question();
-    run.model = common::envOrDefault("LLM_MODEL", "deepseek-v4-pro");
+    run.model = common::envOrDefault("LLM_MODEL", "deepseek-v4-flash");
 
     const std::string route = orchestrator_enabled_ ? "multi-agent" : "single-agent-a2a";
     nlohmann::json plan_json;
@@ -765,14 +763,15 @@ grpc::Status AIQueryServiceImpl::Query(
     bool success = false;
     std::string response_text;
     std::string error_message;
+    grpc::Status execution_status;  // multi-agent path reports via grpc::Status
 
     if (orchestrator_enabled_) {
         // Multi-agent orchestrator path
-        auto status = multi_agent_handler_->handleQuery(
+        execution_status = multi_agent_handler_->handleQuery(
             context, &enriched_req, response, request_id);
-        success = status.ok();
+        success = execution_status.ok();
         response_text = response->answer();
-        error_message = status.error_message();
+        error_message = execution_status.error_message();
         response->set_request_id(request_id);
         response->set_task_id(request_id);
     } else {
@@ -795,7 +794,6 @@ grpc::Status AIQueryServiceImpl::Query(
         }
 
         // Process query via A2A adapter
-        // Process query via A2A adapter
         common::TraceContext::current()->startSpan("process_query", "server");
         success = a2a_adapter_->processQuery(enriched_req, response);
         common::TraceContext::current()->endSpan();
@@ -809,6 +807,15 @@ grpc::Status AIQueryServiceImpl::Query(
         response->set_task_id(request_id);
         response_text = response->answer();
         error_message = response->status().message();
+    }
+
+    // Client disconnected mid-execution: persist cancelled instead of
+    // finalizing a completed (and billed) run — same contract as the
+    // streaming path.
+    if (context->IsCancelled()) {
+        finalizeDurableQuery(run, "cancelled", "", "Request cancelled");
+        helpers_.updateTaskStatus(request_id, "cancelled");
+        return grpc::Status(grpc::StatusCode::CANCELLED, "Request cancelled");
     }
 
     auto end_time = std::chrono::steady_clock::now();
@@ -877,6 +884,15 @@ grpc::Status AIQueryServiceImpl::Query(
     if (success) {
         return grpc::Status::OK;
     }
+    if (orchestrator_enabled_) {
+        // The handler reports the real gRPC code via its Status; the
+        // protobuf status().code() is not populated on this path.
+        return grpc::Status(execution_status.error_code(),
+                            sanitizeErrorMessage(
+                                error_message.empty()
+                                    ? execution_status.error_message()
+                                    : error_message));
+    }
     grpc::StatusCode grpc_code = a2a_adapter::ErrorMapper::mapIntToGrpcStatus(
         response->status().code());
     return grpc::Status(grpc_code, sanitizeErrorMessage(
@@ -941,7 +957,7 @@ grpc::Status AIQueryServiceImpl::QueryStream(
     run.conversation_id = context_id;
     run.request_id = request_id;
     run.question = request->question();
-    run.model = common::envOrDefault("LLM_MODEL", "deepseek-v4-pro");
+    run.model = common::envOrDefault("LLM_MODEL", "deepseek-v4-flash");
 
     const std::string route = orchestrator_enabled_ ? "multi-agent" : "single-agent-a2a";
     nlohmann::json plan_json;
@@ -1037,7 +1053,6 @@ grpc::Status AIQueryServiceImpl::QueryStream(
         return status;
     }
 
-    // Circuit breaker check
     // Circuit breaker check
     if (circuit_breaker_ && !circuit_breaker_->isRequestAllowed()) {
         LOG_WARN("A2A backend circuit breaker open, rejecting streaming query: " + request_id);

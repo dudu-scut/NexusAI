@@ -40,9 +40,6 @@ public:
         tls.spans_.clear();
         tls.span_stack_.clear();
         tls.depth_ = 0;
-        tls.start_steady_ = std::chrono::steady_clock::now();
-        tls.start_epoch_ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
     }
 
     // Cross-thread propagation overload: when existing_trace_id is non-empty
@@ -60,9 +57,6 @@ public:
         tls.spans_.clear();
         tls.span_stack_.clear();
         tls.depth_ = 0;
-        tls.start_steady_ = std::chrono::steady_clock::now();
-        tls.start_epoch_ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
     }
 
     static TraceContext* current() {
@@ -71,10 +65,6 @@ public:
 
     const std::string& traceId() const { return trace_id_; }
     const std::string& userId() const { return user_id_; }
-
-    // Wall-clock reference for span serialization to Unix ms
-    int64_t epochMs() const { return start_epoch_ms_; }
-    std::chrono::steady_clock::time_point startSteady() const { return start_steady_; }
 
     // Span management
     void startSpan(const std::string& name, const std::string& component) {
@@ -180,10 +170,6 @@ private:
     std::vector<Span> spans_;
     std::vector<std::string> span_stack_;  // stack of span_ids for parent tracking
     int depth_ = 0;  // delegation depth counter
-
-    // Wall-clock reference: captured at init() for converting steady_clock → Unix ms
-    std::chrono::steady_clock::time_point start_steady_{};
-    int64_t start_epoch_ms_ = 0;
 };
 
 }  // namespace common

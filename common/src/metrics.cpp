@@ -372,15 +372,14 @@ Metrics& Metrics::getInstance() {
 }
 
 void Metrics::initialize() {
-    initializeDefaultMetrics();
+    // Idempotent: the constructor already initialized the default metrics.
+    if (!rpc_request_counter_) {
+        initializeDefaultMetrics();
+    }
     LOG_INFO("Metrics system initialized");
 }
 
 void Metrics::recordRpcRequest(const std::string& service, const std::string& method, double duration_ms) {
-    if (!rpc_request_counter_ || !rpc_duration_histogram_) {
-        initializeDefaultMetrics();
-    }
-
     rpc_request_counter_->increment();
     rpc_duration_histogram_->observe(duration_ms);
 
@@ -403,9 +402,6 @@ void Metrics::recordRpcResponse(const std::string& service, const std::string& m
 }
 
 void Metrics::recordRpcError(const std::string& service, const std::string& method, const std::string& error_type) {
-    if (!rpc_error_counter_) {
-        initializeDefaultMetrics();
-    }
 
     rpc_error_counter_->increment();
     MetricsCollector::getInstance()
@@ -415,9 +411,6 @@ void Metrics::recordRpcError(const std::string& service, const std::string& meth
 }
 
 void Metrics::recordConnection(const std::string& service, bool success) {
-    if (!active_connections_gauge_) {
-        initializeDefaultMetrics();
-    }
 
     if (success) {
         active_connections_gauge_->increment();
@@ -429,9 +422,6 @@ void Metrics::recordConnection(const std::string& service, bool success) {
 }
 
 void Metrics::recordDisconnection(const std::string& service) {
-    if (!active_connections_gauge_) {
-        initializeDefaultMetrics();
-    }
 
     active_connections_gauge_->decrement();
     MetricsCollector::getInstance()
@@ -441,9 +431,6 @@ void Metrics::recordDisconnection(const std::string& service) {
 }
 
 void Metrics::recordMessageSent(const std::string& message_type, size_t size) {
-    if (!message_counter_) {
-        initializeDefaultMetrics();
-    }
 
     message_counter_->increment();
     MetricsCollector::getInstance()
@@ -458,9 +445,6 @@ void Metrics::recordMessageSent(const std::string& message_type, size_t size) {
 }
 
 void Metrics::recordMessageReceived(const std::string& message_type, size_t size) {
-    if (!message_counter_) {
-        initializeDefaultMetrics();
-    }
 
     message_counter_->increment();
     MetricsCollector::getInstance()
@@ -475,16 +459,10 @@ void Metrics::recordMessageReceived(const std::string& message_type, size_t size
 }
 
 void Metrics::recordMemoryUsage(size_t bytes) {
-    if (!memory_usage_gauge_) {
-        initializeDefaultMetrics();
-    }
     memory_usage_gauge_->set(static_cast<double>(bytes));
 }
 
 void Metrics::recordCpuUsage(double percentage) {
-    if (!cpu_usage_gauge_) {
-        initializeDefaultMetrics();
-    }
     cpu_usage_gauge_->set(percentage);
 }
 

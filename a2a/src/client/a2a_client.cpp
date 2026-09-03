@@ -3,6 +3,7 @@
 #include <a2a/core/jsonrpc_response.hpp>
 #include <a2a/core/a2a_methods.hpp>
 #include <a2a/core/exception.hpp>
+#include <nlohmann/json.hpp>
 #include <atomic>
 #include <sstream>
 
@@ -80,55 +81,48 @@ A2AClient& A2AClient::operator=(A2AClient&&) noexcept = default;
 A2AResponse A2AClient::send_message(const MessageSendParams& params) {
     // Serialize params to JSON
     std::string params_json = params.to_json();
-    
+
     // Send JSON-RPC request
     auto response = impl_->send_rpc_request(A2AMethods::MESSAGE_SEND, params_json);
-    
+
     // Parse result
     if (!response.result_json().has_value()) {
         throw A2AException("No result in response", ErrorCode::InternalError);
     }
-    
-    const std::string& result_json = *response.result_json();
 
-    // Unwrap A2A JSON-RPC envelope if present.
-    // Python agents return: {"type":"message","message":{...}}
-    // The actual message fields (messageId, role, parts) are nested inside "message".
-    std::string effective_json = result_json;
-    if (result_json.find("\"message\":") != std::string::npos &&
-        result_json.find("\"type\":") != std::string::npos) {
-        // Extract the inner message object from the A2A envelope
-        size_t msg_pos = result_json.find("\"message\":");
-        size_t obj_start = result_json.find("{", msg_pos + 10);
-        if (obj_start != std::string::npos) {
-            // Find matching closing brace
-            int depth = 0;
-            size_t obj_end = obj_start;
-            for (size_t i = obj_start; i < result_json.length(); ++i) {
-                if (result_json[i] == '{') depth++;
-                else if (result_json[i] == '}') {
-                    depth--;
-                    if (depth == 0) {
-                        obj_end = i;
-                        break;
-                    }
-                }
-            }
-            effective_json = result_json.substr(obj_start, obj_end - obj_start + 1);
+    const std::string& result_json = *response.result_json();
+    nlohmann::json parsed = nlohmann::json::parse(result_json, nullptr, false);
+    if (parsed.is_discarded() || !parsed.is_object()) {
+        throw A2AException("Invalid JSON-RPC result", ErrorCode::InternalError);
+    }
+
+    // Tasks are recognized by an explicit kind/type discriminator or a
+    // top-level status object. A Task result may itself carry a "message"
+    // field, so check the discriminator before unwrapping any envelope.
+    auto kind_of = [](const nlohmann::json& j) -> std::string {
+        auto it = j.contains("kind") ? j.find("kind") : j.find("type");
+        return (it != j.end() && it->is_string()) ? it->get<std::string>() : std::string();
+    };
+
+    if (kind_of(parsed) == "task") {
+        return A2AResponse(AgentTask::from_json(result_json));
+    }
+
+    // Unwrap the Python-agent message envelope {"type":"message","message":{...}};
+    // a top-level "parts" means the message is already unwrapped.
+    nlohmann::json effective = parsed;
+    if (!parsed.contains("parts")) {
+        const auto envelope_msg = parsed.find("message");
+        if (envelope_msg != parsed.end() && envelope_msg->is_object()) {
+            effective = *envelope_msg;
         }
     }
 
-    // Determine if result is Task or Message
-    // Check for "kind" field or "status" field to distinguish
-    if (result_json.find("\"status\":") != std::string::npos) {
-        // It's a Task
-        AgentTask task = AgentTask::from_json(result_json);
-        return A2AResponse(task);
-    } else {
-        // It's a Message
-        AgentMessage message = AgentMessage::from_json(result_json);
-        return A2AResponse(message);
+    const std::string effective_json = effective.dump();
+    if (kind_of(effective) == "task" || effective.contains("status")) {
+        return A2AResponse(AgentTask::from_json(effective_json));
     }
+    return A2AResponse(AgentMessage::from_json(effective_json));
 }
 
 void A2AClient::send_message_streaming(const MessageSendParams& params,

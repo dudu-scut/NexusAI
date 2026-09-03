@@ -115,11 +115,14 @@ function formatTime(ms: number): string {
 }
 
 async function copyContent() {
-  if (contentRef.value) {
+  if (!contentRef.value) return
+  try {
     await navigator.clipboard.writeText(contentRef.value.innerText)
     copied.value = true
     toast?.addToast({ type: 'success', message: '已复制到剪贴板' })
     setTimeout(() => { copied.value = false }, 2000)
+  } catch {
+    toast?.addToast({ type: 'error', message: '复制失败：剪贴板权限被拒绝' })
   }
 }
 </script>

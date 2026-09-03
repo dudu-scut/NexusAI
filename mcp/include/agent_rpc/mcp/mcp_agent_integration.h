@@ -37,7 +37,7 @@ namespace mcp {
 struct RAGConfig {
     bool enabled = false;                  ///< Whether RAG-MCP is enabled
     std::string api_key;                   ///< API key (read from LLM_API_KEY env var if empty)
-    std::string model = agent_rpc::common::envOrDefault("EMBEDDING_MODEL", agent_rpc::common::envOrDefault("LLM_MODEL", "deepseek-v4-pro"));
+    std::string model = agent_rpc::common::envOrDefault("EMBEDDING_MODEL", agent_rpc::common::envOrDefault("LLM_MODEL", "deepseek-v4-flash"));
     int top_k = agent_rpc::common::envOrInt("RAG_TOP_K", 5);
     float similarity_threshold = agent_rpc::common::envOrFloat("RAG_THRESHOLD", 0.3f);
     std::string index_path;                ///< Index file path

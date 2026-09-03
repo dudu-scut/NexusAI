@@ -74,6 +74,10 @@ public:
     /** Trim list to [start, stop] range. */
     bool ltrim(const std::string& key, int start, int stop);
 
+    /** Pop the head of a list into result. Returns true only when a value
+     *  was popped; false on error or when the list is empty. */
+    bool lpop(const std::string& key, std::string& result);
+
     /** Set TTL on a key (seconds). */
     bool expire(const std::string& key, int seconds);
 

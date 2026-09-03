@@ -22,7 +22,7 @@ namespace rag {
  */
 struct EmbeddingConfig {
     std::string api_key;                          ///< API key (Bearer Token authentication)
-    std::string model = agent_rpc::common::envOrDefault("EMBEDDING_MODEL", agent_rpc::common::envOrDefault("LLM_MODEL", "deepseek-v4-pro"));
+    std::string model = agent_rpc::common::envOrDefault("EMBEDDING_MODEL", agent_rpc::common::envOrDefault("LLM_MODEL", "deepseek-v4-flash"));
     int dimension = 1024;                         ///< Embedding dimension
     int max_retries = 3;                          ///< Maximum retry count
     int timeout_ms = 10000;                       ///< Timeout (ms)

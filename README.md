@@ -45,7 +45,7 @@ NexusAI 是一个基于 C++20 与 gRPC 构建的高性能多 Agent 协作与智�
 
 ### DAG 任务编排引擎
 
-TaskPlanner 调用 LLM 分析请求，自动生成带依赖关系的子任务 DAG，经 Kahn 拓扑排序分层后，TaskExecutor 使用 `std::async` 并行执行同层无依赖子任务，前置任务的结果自动注入下游上下文，ResultAggregator 聚合多 Agent 输出为统一响应。全局超时防止无限等待，委派深度限制 5 层防止 Agent 递归失控，可配置重试策略自动处理瞬态错误。前端以 Mermaid 实时渲染 DAG 状态流转。
+TaskPlanner 调用 LLM 分析请求，自动生成带依赖关系的子任务 DAG，经 Kahn 拓扑排序分层后，TaskExecutor 以独立工作线程并行执行同层无依赖子任务（子任务超时可安全放弃，不阻塞后续层推进），前置任务的结果自动注入下游上下文，ResultAggregator 聚合多 Agent 输出为统一响应。全局超时防止无限等待，委派深度限制 5 层防止 Agent 递归失控，可配置重试策略自动处理瞬态错误。前端以 Mermaid 实时渲染 DAG 状态流转。
 
 ### 四级智能路由与熔断容错
 
@@ -84,7 +84,7 @@ Node.js 网关将 gRPC 状态码映射为六种 HTTP 语义码：UNAUTHENTICATED
 
 ### 认证与安全
 
-密码采用 32 字节安全盐加一万次 SHA-256 迭代的哈希策略存储，会话令牌为 UUID 并在 Redis 中按 24 小时 TTL 管理。gRPC 拦截器对全部接口鉴权，白名单内的公开 RPC 免认证。匹配 `NEXUSAI_ADMIN_USERNAME` 的用户在注册时获得 ADMIN 角色，作为 RegisterAgent / UnregisterAgent 等管理面 RPC 的强制门槛。
+密码采用 OpenSSL scrypt（EVP_PBE_scrypt，32 字节随机盐）哈希存储，会话令牌为 UUID 并在 Redis 中按 24 小时 TTL 管理。gRPC 拦截器对全部接口鉴权，白名单内的公开 RPC 免认证。匹配 `NEXUSAI_ADMIN_USERNAME` 的用户在注册时获得 ADMIN 角色，作为 RegisterAgent / UnregisterAgent 等管理面 RPC 的强制门槛。
 
 ## 架构概览
 
@@ -103,7 +103,7 @@ Node.js 网关将 gRPC 状态码映射为六种 HTTP 语义码：UNAUTHENTICATED
                                     │ gRPC / Protobuf
                      ┌──────────────▼───────────────┐
                      │  gRPC Server (:50051)         │
-                     │  9 个 Service · 35 个 RPC     │
+                     │  9 个 Service · 41 个 RPC     │
                      │  认证拦截器 · 成本拦截器       │
                      └────┬─────────┬─────────┬─────┘
                           │         │         │
@@ -150,9 +150,11 @@ Node.js 网关将 gRPC 状态码映射为六种 HTTP 语义码：UNAUTHENTICATED
 docker compose up --build
 ```
 
-将启动 5 个服务：PostgreSQL、Redis、RPC 服务端、Node 代理、Nginx 前端。RPC 服务端启动时自动执行 `db/migrations` 迁移，无需单独的迁移服务。服务之间通过 Compose DNS 互通（代理以 `rpc-server:50051` 连接后端），无需配置主机地址。
+将启动 5 个服务：PostgreSQL、Redis、RPC 服务端、Node 代理、Nginx 前端。RPC 服务端启动时自动执行 `db/migrations` 迁移，无需单独的迁移服务。`.env` 中配置的 `LLM_API_KEY` / `LLM_MODEL` / `NEXUSAI_ADMIN_USERNAME` 等会自动透传给 rpc-server 容器（缺省时服务照常启动，LLM 相关能力优雅降级）。服务之间通过 Compose DNS 互通（代理以 `rpc-server:50051` 连接后端），无需配置主机地址。
 
 启动完成后访问 **<http://127.0.0.1:8080>** 即可使用（生产模式前端由 Nginx 托管，端口为 8080 而非 5173）。PostgreSQL 数据持久化在已加入 .gitignore 的 `./.nexusai-data/postgres` 挂载卷中。
+
+> 排障：若 rpc-server 容器退出并报 `migration checksum mismatch`，说明该数据卷是在迁移文件的换行符（CRLF/LF）或内容与当前检出不一致时初始化的旧卷——本地开发数据可丢弃，删除 `./.nexusai-data/postgres` 后重新执行一键启动即可（迁移以当前文件重新初始化）。仓库已通过 `.gitattributes` 将 `*.sql` 固定为 LF，避免再次出现换行符漂移。
 
 受限网络环境下可通过构建参数指定 Debian apt 镜像（默认为空即官方源）：
 
@@ -233,7 +235,7 @@ RegisterAgent 为 ADMIN 专属 RPC，登录用户须匹配 `NEXUSAI_ADMIN_USERNA
 | GCC | 10+ | 支持 C++20 |
 | gRPC | 1.51.1+ | RPC 框架 |
 | PostgreSQL | 16 | 持久事实源 |
-| Redis | 6.0+ | 缓存 / 心跳 / 限流 |
+| Redis | 7.0+ | 缓存 / 心跳 / 限流 |
 | Node.js | 18+ | 前端 + 网关代理 |
 
 ### 服务端口
@@ -268,7 +270,7 @@ agent-communication-and-tool-selection-framework/
 ├── server/                          # gRPC 服务端 — 9 个 Service 实现与 durable 查询管线
 ├── orchestrator/                    # DAG 任务编排与智能路由
 │   ├── task_planner                 #   DAG 规划器（Kahn 拓扑排序）
-│   ├── task_executor                #   并行执行器（std::async）
+│   ├── task_executor                #   并行执行器（独立工作线程，超时可放弃）
 │   ├── agent_router                 #   四级路由引擎
 │   ├── result_aggregator            #   结果聚合器
 │   ├── replay_service / export_service  # 回放与导出

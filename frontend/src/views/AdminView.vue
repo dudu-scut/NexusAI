@@ -77,7 +77,7 @@
             <table class="data-table">
               <thead>
                 <tr>
-                  <th>Agent</th><th>Status</th><th>Success Rate</th><th>Avg Latency</th><th>Active Reqs</th><th>Breaker Trips</th><th>Last Heartbeat</th>
+                  <th>Agent</th><th>Status</th><th>Success Rate</th><th>Avg Latency</th><th>Total Requests</th>
                 </tr>
               </thead>
               <tbody>
@@ -99,9 +99,7 @@
                     </div>
                   </td>
                   <td>{{ getAvgLatency(agent) }}{{ agent.metrics?.avg_latency_ms != null ? 'ms' : '' }}</td>
-                  <td>{{ agent.metrics?.active_requests || 0 }}</td>
-                  <td>{{ agent.metrics?.circuit_breaker_trips || 0 }}</td>
-                  <td class="time-cell">{{ formatTimeAgo(agent.lastHeartbeat) }}</td>
+                  <td>{{ agent.metrics?.total_requests ?? 0 }}</td>
                 </tr>
               </tbody>
             </table>
@@ -197,19 +195,15 @@ const tabs = [
 
 const agents = computed(() => agentsStore.agents)
 const healthyCount = computed(() => agents.value.filter(a => a.healthy).length)
-const degradedCount = computed(() => agents.value.filter(a => !a.healthy && a.lastHeartbeat).length)
-const unhealthyCount = computed(() => agents.value.filter(a => !a.lastHeartbeat).length)
+const degradedCount = computed(() => agents.value.filter(a => !a.healthy).length)
+const unhealthyCount = computed(() => agents.value.filter(a => !a.healthy).length)
 
 function getHealthClass(a: AgentDisplayInfo): string {
-  if (a.healthy) return 'healthy'
-  if (a.lastHeartbeat) return 'degraded'
-  return 'unhealthy'
+  return a.healthy ? 'healthy' : 'unhealthy'
 }
 
 function getHealthLabel(a: AgentDisplayInfo): string {
-  if (a.healthy) return 'Healthy'
-  if (a.lastHeartbeat) return 'Degraded'
-  return 'Offline'
+  return a.healthy ? 'Healthy' : 'Offline'
 }
 
 function getSuccessRate(a: AgentDisplayInfo): number {
@@ -218,14 +212,6 @@ function getSuccessRate(a: AgentDisplayInfo): number {
 
 function getAvgLatency(a: AgentDisplayInfo): number | string {
   return a.metrics?.avg_latency_ms ?? '--'
-}
-
-function formatTimeAgo(ts?: number): string {
-  if (!ts) return '---'
-  const sec = Math.floor((Date.now() - ts) / 1000)
-  if (sec < 60) return `${sec}s ago`
-  if (sec < 3600) return `${Math.floor(sec / 60)}min ago`
-  return `${Math.floor(sec / 3600)}h ago`
 }
 
 // Budget

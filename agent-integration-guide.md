@@ -762,4 +762,4 @@ service AgentCommunicationService {
 
 ### 如何实现长时任务
 
-对于需要较长时间处理的任务，推荐使用 `message/stream` 端点返回 SSE 流。平台会在收到 `state=completed` 事件或连接关闭时结束等待。注意平台的默认请求超时为 60 秒，如果需要更长时间，需要在 A2AAdapter 配置中调整 `request_timeout_seconds`。
+对于需要较长时间处理的任务，推荐使用 `message/stream` 端点返回 SSE 流。平台会在收到 `state=completed` 事件或连接关闭时结束等待。注意平台的默认请求超时为 30 秒（`A2AConfig.request_timeout_seconds`，gRPC deadline 会传播覆盖该值），如果需要更长时间，需要在 A2AAdapter 配置中调整。

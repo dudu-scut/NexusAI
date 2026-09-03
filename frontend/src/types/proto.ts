@@ -77,7 +77,7 @@ export interface Artifact {
 
 export interface AIStreamEvent {
   event_id: string
-  event_type: 'partial' | 'status' | 'complete' | 'error' | 'plan' | 'subtask_start' | 'subtask_complete' | 'activity_json' | 'trace_summary'
+  event_type: 'partial' | 'status' | 'complete' | 'error' | 'plan' | 'subtask_start' | 'subtask_complete'
   content: string
   task_state: string
   context_id: string
@@ -106,7 +106,6 @@ export interface FindAgentsRequest {
   skill: string
   keyword: string
   limit: number
-  required_skills?: string[]
 }
 
 export interface FindAgentsResponse {
@@ -125,15 +124,8 @@ export interface AgentMetrics {
   total_requests: number
   approval_rate?: number      // approval rate
 
-  // The backend may not return these fields; marked optional
-  estimated_token_low?: number
-  estimated_token_high?: number
-  active_requests?: number
-  circuit_breaker_trips?: number
-  health_status?: string
-  last_heartbeat?: string
-  cpu_percent?: number
-  memory_mb?: number
+  estimated_token_low?: number   // proto field 7
+  estimated_token_high?: number  // proto field 8
 }
 
 export interface GetAgentMetricsRequest {
@@ -166,7 +158,8 @@ export interface SubTaskInfo {
   depends_on: string[]
   status: 'pending' | 'running' | 'completed' | 'failed'
   result?: string
-  assigned_agent_id?: string
+  agent_id?: string      // backend plan event field (multi_agent_handler)
+  agent_name?: string
 }
 
 export interface ExecutionPlan {
@@ -403,7 +396,6 @@ export interface AgentDisplayInfo {
   tags: string[]
   skills: string[]
   healthy: boolean
-  lastHeartbeat?: number
   metrics?: AgentMetrics
 }
 

@@ -164,7 +164,9 @@ public:
                          double confidence = 1.0) const;
 
 private:
-    std::unique_ptr<a2a::A2AClient> a2a_client_;
+    // Callers run on multiple gRPC threads, so all HTTP calls use a
+    // per-request local A2AClient; only this timeout knob is shared.
+    std::atomic<long> request_timeout_seconds_{30};
     std::unique_ptr<RequestAdapter> request_adapter_;
     std::unique_ptr<ResponseAdapter> response_adapter_;
     A2AConfig config_;

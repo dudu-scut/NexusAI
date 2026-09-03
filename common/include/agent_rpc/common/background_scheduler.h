@@ -99,6 +99,11 @@ private:
                 auto now = std::chrono::steady_clock::now();
                 for (auto& t : tasks_) {
                     if (now >= t.next_run && !t.running.load() && !t.cancelled.load()) {
+                        // Claim the task here — before it even queues — so a
+                        // task that waits longer than one interval (all
+                        // workers busy) cannot be enqueued twice and then run
+                        // concurrently on two workers.
+                        t.running.store(true);
                         t.next_run = now + t.interval;
                         {
                             std::lock_guard<std::mutex> q_lock(queue_mutex_);
@@ -130,10 +135,11 @@ private:
                 // Cancelled tasks may linger in ready_queue_ at cancel time.
                 // The cancelled flag is checked here before execution instead of
                 // draining the queue, which avoids a lock ordering hazard.
+                // running was already claimed by the coordinator at enqueue.
                 if (task->cancelled.load()) {
+                    task->running.store(false);
                     continue;
                 }
-                task->running.store(true);
                 try {
                     task->fn();
                 } catch (...) {

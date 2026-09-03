@@ -1,8 +1,9 @@
 /**
  * JSON proxy client wrapper
  *
- * Communicates with grpcwebproxy via HTTP/1.1, which converts to gRPC/2 and forwards to NexusAI.
- * Currently uses hand-written TypeScript types + fetch; can switch to protoc-generated stubs later.
+ * Communicates with the Node JSON→gRPC proxy (gateway/proxy/server.mjs)
+ * over HTTP/1.1. Currently uses hand-written TypeScript types + fetch;
+ * can switch to protoc-generated stubs later.
  */
 
 import type {
@@ -75,7 +76,7 @@ let _onUnauthorized: (() => void) | null = null
 export function setOnUnauthorized(cb: () => void) { _onUnauthorized = cb }
 
 /**
- * Unary RPC call (JSON serialized, forwarded via grpcwebproxy)
+ * Unary RPC call (JSON serialized, forwarded by the Node JSON proxy)
  */
 async function unaryCall<TReq, TRes>(
   servicePath: string,
@@ -180,7 +181,19 @@ export function queryStream(
   })
     .then(async (resp) => {
       if (!resp.ok) {
-        throw new Error(`QueryStream failed: ${resp.status}`)
+        // Same contract as unaryCall: trigger logout on 401 and surface the
+        // proxy's semantic { error, code, details } body.
+        if (resp.status === 401) {
+          _onUnauthorized?.()
+        }
+        let backendMessage = ''
+        try {
+          const body = await resp.json()
+          backendMessage = (body && (body.error || body.message || body.details)) || ''
+        } catch {
+          // non-JSON error body
+        }
+        throw new Error(backendMessage || `QueryStream failed: ${resp.status}`)
       }
 
       const reader = resp.body?.getReader()

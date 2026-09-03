@@ -103,6 +103,10 @@ public:
      * @brief Shutdown the service
      */
     void shutdown();
+
+    // Four-layer budget limits read from NEXUSAI_BUDGET_* environment
+    // variables (shared with ExecutePlan's durable reservation).
+    static common::BudgetLimits budgetLimitsFromEnvironment();
     
     /**
      * @brief Check if service is available
@@ -164,7 +168,6 @@ private:
     common::RedisClient* redis_client_ = nullptr;
 
     // Durable pipeline dependencies (non-owning; RpcServer owns the objects)
-    common::PostgresStore* store_ = nullptr;
     common::QueryDomainRepository* domain_repo_ = nullptr;
     common::PostgresBudgetRepository* budget_repo_ = nullptr;
     common::BudgetLimits budget_limits_;
@@ -178,7 +181,6 @@ private:
         std::string question;
         std::string model;
         std::int64_t estimated_tokens = 0;
-        bool first_attempt = false;
         std::atomic<bool> finalized{false};
     };
 
@@ -209,7 +211,6 @@ private:
     void maybeScheduleProfileExtraction(const DurableQueryRun& run,
                                         int message_count);
     static std::int64_t estimateTokens(const std::string& question);
-    static common::BudgetLimits budgetLimitsFromEnvironment();
 
     // agent_invocations producer: best-effort owner-scoped fact write; a
     // failure here is logged and swallowed, never propagated to the caller.

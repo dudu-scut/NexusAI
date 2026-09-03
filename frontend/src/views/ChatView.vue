@@ -109,14 +109,6 @@
             @feedback="handleFeedback"
           />
         </TransitionGroup>
-
-        <!-- Agent Selector -->
-        <AgentSelector
-          v-if="showAgentSelector"
-          :candidates="agentCandidates"
-          :selected-id="selectedAgentId"
-          @select="handleAgentSelect"
-        />
       </div>
 
       <!-- Failure banner with retry — error reason stays visible -->
@@ -216,12 +208,12 @@ import { ref, computed, nextTick, watch, inject } from 'vue'
 import { useRouter } from 'vue-router'
 import { useChatStore } from '../stores/chat'
 import { useAuthStore } from '../stores/auth'
-import { shareSession, executePlan, getAgents } from '../services/grpc-client'
+import { shareSession } from '../services/grpc-client'
+import { executePlan, getAgents } from '../services/grpc-client'
 import type { DAGStructure, ServiceInfo } from '../types/proto'
 import MessageBubble from '../components/MessageBubble.vue'
 import ActivityPanel from '../components/ActivityPanel.vue'
-import AgentSelector from '../components/AgentSelector.vue'
-import type { AgentDisplayInfo, ActivityEntry } from '../types/proto'
+import type { ActivityEntry } from '../types/proto'
 
 const router = useRouter()
 const chatStore = useChatStore()
@@ -269,11 +261,6 @@ async function handleShare() {
   }
 }
 
-// Agent selector state
-const showAgentSelector = ref(false)
-const agentCandidates = ref<AgentDisplayInfo[]>([])
-const selectedAgentId = ref<string>()
-
 // Activity feed
 const activityEntries = ref<ActivityEntry[]>([])
 
@@ -305,12 +292,6 @@ function handleSend() {
 function handleFeedback(msgId: string, type: 'like' | 'dislike') {
   chatStore.setFeedback(msgId, type)
   addActivity('complete', type === 'like' ? 'User marked as helpful 👍' : 'User marked as not helpful 👎')
-}
-
-function handleAgentSelect(agentId: string) {
-  selectedAgentId.value = agentId
-  showAgentSelector.value = false
-  addActivity('agent_call', `Agent selected: ${agentId}`)
 }
 
 function addActivity(type: ActivityEntry['type'], message: string, extra?: Partial<ActivityEntry>) {
@@ -397,8 +378,8 @@ async function rerunLastPlan() {
       nodes: plan.tasks.map(t => ({
         id: t.id,
         description: t.description,
-        agent_id: (t as any).assigned_agent_id ?? '',
-        dependencies: (t as any).depends_on ?? [],
+        agent_id: t.agent_id ?? '',
+        dependencies: t.depends_on ?? [],
       })),
     }
     const response = await executePlan(dag, chatStore.contextId)
@@ -429,8 +410,8 @@ async function openPlanEditor() {
     editedTasks.value = plan.tasks.map(t => ({
       id: t.id,
       description: t.description,
-      agent_id: (t as any).assigned_agent_id ?? '',
-      dependencies: (t as any).depends_on ?? [],
+      agent_id: t.agent_id ?? '',
+      dependencies: t.depends_on ?? [],
     }))
     if (availableAgents.value.length === 0) {
       try {

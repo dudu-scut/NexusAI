@@ -119,8 +119,9 @@ export const useChatStore = defineStore('chat', () => {
           }
           addActivity('thinking', 'Planning tasks...')
         } else if (event.content && event.content !== 'thinking') {
-          msg.agentName = event.content
-          addActivity('agent_call', `Routed to Agent: ${event.content}`)
+          // Status contents are intents/descriptions, not agent names —
+          // agent attribution arrives via the plan / subtask events.
+          addActivity('thinking', event.content)
         }
         break
 
@@ -135,7 +136,8 @@ export const useChatStore = defineStore('chat', () => {
               skill: t.skill,
               depends_on: t.depends_on || [],
               status: 'pending' as const,
-              assigned_agent_id: t.assigned_agent_id,
+              agent_id: t.agent_id,
+              agent_name: t.agent_name,
             })),
           }
           addActivity('thinking', `Execution plan: ${plan.tasks?.length || 0} subtask(s)`)
@@ -149,8 +151,11 @@ export const useChatStore = defineStore('chat', () => {
           const task = msg.executionPlan.tasks.find(t => t.id === event.task_state)
           if (task) {
             task.status = 'running'
+            if (task.agent_id) {
+              msg.agentName = task.agent_name || task.agent_id
+            }
             addActivity('tool_call', `Executing subtask: ${task.description}`, {
-              agent_name: task.assigned_agent_id,
+              agent_name: task.agent_id,
               tool_name: task.skill,
             })
           }
@@ -165,29 +170,9 @@ export const useChatStore = defineStore('chat', () => {
             task.result = event.content
             addActivity(
               task.status === 'completed' ? 'complete' : 'error',
-              `${task.status === 'completed' ? 'Completed' : 'Failed'}: ${task.description}`,
-              { duration_ms: task.status === 'completed' ? undefined : undefined }
+              `${task.status === 'completed' ? 'Completed' : 'Failed'}: ${task.description}`
             )
           }
-        }
-        break
-
-      case 'activity_json':
-        try {
-          const activity = JSON.parse(event.content)
-          addActivity(activity.type || 'tool_call', activity.message, activity)
-        } catch {
-          addActivity('tool_call', event.content)
-        }
-        break
-
-      case 'trace_summary':
-        try {
-          const trace = JSON.parse(event.content) as TraceInfo
-          msg.traceInfo = trace
-          traceInfo.value = trace
-        } catch {
-          // ignore malformed trace
         }
         break
 

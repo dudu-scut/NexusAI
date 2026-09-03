@@ -206,13 +206,15 @@ bool RedisClient::hget(const std::string& key, const std::string& field,
 bool RedisClient::hgetall(const std::string& key,
                            std::map<std::string, std::string>& result) {
     std::lock_guard<std::mutex> lock(mutex_);
+    result.clear();
     if (!ensureConnected()) return false;
 
     auto* reply = static_cast<redisReply*>(
         redisCommand(ctx_, "HGETALL %s", key.c_str()));
     if (!reply) return false;
 
-    if (reply->type == REDIS_REPLY_ARRAY && reply->elements >= 2) {
+    bool ok = (reply->type == REDIS_REPLY_ARRAY);
+    if (ok) {
         for (size_t i = 0; i + 1 < reply->elements; i += 2) {
             if (reply->element[i]->type == REDIS_REPLY_STRING &&
                 reply->element[i + 1]->type == REDIS_REPLY_STRING) {
@@ -223,7 +225,7 @@ bool RedisClient::hgetall(const std::string& key,
         }
     }
     freeReplyObject(reply);
-    return !result.empty();
+    return ok;
 }
 
 bool RedisClient::hdel(const std::string& key, const std::string& field) {
@@ -272,13 +274,15 @@ bool RedisClient::rpush(const std::string& key, const std::string& value) {
 bool RedisClient::lrange(const std::string& key, int start, int stop,
                           std::vector<std::string>& result) {
     std::lock_guard<std::mutex> lock(mutex_);
+    result.clear();
     if (!ensureConnected()) return false;
 
     auto* reply = static_cast<redisReply*>(
         redisCommand(ctx_, "LRANGE %s %d %d", key.c_str(), start, stop));
     if (!reply) return false;
 
-    if (reply->type == REDIS_REPLY_ARRAY) {
+    bool ok = (reply->type == REDIS_REPLY_ARRAY);
+    if (ok) {
         for (size_t i = 0; i < reply->elements; ++i) {
             if (reply->element[i]->type == REDIS_REPLY_STRING) {
                 result.emplace_back(reply->element[i]->str, reply->element[i]->len);
@@ -286,7 +290,23 @@ bool RedisClient::lrange(const std::string& key, int start, int stop,
         }
     }
     freeReplyObject(reply);
-    return !result.empty();
+    return ok;
+}
+
+bool RedisClient::lpop(const std::string& key, std::string& result) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    result.clear();
+    if (!ensureConnected()) return false;
+
+    auto* reply = static_cast<redisReply*>(
+        redisCommand(ctx_, "LPOP %s", key.c_str()));
+    if (!reply) return false;
+    bool ok = (reply->type == REDIS_REPLY_STRING);
+    if (ok) {
+        result.assign(reply->str, reply->len);
+    }
+    freeReplyObject(reply);
+    return ok;
 }
 
 bool RedisClient::ltrim(const std::string& key, int start, int stop) {

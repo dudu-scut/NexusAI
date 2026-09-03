@@ -31,6 +31,13 @@ ServiceEndpoint RoundRobinLoadBalancer::selectEndpoint(const std::vector<Service
 void RoundRobinLoadBalancer::updateEndpoints(const std::vector<ServiceEndpoint>& endpoints) {
     std::lock_guard<std::mutex> lock(endpoints_mutex_);
     healthy_endpoints_ = endpoints;
+    // Refresh health state: a stale unhealthy mark left by an earlier
+    // markEndpointStatus call must not permanently exclude an endpoint that
+    // the fresh snapshot reports as healthy.
+    endpoint_health_.clear();
+    for (const auto& ep : endpoints) {
+        endpoint_health_[ep.host + ":" + std::to_string(ep.port)] = ep.is_healthy;
+    }
     current_index_ = 0;
 }
 
