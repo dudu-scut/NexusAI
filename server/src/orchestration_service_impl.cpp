@@ -22,6 +22,7 @@
 #include "agent_rpc/orchestrator/result_aggregator.h"
 #include "agent_rpc/a2a_adapter/url_validation.h"
 #include "agent_rpc/registry/service_registry.h"
+#include "agent_rpc/server/in_flight_registry.h"
 
 #include <a2a/client/a2a_client.hpp>
 #include <nlohmann/json.hpp>
@@ -312,8 +313,12 @@ grpc::Status OrchestrationServiceImpl::executePlan(
         }
     }
 
-    // Build call_agent lambda
-    auto call_agent = [this, &memory_ctx](const std::string& agent_url,
+    // Build call_agent lambda. memory_ctx is captured BY VALUE: a timed-out
+    // or disconnected subtask keeps executing this lambda on a pool worker
+    // after execute() returns, so a reference capture would dangle once the
+    // executePlan stack frame is gone (same contract as the handler's
+    // buildCallAgent, see the TaskExecutor launch-site comment).
+    auto call_agent = [this, memory_ctx, request_id](const std::string& agent_url,
                              const std::string& prompt) -> std::string {
         std::string enriched_prompt = prompt;
         if (!memory_ctx.empty()) {
@@ -345,6 +350,10 @@ grpc::Status OrchestrationServiceImpl::executePlan(
 
         a2a::A2AClient client(agent_url);
         client.set_timeout(rpc_config_->timeout_seconds);
+        // P24 C0: register the in-flight call so a subtask timeout or a
+        // client disconnect aborts the blocking transfer via on_cancel.
+        InFlightRegistration in_flight(agent_url, request_id);
+        client.set_abort_flag(in_flight.flag().get());
 
         a2a::AgentMessage msg = a2a::AgentMessage::create()
             .with_role(a2a::MessageRole::User)
@@ -367,7 +376,12 @@ grpc::Status OrchestrationServiceImpl::executePlan(
     try {
         // Client-disconnect propagation + executed-only health accounting.
         auto cancelled_probe = [context]() { return context->IsCancelled(); };
-        auto results = task_executor_->execute(plan, call_agent, nullptr, nullptr,
+        // P24 C0: timed-out / disconnected subtasks abort their in-flight
+        // A2A call (scoped to this request, same as the handler DAG path).
+        auto on_cancel = [request_id](const std::string& agent_url) {
+            InFlightAbortRegistry::instance().cancelInFlight(agent_url, request_id);
+        };
+        auto results = task_executor_->execute(plan, call_agent, nullptr, on_cancel,
                                                cancelled_probe);
         for (const auto& [tid, result] : results) {
             (void)tid;

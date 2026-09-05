@@ -3,8 +3,9 @@
  * @brief TaskExecutor — DAG execution engine for multi-agent orchestration
  *
  * Executes an ExecutionPlan by topologically sorting subtasks into layers,
- * running same-layer tasks in parallel via std::async, and propagating
- * predecessor results into dependent subtask prompts.
+ * running same-layer tasks in parallel on a fixed subtask worker pool
+ * (P19), and propagating predecessor results into dependent subtask
+ * prompts.
  */
 
 #pragma once
@@ -15,10 +16,12 @@
 #include <a2a/llm_client.hpp>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <functional>
 #include <future>
 #include <memory>
 #include <mutex>
+#include <queue>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -61,6 +64,77 @@ struct SubTaskResult {
 struct ExecutorConfig {
     int subtask_timeout_seconds  = 30;   // Per-subtask timeout
     int global_timeout_seconds   = 120;  // Overall execution timeout
+    // P19: fixed subtask worker pool size. 0 = auto (max(4, min(16,
+    // hardware_concurrency))). Tests inject a small pool via this field;
+    // there is deliberately no env switch (P19 decision: no rollback knob).
+    int subtask_pool_size        = 0;
+};
+
+// ── Subtask worker pool (P19) ──────────────────────────────────────────────
+// Fixed set of resident workers shared by every DAG execution of this
+// TaskExecutor (a process-level singleton in the server, so the pool is
+// effectively process-wide). Pins the thread-count upper bound to the pool
+// size instead of (concurrent requests × layer width), and packaged_task
+// futures carry no destructor-join semantics. Workers stuck in an in-flight
+// HTTP call are bounded by the A2A HTTP timeout plus the P20/P24 abort
+// flag, so shutdown joins cannot block indefinitely.
+class SubtaskPool {
+public:
+    explicit SubtaskPool(int worker_count) {
+        const int n = worker_count > 0 ? worker_count : 1;
+        workers_.reserve(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i) {
+            workers_.emplace_back([this]() { workerLoop(); });
+        }
+    }
+
+    ~SubtaskPool() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+        }
+        cv_.notify_all();
+        for (auto& w : workers_) {
+            if (w.joinable()) w.join();
+        }
+    }
+
+    SubtaskPool(const SubtaskPool&) = delete;
+    SubtaskPool& operator=(const SubtaskPool&) = delete;
+
+    void submit(std::function<void()> job) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (stopping_) {
+                return;  // shutdown race: drop instead of enqueueing forever
+            }
+            jobs_.push(std::move(job));
+        }
+        cv_.notify_one();
+    }
+
+private:
+    void workerLoop() {
+        for (;;) {
+            std::function<void()> job;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                cv_.wait(lock, [this]() { return stopping_ || !jobs_.empty(); });
+                if (stopping_) {
+                    return;  // queued jobs are dropped at shutdown
+                }
+                job = std::move(jobs_.front());
+                jobs_.pop();
+            }
+            job();
+        }
+    }
+
+    std::vector<std::thread> workers_;
+    std::queue<std::function<void()>> jobs_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool stopping_ = false;
 };
 
 // ── Progress callback ──────────────────────────────────────────────────────
@@ -146,24 +220,22 @@ private:
         const std::string& pre_resolved_url = "",
         const std::string& pre_resolved_agent_id = "");
 
-    // Launch fn on a background thread whose handle is parked internally.
-    // Unlike std::async(std::launch::async), abandoning the returned future
-    // after a timeout never blocks the caller on task completion; parked
-    // threads are joined in the destructor (bounded by the HTTP timeout).
+    // Submit fn to the subtask pool (P19). The wrapper installed before the
+    // payload enforces the dequeue-before-run check: a queued task whose
+    // wait deadline (min(subtask cap, remaining global budget), fixed at
+    // submission) has already expired, or whose caller has aborted it
+    // (timeout / client disconnect via `abandoned`), is skipped without
+    // issuing its HTTP call — a saturated pool must never execute a stale
+    // task long after its result was given up on.
     std::future<SubTaskResult> launchSubtask(
-        std::function<SubTaskResult()> fn);
+        const std::string& task_id,
+        std::function<SubTaskResult()> fn,
+        std::chrono::steady_clock::time_point wait_deadline,
+        std::shared_ptr<std::atomic<bool>> abandoned);
 
     AgentRouter& router_;
     ExecutorConfig config_;
-
-    // Worker threads of timed-out subtasks. `done` lets finished threads be
-    // reaped lazily; the rest are joined in the destructor.
-    struct ParkedThread {
-        std::thread thread;
-        std::shared_ptr<std::atomic<bool>> done;
-    };
-    std::mutex zombie_mutex_;
-    std::vector<ParkedThread> zombie_threads_;
+    SubtaskPool pool_;
 };
 
 } // namespace orchestrator

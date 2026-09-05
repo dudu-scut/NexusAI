@@ -160,26 +160,12 @@ private:
         buildCallAgent(const agent_communication::AIQueryRequest* request,
                        int effective_timeout_seconds);
 
-    // P20: in-flight A2A call registry. Every DAG subtask registers a
-    // per-call abort flag keyed by agent URL before the blocking
-    // send_message; a timed-out subtask flips the flag, which aborts the
-    // blocking HTTP transfer via the HttpClient progress callback.
-    // multimap + flag-matched erase: parallel subtasks may share one URL,
-    // so a URL can carry several live flags.
-    // Each entry carries its owning request_id: cancellation is scoped to
-    // the request that timed out, so a concurrent request hitting the same
-    // agent URL is never aborted as collateral (R18).
-    struct InFlightCall {
-        std::shared_ptr<std::atomic<bool>> flag;
-        std::string owner_request_id;
-    };
-    void cancelInFlight(const std::string& agent_url,
-                        const std::string& owner_request_id);
-    void unregisterInFlight(const std::string& agent_url,
-                            const std::shared_ptr<std::atomic<bool>>& flag);
-    std::mutex in_flight_mutex_;
-    std::unordered_multimap<std::string, InFlightCall>
-        in_flight_calls_;
+    // P24 C0: the in-flight A2A call registry moved to the shared
+    // InFlightAbortRegistry (in_flight_registry.h) so the single-agent fast
+    // path, the direct adapter path and the ExecutePlan call agent register
+    // their abort flags in the same place the DAG subtasks do. The DAG
+    // buildCallAgent registers through the registry directly; cancellation
+    // stays scoped by owner_request_id (R18).
 
     // P10: injected fast-path skill resolver (null → router embedding tier).
     FastPathSkillFn fast_path_skill_resolver_;

@@ -11,6 +11,7 @@
 #include "agent_rpc/server/multi_agent_handler.h"
 #include "agent_rpc/server/query_helpers.h"
 #include "agent_rpc/server/auth_interceptor.h"
+#include "agent_rpc/server/in_flight_registry.h"
 #include "agent_rpc/common/agent_runtime_repository.h"
 #include "agent_rpc/common/logger.h"
 #include "agent_rpc/common/env_loader.h"
@@ -300,10 +301,18 @@ bool MultiAgentHandler::executeSingleAgentSync(
             agent_url = agent->url;
         }
     }
+    // P24 C0: uniform in-flight registration. The blocking sync call has no
+    // concurrent observer on this path (no mid-call trigger today — that is
+    // the honest C2 boundary), but the abort flag is installed on the HTTP
+    // client so any future cancellation entry point can use it.
+    const std::string target_url = !agent_url.empty()
+        ? agent_url : a2a_adapter_->getConfig().orchestrator_url;
+    InFlightRegistration in_flight(target_url, request.request_id());
     if (!agent_url.empty()) {
-        return a2a_adapter_->processQueryDirect(request, response, agent_url);
+        return a2a_adapter_->processQueryDirect(request, response, agent_url,
+                                                in_flight.flag());
     }
-    return a2a_adapter_->processQuery(request, response);
+    return a2a_adapter_->processQuery(request, response, in_flight.flag());
 }
 
 // agent_invocations producer for the orchestrator path. The owner is read
@@ -557,8 +566,8 @@ grpc::Status MultiAgentHandler::handleQuery(
     auto call_agent = buildCallAgent(request, effective_timeout_seconds);
     // P20: a timed-out subtask aborts its in-flight A2A call (scoped to this
     // request — concurrent requests sharing the agent URL are not touched).
-    auto on_cancel = [this, request_id](const std::string& agent_url) {
-        cancelInFlight(agent_url, request_id);
+    auto on_cancel = [request_id](const std::string& agent_url) {
+        InFlightAbortRegistry::instance().cancelInFlight(agent_url, request_id);
     };
     // Client-disconnect propagation: the executor checks this at every layer
     // boundary and stops launching new work when the RPC is cancelled.
@@ -832,8 +841,8 @@ grpc::Status MultiAgentHandler::handleQueryStream(
     auto call_agent = buildCallAgent(request, effective_timeout_seconds);
     // P20: a timed-out subtask aborts its in-flight A2A call (scoped to this
     // request — concurrent requests sharing the agent URL are not touched).
-    auto on_cancel = [this, request_id](const std::string& agent_url) {
-        cancelInFlight(agent_url, request_id);
+    auto on_cancel = [request_id](const std::string& agent_url) {
+        InFlightAbortRegistry::instance().cancelInFlight(agent_url, request_id);
     };
     // Client-disconnect propagation into the DAG (R3): the executor stops
     // launching new layers once the RPC context is cancelled.
@@ -990,7 +999,7 @@ MultiAgentHandler::SingleStreamOutcome MultiAgentHandler::executeSingleAgentStre
     std::string lower_error;
 
     auto write_cb = [context, writer, &cancelled, &write_failed,
-                     &lower_error](const agent_communication::AIStreamEvent& event) {
+                     &lower_error, request_id](const agent_communication::AIStreamEvent& event) {
         if (event.event_type() == "complete") {
             return;  // filtered: terminal belongs to the service layer
         }
@@ -1003,6 +1012,9 @@ MultiAgentHandler::SingleStreamOutcome MultiAgentHandler::executeSingleAgentStre
         }
         if (context->IsCancelled()) {
             cancelled = true;
+            // P24 C0: client disconnected — abort the SSE transfer itself
+            // instead of only stopping event consumption.
+            InFlightAbortRegistry::instance().cancelInFlightByRequest(request_id);
             return;
         }
         if (event.event_type() == "partial") {
@@ -1010,6 +1022,8 @@ MultiAgentHandler::SingleStreamOutcome MultiAgentHandler::executeSingleAgentStre
         }
         if (!writer->Write(event)) {
             write_failed = true;
+            // P24 C0: the response stream is gone — abort the SSE transfer.
+            InFlightAbortRegistry::instance().cancelInFlightByRequest(request_id);
         } else {
             // Any delivered event (status included) makes the stream
             // irreversible: the caller must not replay the run.
@@ -1025,14 +1039,21 @@ MultiAgentHandler::SingleStreamOutcome MultiAgentHandler::executeSingleAgentStre
         }
     }
 
+    // P24 C0: register the in-flight call so cancellation detected inside
+    // write_cb aborts the SSE transfer via the shared registry.
+    const std::string target_url = !agent_url.empty()
+        ? agent_url : a2a_adapter_->getConfig().orchestrator_url;
+    InFlightRegistration in_flight(target_url, request_id);
+
     try {
         if (!agent_url.empty()) {
             LOG_INFO("Single-agent stream: routing to " + plan.single_agent_skill +
                      " via " + agent_url);
-            a2a_adapter_->processQueryStreamingDirect(*request, write_cb, agent_url);
+            a2a_adapter_->processQueryStreamingDirect(*request, write_cb,
+                                                      agent_url, in_flight.flag());
         } else {
             LOG_INFO("Single-agent stream: no pre-resolved agent, using adapter routing");
-            a2a_adapter_->processQueryStreaming(*request, write_cb);
+            a2a_adapter_->processQueryStreaming(*request, write_cb, in_flight.flag());
         }
     } catch (const std::exception& e) {
         LOG_ERROR("Single-agent streaming failed: " + request_id + " - " + e.what());
@@ -1139,116 +1160,68 @@ MultiAgentHandler::buildCallAgent(const agent_communication::AIQueryRequest* req
             throw std::runtime_error("Agent URL rejected: " + url_err);
         }
 
-        // P20: register an abort flag for this in-flight call so a timed-out
-        // subtask can interrupt the blocking HTTP transfer. The flag is
-        // erased on every exit path (success, exception).
-        auto abort_flag = std::make_shared<std::atomic<bool>>(false);
-        {
-            std::lock_guard<std::mutex> lock(in_flight_mutex_);
-            in_flight_calls_.emplace(agent_url,
-                                     InFlightCall{abort_flag, owner_request_id});
-        }
-        auto unregister = [this, &agent_url, abort_flag]() {
-            unregisterInFlight(agent_url, abort_flag);
-        };
+        // P20/P24: register an abort flag for this in-flight call so a
+        // timed-out subtask (or a client disconnect) can interrupt the
+        // blocking HTTP transfer. RAII erases it on every exit path
+        // (success, exception).
+        InFlightRegistration in_flight(agent_url, owner_request_id);
 
-        try {
-            a2a::A2AClient client(agent_url);
-            client.set_abort_flag(abort_flag.get());
-            // P20: the remaining request budget tightens the HTTP timeout
-            // instead of the fixed rpc_config value.
-            client.set_timeout(std::max(1L, static_cast<long>(std::min(
-                effective_timeout_seconds, rpc_config_->timeout_seconds))));
+        a2a::A2AClient client(agent_url);
+        client.set_abort_flag(in_flight.flag().get());
+        // P20: the remaining request budget tightens the HTTP timeout
+        // instead of the fixed rpc_config value.
+        client.set_timeout(std::max(1L, static_cast<long>(std::min(
+            effective_timeout_seconds, rpc_config_->timeout_seconds))));
 
-            // P21 L2 (strict mode): resolve the host, reject blacklisted
-            // addresses, and pin the validated IPs to the connection so the
-            // resolution and the connect share one result (anti-rebinding).
-            std::string host;
-            std::string port_str;
-            if (agent_rpc::a2a_adapter::ssrfStrictModeEnabled() &&
-                agent_rpc::a2a_adapter::splitAgentUrlHostPort(
-                    agent_url, host, port_str)) {
-                std::vector<std::string> ips;
-                std::string host_err;
-                if (!agent_rpc::a2a_adapter::validateResolvedHost(
-                        host, ips, host_err)) {
-                    throw std::runtime_error("Agent host rejected: " + host_err);
-                }
-                // Scheme detection must match L1's case-insensitive parse:
-                // any case of https pins port 443.
-                const bool https =
-                    std::equal(agent_url.begin(),
-                               agent_url.begin() + std::min<size_t>(8, agent_url.size()),
-                               "https://", [](char a, char b) {
-                                   return std::tolower(static_cast<unsigned char>(a)) == b;
-                               });
-                const std::string pin_port =
-                    port_str.empty() ? (https ? "443" : "80") : port_str;
-                std::vector<std::string> resolve_entries;
-                resolve_entries.reserve(ips.size());
-                for (const auto& ip : ips) {
-                    resolve_entries.push_back(host + ":" + pin_port + ":" + ip);
-                }
-                client.set_resolve_entries(resolve_entries);
+        // P21 L2 (strict mode): resolve the host, reject blacklisted
+        // addresses, and pin the validated IPs to the connection so the
+        // resolution and the connect share one result (anti-rebinding).
+        std::string host;
+        std::string port_str;
+        if (agent_rpc::a2a_adapter::ssrfStrictModeEnabled() &&
+            agent_rpc::a2a_adapter::splitAgentUrlHostPort(
+                agent_url, host, port_str)) {
+            std::vector<std::string> ips;
+            std::string host_err;
+            if (!agent_rpc::a2a_adapter::validateResolvedHost(
+                    host, ips, host_err)) {
+                throw std::runtime_error("Agent host rejected: " + host_err);
             }
-
-            a2a::AgentMessage msg = a2a::AgentMessage::create()
-                .with_role(a2a::MessageRole::User)
-                .with_text(enriched_prompt);
-
-            auto params = a2a::MessageSendParams::create().with_message(msg);
-            auto a2a_response = client.send_message(params);
-            unregister();
-            if (a2a_response.is_task()) {
-                for (const auto& artifact : a2a_response.as_task().artifacts()) {
-                    if (artifact.content().has_value()) {
-                        return artifact.content().value();
-                    }
-                }
-            } else if (a2a_response.is_message()) {
-                return a2a_response.as_message().get_text();
+            // Scheme detection must match L1's case-insensitive parse:
+            // any case of https pins port 443.
+            const bool https =
+                std::equal(agent_url.begin(),
+                           agent_url.begin() + std::min<size_t>(8, agent_url.size()),
+                           "https://", [](char a, char b) {
+                               return std::tolower(static_cast<unsigned char>(a)) == b;
+                           });
+            const std::string pin_port =
+                port_str.empty() ? (https ? "443" : "80") : port_str;
+            std::vector<std::string> resolve_entries;
+            resolve_entries.reserve(ips.size());
+            for (const auto& ip : ips) {
+                resolve_entries.push_back(host + ":" + pin_port + ":" + ip);
             }
-            return "";
-        } catch (...) {
-            unregister();
-            throw;
+            client.set_resolve_entries(resolve_entries);
         }
+
+        a2a::AgentMessage msg = a2a::AgentMessage::create()
+            .with_role(a2a::MessageRole::User)
+            .with_text(enriched_prompt);
+
+        auto params = a2a::MessageSendParams::create().with_message(msg);
+        auto a2a_response = client.send_message(params);
+        if (a2a_response.is_task()) {
+            for (const auto& artifact : a2a_response.as_task().artifacts()) {
+                if (artifact.content().has_value()) {
+                    return artifact.content().value();
+                }
+            }
+        } else if (a2a_response.is_message()) {
+            return a2a_response.as_message().get_text();
+        }
+        return "";
     };
-}
-
-void MultiAgentHandler::cancelInFlight(const std::string& agent_url,
-                                       const std::string& owner_request_id) {
-    // Collect the live flags for the URL that belong to THIS request first
-    // (lock scope), then flip them outside the lock. A timed-out subtask
-    // aborts only its own request's calls sharing the URL — concurrent
-    // requests targeting the same agent keep their in-flight calls intact.
-    std::vector<std::shared_ptr<std::atomic<bool>>> flags;
-    {
-        std::lock_guard<std::mutex> lock(in_flight_mutex_);
-        auto range = in_flight_calls_.equal_range(agent_url);
-        for (auto it = range.first; it != range.second; ++it) {
-            if (it->second.owner_request_id == owner_request_id ||
-                it->second.owner_request_id.empty()) {
-                flags.push_back(it->second.flag);
-            }
-        }
-    }
-    for (auto& flag : flags) {
-        flag->store(true);
-    }
-}
-
-void MultiAgentHandler::unregisterInFlight(
-    const std::string& agent_url,
-    const std::shared_ptr<std::atomic<bool>>& flag) {
-    std::lock_guard<std::mutex> lock(in_flight_mutex_);
-    auto range = in_flight_calls_.equal_range(agent_url);
-    for (auto it = range.first; it != range.second; ++it) {
-        if (it->second.flag == flag) {
-            in_flight_calls_.erase(it);
-            return;
-        }
-    }
 }
 
 } // namespace server

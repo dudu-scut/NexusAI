@@ -20,6 +20,7 @@
 #include "agent_rpc/common/load_balancer.h"
 #include "agent_rpc/a2a_adapter/url_validation.h"
 
+#include <atomic>
 #include <cstdlib>
 #include <thread>
 #include <unordered_set>
@@ -1103,6 +1104,111 @@ TEST_F(AgentRouterPropertyTest, SingleTaskLayerCompletesNormallyWithAgentId) {
     EXPECT_TRUE(results.at("t1").success);
     EXPECT_EQ(results.at("t1").result, "answer");
     EXPECT_EQ(results.at("t1").agent_id, "fast-agent");  // P14(a) backfill
+}
+
+// ── P19: fixed subtask pool + dequeue-before-run check ──────────────────
+
+// With a 1-worker pool, the first task occupies the worker while the second
+// one queues past its wait deadline. After the layer is given up (both tasks
+// time out), the queued task must NOT be executed late — the dequeue check
+// (deadline passed / abandoned flag) skips it, so the agent is contacted
+// exactly once.
+TEST_F(AgentRouterPropertyTest, P19QueuedTaskIsSkippedAfterWaitWindowExpires) {
+    auto agent = createAgent("p19-agent", {"math"});
+    router_->addAgent(agent);
+
+    ExecutorConfig cfg;
+    cfg.subtask_timeout_seconds = 1;
+    cfg.global_timeout_seconds = 30;
+    cfg.subtask_pool_size = 1;  // force queueing behind the first task
+    TaskExecutor executor(*router_, cfg);
+
+    ExecutionPlan plan;
+    plan.is_single_agent = false;
+    for (const char* id : {"t1", "t2"}) {
+        SubTask st;
+        st.id = id;
+        st.description = "do math";
+        st.required_skill = "math";
+        st.preferred_agent_id = "p19-agent";
+        plan.tasks.push_back(st);
+    }
+
+    std::atomic<int> calls{0};
+    auto call_agent = [&calls](const std::string&, const std::string&) -> std::string {
+        calls.fetch_add(1);
+        // Occupy the single worker past both tasks' 1s wait windows.
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        return "late answer";
+    };
+
+    auto results = executor.execute(plan, call_agent);
+
+    ASSERT_EQ(results.count("t1"), 1u);
+    ASSERT_EQ(results.count("t2"), 1u);
+    EXPECT_FALSE(results.at("t1").success);
+    EXPECT_FALSE(results.at("t2").success);
+    EXPECT_EQ(results.at("t1").error_message, "Subtask timeout exceeded");
+    EXPECT_EQ(results.at("t2").error_message, "Subtask timeout exceeded");
+
+    // Grace window: the worker frees up ~1s after execute() returned. A
+    // missing dequeue check would execute t2 at that point (calls → 2).
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+    EXPECT_EQ(calls.load(), 1);
+}
+
+// ── P24 C0.5: client-disconnect propagation aborts the in-flight layer ──
+
+// The cancellation probe fires mid-wait; the collector must notice it within
+// the 200ms probe slice, abort the in-flight call via on_cancel, and return
+// promptly instead of waiting out the full (30s) subtask budget.
+TEST_F(AgentRouterPropertyTest, P24ClientDisconnectAbortsInFlightLayerTask) {
+    auto agent = createAgent("p24-agent", {"math"});
+    router_->addAgent(agent);
+
+    ExecutorConfig cfg;
+    cfg.subtask_timeout_seconds = 30;  // no per-subtask timeout: the probe wins
+    cfg.global_timeout_seconds = 30;
+    TaskExecutor executor(*router_, cfg);
+
+    ExecutionPlan plan;
+    plan.is_single_agent = false;
+    SubTask st;
+    st.id = "t1";
+    st.description = "do math";
+    st.required_skill = "math";
+    st.preferred_agent_id = "p24-agent";
+    plan.tasks.push_back(st);
+
+    auto call_agent = [](const std::string&, const std::string&) -> std::string {
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        return "late answer";
+    };
+
+    std::string cancelled_url;
+    auto on_cancel = [&cancelled_url](const std::string& url) {
+        cancelled_url = url;
+    };
+    const auto probe_start = std::chrono::steady_clock::now();
+    auto cancelled = [&probe_start]() {
+        return std::chrono::steady_clock::now() - probe_start >
+               std::chrono::milliseconds(500);
+    };
+
+    auto start = std::chrono::steady_clock::now();
+    auto results = executor.execute(plan, call_agent, nullptr, on_cancel, cancelled);
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count();
+
+    ASSERT_EQ(results.count("t1"), 1u);
+    EXPECT_FALSE(results.at("t1").success);
+    EXPECT_NE(results.at("t1").error_message.find("client disconnected"),
+              std::string::npos);
+    // The in-flight call was aborted with the pre-resolved agent URL.
+    EXPECT_EQ(cancelled_url, agent.url);
+    // Returned right after the probe fired (~0.5s + one probe slice), not
+    // after the 5s fake call or the 30s budget.
+    EXPECT_LT(elapsed, 3000);
 }
 
 // ── P21: SSRF URL validation (L1 always-on; L2 resolution blacklist) ─────

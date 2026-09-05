@@ -62,8 +62,9 @@ void A2AAdapter::shutdown() {
 
 bool A2AAdapter::processQuery(
     const agent_communication::AIQueryRequest& request,
-    agent_communication::AIQueryResponse* response) {
-    
+    agent_communication::AIQueryResponse* response,
+    std::shared_ptr<std::atomic<bool>> abort_flag) {
+
     if (!response) {
         return false;
     }
@@ -95,6 +96,11 @@ bool A2AAdapter::processQuery(
         // per-call headers/timeouts must not live on shared state).
         a2a::A2AClient client(config_.orchestrator_url);
         client.set_timeout(request_timeout_seconds_.load());
+        // P24: install the caller-registered abort flag so a client
+        // disconnect can interrupt the blocking transfer.
+        if (abort_flag) {
+            client.set_abort_flag(abort_flag.get());
+        }
 
         // RAII span guard: closes agent_call and restores the delegation
         // depth on every exit path (previously the failure paths leaked the
@@ -278,8 +284,9 @@ void A2AAdapter::processQueryAsync(
 
 void A2AAdapter::processQueryStreaming(
     const agent_communication::AIQueryRequest& request,
-    std::function<void(const agent_communication::AIStreamEvent&)> callback) {
-    
+    std::function<void(const agent_communication::AIStreamEvent&)> callback,
+    std::shared_ptr<std::atomic<bool>> abort_flag) {
+
     if (!initialized_ || !callback || !config_.enable_streaming) {
         return;
     }
@@ -336,6 +343,11 @@ void A2AAdapter::processQueryStreaming(
         // header/timeout state.
         a2a::A2AClient client(config_.orchestrator_url);
         client.set_timeout(request_timeout_seconds_.load());
+        // P24: install the caller-registered abort flag so a client
+        // disconnect can interrupt the SSE transfer.
+        if (abort_flag) {
+            client.set_abort_flag(abort_flag.get());
+        }
         if (!trace_id.empty()) {
             client.add_header("x-trace-id", trace_id);
             client.add_header("x-delegation-depth", std::to_string(depth + 1));
@@ -543,7 +555,8 @@ bool A2AAdapter::isAvailable() const {
 bool A2AAdapter::processQueryDirect(
     const agent_communication::AIQueryRequest& request,
     agent_communication::AIQueryResponse* response,
-    const std::string& agent_url) {
+    const std::string& agent_url,
+    std::shared_ptr<std::atomic<bool>> abort_flag) {
 
     if (!response || !initialized_) {
         if (response) {
@@ -590,6 +603,11 @@ bool A2AAdapter::processQueryDirect(
         // static config value, so gRPC-deadline-contracted requests on the
         // direct path honor the same budget as the orchestrator path.
         client.set_timeout(request_timeout_seconds_.load());
+        // P24: install the caller-registered abort flag so a client
+        // disconnect can interrupt the blocking transfer.
+        if (abort_flag) {
+            client.set_abort_flag(abort_flag.get());
+        }
 
         // P21 L2 (strict mode): resolve the host, reject blacklisted
         // addresses, and pin the validated IPs to the connection
@@ -696,7 +714,8 @@ bool A2AAdapter::processQueryDirect(
 void A2AAdapter::processQueryStreamingDirect(
     const agent_communication::AIQueryRequest& request,
     std::function<void(const agent_communication::AIStreamEvent&)> callback,
-    const std::string& agent_url) {
+    const std::string& agent_url,
+    std::shared_ptr<std::atomic<bool>> abort_flag) {
 
     if (!initialized_ || !callback || !config_.enable_streaming) {
         return;
@@ -749,6 +768,11 @@ void A2AAdapter::processQueryStreamingDirect(
 
         a2a::A2AClient client(agent_url);
         client.set_timeout(request_timeout_seconds_.load());
+        // P24: install the caller-registered abort flag so a client
+        // disconnect can interrupt the SSE transfer.
+        if (abort_flag) {
+            client.set_abort_flag(abort_flag.get());
+        }
 
         // RAII span guard: closes agent_call_streaming_direct and restores the
         // delegation depth on every exit path.

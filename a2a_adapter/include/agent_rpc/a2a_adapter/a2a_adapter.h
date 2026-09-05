@@ -50,12 +50,16 @@ public:
      * @brief Process a synchronous AI query
      * @param request The RPC request
      * @param response The RPC response to populate
+     * @param abort_flag Optional P24 abort flag (from InFlightAbortRegistry);
+     *                   when set, the HTTP transfer is interruptible via the
+     *                   libcurl progress callback
      * @return true if query successful
      */
     bool processQuery(
         const agent_communication::AIQueryRequest& request,
-        agent_communication::AIQueryResponse* response);
-    
+        agent_communication::AIQueryResponse* response,
+        std::shared_ptr<std::atomic<bool>> abort_flag = nullptr);
+
     /**
      * @brief Process an asynchronous AI query
      * @param request The RPC request
@@ -64,38 +68,44 @@ public:
     void processQueryAsync(
         const agent_communication::AIQueryRequest& request,
         std::function<void(const agent_communication::AIQueryResponse&)> callback);
-    
+
     /**
      * @brief Process a streaming AI query
      * @param request The RPC request
      * @param callback Callback to invoke for each stream event
+     * @param abort_flag Optional P24 abort flag (see processQuery)
      */
     void processQueryStreaming(
         const agent_communication::AIQueryRequest& request,
-        std::function<void(const agent_communication::AIStreamEvent&)> callback);
+        std::function<void(const agent_communication::AIStreamEvent&)> callback,
+        std::shared_ptr<std::atomic<bool>> abort_flag = nullptr);
 
     /**
      * @brief Process a sync query using a pre-resolved agent URL (bypasses routing)
      * @param request The RPC request
      * @param response The RPC response to populate
      * @param agent_url Pre-resolved agent URL
+     * @param abort_flag Optional P24 abort flag (see processQuery)
      * @return true if query successful
      */
     bool processQueryDirect(
         const agent_communication::AIQueryRequest& request,
         agent_communication::AIQueryResponse* response,
-        const std::string& agent_url);
+        const std::string& agent_url,
+        std::shared_ptr<std::atomic<bool>> abort_flag = nullptr);
 
     /**
      * @brief Process a streaming query using a pre-resolved agent URL (bypasses routing)
      * @param request The RPC request
      * @param callback Callback to invoke for each stream event
      * @param agent_url Pre-resolved agent URL
+     * @param abort_flag Optional P24 abort flag (see processQuery)
      */
     void processQueryStreamingDirect(
         const agent_communication::AIQueryRequest& request,
         std::function<void(const agent_communication::AIStreamEvent&)> callback,
-        const std::string& agent_url);
+        const std::string& agent_url,
+        std::shared_ptr<std::atomic<bool>> abort_flag = nullptr);
 
     /**
      * @brief Check if the adapter is available

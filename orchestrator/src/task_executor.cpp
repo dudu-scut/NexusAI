@@ -16,48 +16,93 @@
 namespace agent_rpc {
 namespace orchestrator {
 
-TaskExecutor::TaskExecutor(AgentRouter& router, const ExecutorConfig& config)
-    : router_(router)
-    , config_(config)
-{}
+namespace {
 
-TaskExecutor::~TaskExecutor() {
-    // Join any worker threads left behind by timed-out subtasks. Each is
-    // bounded by its HTTP timeout, so this cannot block indefinitely.
-    std::vector<ParkedThread> zombies;
-    {
-        std::lock_guard<std::mutex> lock(zombie_mutex_);
-        zombies.swap(zombie_threads_);
+// P19: pool size resolution — explicit config wins, otherwise clamp the
+// hardware concurrency hint into [4, 16].
+int resolvePoolSize(const ExecutorConfig& config) {
+    if (config.subtask_pool_size > 0) {
+        return config.subtask_pool_size;
     }
-    for (auto& z : zombies) {
-        if (z.thread.joinable()) z.thread.join();
+    const unsigned hw = std::thread::hardware_concurrency();
+    const int hint = hw > 0 ? static_cast<int>(hw) : 4;
+    return std::max(4, std::min(16, hint));
+}
+
+// P24 C0.5: segmented wait on a subtask future — the collector must notice
+// a client disconnect while an in-flight call is running, not only at the
+// layer boundary. Each slice is capped so the probe runs at least every
+// kProbeSlice while the deadline is still open.
+enum class WaitOutcome { Ready, TimedOut, Cancelled };
+
+WaitOutcome waitForSubtask(
+    std::future<SubTaskResult>& fut,
+    std::chrono::steady_clock::time_point wait_deadline,
+    const std::function<bool()>& cancelled) {
+    constexpr auto kProbeSlice = std::chrono::milliseconds(200);
+    if (cancelled && cancelled()) {
+        return WaitOutcome::Cancelled;
+    }
+    for (;;) {
+        auto now = std::chrono::steady_clock::now();
+        if (now >= wait_deadline) {
+            return WaitOutcome::TimedOut;
+        }
+        const auto slice = std::min(
+            kProbeSlice,
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                wait_deadline - std::chrono::steady_clock::now()));
+        if (fut.wait_for(slice) == std::future_status::ready) {
+            return WaitOutcome::Ready;
+        }
+        if (cancelled && cancelled()) {
+            return WaitOutcome::Cancelled;
+        }
     }
 }
 
+} // namespace
+
+TaskExecutor::TaskExecutor(AgentRouter& router, const ExecutorConfig& config)
+    : router_(router)
+    , config_(config)
+    , pool_(resolvePoolSize(config))
+{}
+
+TaskExecutor::~TaskExecutor() = default;
+
 std::future<SubTaskResult> TaskExecutor::launchSubtask(
-    std::function<SubTaskResult()> fn) {
+    const std::string& task_id,
+    std::function<SubTaskResult()> fn,
+    std::chrono::steady_clock::time_point wait_deadline,
+    std::shared_ptr<std::atomic<bool>> abandoned) {
     auto task = std::make_shared<std::packaged_task<SubTaskResult()>>(
-        std::move(fn));
+        [task_id, fn = std::move(fn), wait_deadline,
+         abandoned = std::move(abandoned)]() -> SubTaskResult {
+            // P19 dequeue-before-run check: a task whose wait window has
+            // already expired or whose caller has aborted it (timeout /
+            // client disconnect) must not start executing after sitting in
+            // the queue. The fabricated result is normally discarded by the
+            // collector, which has already given up on this task; in the
+            // rare race where the collector still picks it up, subtask_id
+            // keeps the result self-describing and executed=false keeps it
+            // out of health accounting.
+            if (abandoned->load(std::memory_order_acquire) ||
+                std::chrono::steady_clock::now() >= wait_deadline) {
+                SubTaskResult skipped;
+                skipped.subtask_id = task_id;
+                skipped.success = false;
+                skipped.executed = false;
+                skipped.error_message =
+                    abandoned->load(std::memory_order_relaxed)
+                        ? "Cancelled before execution"
+                        : "Skipped: wait window expired while queued";
+                return skipped;
+            }
+            return fn();
+        });
     std::future<SubTaskResult> fut = task->get_future();
-
-    auto done = std::make_shared<std::atomic<bool>>(false);
-    std::thread worker([task, done]() {
-        (*task)();
-        done->store(true);
-    });
-
-    std::lock_guard<std::mutex> lock(zombie_mutex_);
-    // Reap workers that already finished (their join returns instantly).
-    auto it = zombie_threads_.begin();
-    while (it != zombie_threads_.end()) {
-        if (it->done->load()) {
-            it->thread.join();
-            it = zombie_threads_.erase(it);
-        } else {
-            ++it;
-        }
-    }
-    zombie_threads_.push_back(ParkedThread{std::move(worker), done});
+    pool_.submit([task]() { (*task)(); });
     return fut;
 }
 
@@ -222,7 +267,20 @@ std::unordered_map<std::string, SubTaskResult> TaskExecutor::execute(
             // running after execute() returns, so capturing them by reference
             // would dangle once the caller destroys the plan and the call
             // lambda. The copy makes the abandoned worker self-contained.
+            // P19: the wait deadline is fixed before submission so the pool
+            // worker's dequeue check and the collector share one bound.
+            auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                global_deadline - std::chrono::steady_clock::now());
+            if (remaining_ms <= std::chrono::milliseconds(0)) {
+                remaining_ms = std::chrono::milliseconds(1);
+            }
+            const auto wait_budget = std::min(subtask_cap, remaining_ms);
+            const auto wait_deadline = std::chrono::steady_clock::now() + wait_budget;
+            const bool global_capped = (wait_budget >= remaining_ms);
+            auto abandoned = std::make_shared<std::atomic<bool>>(false);
+
             auto fut = launchSubtask(
+                tid,
                 [this, st, p = std::move(prompt), call_agent,
                  cancel_url, cancel_agent_id,
                  parent_trace_id, parent_user_id, trace_propagation]() {
@@ -241,17 +299,24 @@ std::unordered_map<std::string, SubTaskResult> TaskExecutor::execute(
                         result.child_spans = trace->completedSpans();
                     }
                     return result;
-                });
+                },
+                wait_deadline, abandoned);
 
             SubTaskResult result;
-            auto remaining_now = std::chrono::duration_cast<std::chrono::milliseconds>(
-                global_deadline - std::chrono::steady_clock::now());
-            auto wait_for = std::min(subtask_cap, remaining_now);
             auto wait_start = std::chrono::steady_clock::now();
-            auto status = fut.wait_for(wait_for);
-            if (status == std::future_status::ready) {
+            const auto outcome =
+                waitForSubtask(fut, wait_deadline, cancelled);
+            if (outcome == WaitOutcome::Ready) {
                 result = fut.get();
             } else {
+                // P19/P24: mark the task abandoned so a still-queued worker
+                // skips it at the dequeue check; abort the in-flight A2A
+                // call instead of leaving a zombie worker blocked until its
+                // HTTP timeout.
+                abandoned->store(true, std::memory_order_release);
+                if (on_cancel && !cancel_url.empty()) {
+                    on_cancel(cancel_url);
+                }
                 result.subtask_id = tid;
                 result.success = false;
                 // A real attempt was in flight — executed stays true so the
@@ -260,20 +325,23 @@ std::unordered_map<std::string, SubTaskResult> TaskExecutor::execute(
                 result.duration_ms = static_cast<int64_t>(
                     std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now() - wait_start).count());
-                result.error_message = (wait_for >= remaining_now)
-                    ? "Global timeout exceeded"
-                    : "Subtask timeout exceeded";
+                if (outcome == WaitOutcome::Cancelled) {
+                    // P24 C0.5: the client disconnected while the call was
+                    // in flight — abort it instead of waiting out the HTTP
+                    // timeout.
+                    result.error_message =
+                        "Cancelled while executing (client disconnected)";
+                } else {
+                    result.error_message = global_capped
+                        ? "Global timeout exceeded"
+                        : "Subtask timeout exceeded";
+                }
                 // B3/P20-7: a write-shaped task may have already applied its
                 // effect — report UNCERTAIN instead of a plain failure.
                 if (st.effect == SubTask::Effect::SideEffect) {
                     result.uncertain = true;
                     result.error_message +=
                         "; side-effect may have applied (unknown)";
-                }
-                // P20: abort the in-flight A2A call instead of leaving a
-                // zombie thread blocked until its HTTP timeout.
-                if (on_cancel && !cancel_url.empty()) {
-                    on_cancel(cancel_url);
                 }
             }
 
@@ -293,8 +361,17 @@ std::unordered_map<std::string, SubTaskResult> TaskExecutor::execute(
 
             results[tid] = std::move(result);
         } else {
-            // Multiple subtasks — execute in parallel via std::async
-            std::vector<std::pair<std::string, std::future<SubTaskResult>>> futures;
+            // Multiple subtasks — execute in parallel on the subtask pool
+            // (P19: fixed worker count instead of one thread per task).
+            struct LaunchedSubtask {
+                std::string tid;
+                std::future<SubTaskResult> fut;
+                std::chrono::steady_clock::time_point wait_deadline;
+                bool global_capped = false;
+                std::shared_ptr<std::atomic<bool>> abandoned;
+                std::string cancel_url;
+            };
+            std::vector<LaunchedSubtask> launched;
 
             // Capture parent trace context for subtask thread propagation
             std::string parent_trace_id;
@@ -350,12 +427,27 @@ std::unordered_map<std::string, SubTaskResult> TaskExecutor::execute(
                 const std::string cancel_url = target.first;
                 const std::string cancel_agent_id = target.second;
 
-                // Capture st by reference (valid throughout layer execution)
-                // and prompt by value (moved into lambda)
+                // P19: fix this task's wait window at submission — the pool
+                // worker's dequeue check and the collector share one bound,
+                // and queueing time consumes the deadline by design.
+                auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    global_deadline - std::chrono::steady_clock::now());
+                if (remaining_ms <= std::chrono::milliseconds(0)) {
+                    remaining_ms = std::chrono::milliseconds(1);
+                }
+                const auto wait_budget = std::min(subtask_cap, remaining_ms);
+
+                LaunchedSubtask item;
+                item.tid = tid;
+                item.wait_deadline = std::chrono::steady_clock::now() + wait_budget;
+                item.global_capped = (wait_budget >= remaining_ms);
+                item.abandoned = std::make_shared<std::atomic<bool>>(false);
+                item.cancel_url = cancel_url;
+
                 // By-value capture as in the single-subtask branch: the
                 // worker may outlive this execute() call after a timeout.
-                futures.emplace_back(tid,
-                    launchSubtask(
+                item.fut = launchSubtask(
+                        tid,
                         [this, st, p = std::move(prompt), call_agent,
                          cancel_url, cancel_agent_id,
                          parent_trace_id, parent_user_id, trace_propagation]() {
@@ -380,64 +472,58 @@ std::unordered_map<std::string, SubTaskResult> TaskExecutor::execute(
                                 result.child_spans = trace->completedSpans();
                             }
                             return result;
-                        }));
+                        },
+                        item.wait_deadline, item.abandoned);
+                launched.push_back(std::move(item));
             }
 
             // Collect results with deadline awareness (fixes #18: DAG global timeout
             // now actually cancels waiting on incomplete async tasks instead of
             // blocking indefinitely on fut.get())
-            for (auto& [tid, fut] : futures) {
+            for (auto& item : launched) {
+                const auto& tid = item.tid;
                 try {
-                    auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        global_deadline - std::chrono::steady_clock::now());
-
                     SubTaskResult result;
-                    if (remaining <= std::chrono::milliseconds(0)) {
-                        // Deadline already passed. The future was already
-                        // launched, so the worker may have a real HTTP call
-                        // in flight — keep executed=true and abort it, same
-                        // as the wait-timeout branch below (P3-2).
+                    auto wait_start = std::chrono::steady_clock::now();
+                    const auto outcome =
+                        waitForSubtask(item.fut, item.wait_deadline, cancelled);
+                    if (outcome == WaitOutcome::Ready) {
+                        result = item.fut.get();
+                    } else {
+                        // P19/P24: mark abandoned (queued siblings of this
+                        // task skip execution at the dequeue check) and
+                        // abort the in-flight A2A call.
+                        item.abandoned->store(true, std::memory_order_release);
+                        if (on_cancel && !item.cancel_url.empty()) {
+                            on_cancel(item.cancel_url);
+                        }
                         result.subtask_id = tid;
                         result.success = false;
-                        result.error_message = "Global timeout exceeded";
-                        auto dead_target = layer_targets.find(tid);
-                        if (on_cancel && dead_target != layer_targets.end() &&
-                            !dead_target->second.first.empty()) {
-                            on_cancel(dead_target->second.first);
-                        }
-                    } else {
-                        // P20: wait no longer than the per-subtask cap OR the
-                        // remaining global budget, whichever is tighter.
-                        auto wait_for = std::min(subtask_cap, remaining);
-                        auto wait_start = std::chrono::steady_clock::now();
-                        auto status = fut.wait_for(wait_for);
-                        if (status == std::future_status::ready) {
-                            result = fut.get();
+                        // Real attempt in flight — executed stays true;
+                        // record the actual wait duration.
+                        result.duration_ms = static_cast<int64_t>(
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - wait_start).count());
+                        if (outcome == WaitOutcome::Cancelled) {
+                            // P24 C0.5: client disconnected while the call
+                            // was in flight — aborted above, return fast.
+                            result.error_message =
+                                "Cancelled while executing (client disconnected)";
                         } else {
-                            result.subtask_id = tid;
-                            result.success = false;
-                            // Real attempt in flight — executed stays true;
-                            // record the actual wait duration.
-                            result.duration_ms = static_cast<int64_t>(
-                                std::chrono::duration_cast<std::chrono::milliseconds>(
-                                    std::chrono::steady_clock::now() - wait_start).count());
-                            result.error_message = (wait_for >= remaining)
+                            // P20: wait no longer than the per-subtask cap
+                            // OR the remaining global budget, whichever is
+                            // tighter.
+                            result.error_message = item.global_capped
                                 ? "Global timeout exceeded"
                                 : "Subtask timeout exceeded";
-                            // B3/P20-7: write-shaped task → UNCERTAIN.
-                            auto task_it = task_map.find(tid);
-                            if (task_it != task_map.end() &&
-                                task_it->second->effect == SubTask::Effect::SideEffect) {
-                                result.uncertain = true;
-                                result.error_message +=
-                                    "; side-effect may have applied (unknown)";
-                            }
-                            // P20: abort the in-flight A2A call.
-                            auto target_it = layer_targets.find(tid);
-                            if (on_cancel && target_it != layer_targets.end() &&
-                                !target_it->second.first.empty()) {
-                                on_cancel(target_it->second.first);
-                            }
+                        }
+                        // B3/P20-7: write-shaped task → UNCERTAIN.
+                        auto task_it = task_map.find(tid);
+                        if (task_it != task_map.end() &&
+                            task_it->second->effect == SubTask::Effect::SideEffect) {
+                            result.uncertain = true;
+                            result.error_message +=
+                                "; side-effect may have applied (unknown)";
                         }
                     }
 

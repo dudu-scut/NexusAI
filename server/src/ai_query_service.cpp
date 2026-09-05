@@ -26,6 +26,7 @@
 
 #include "agent_rpc/server/ai_query_service.h"
 #include "agent_rpc/server/auth_interceptor.h"
+#include "agent_rpc/server/in_flight_registry.h"
 #include "agent_rpc/common/logger.h"
 #include "agent_rpc/common/env_loader.h"
 #include "agent_rpc/a2a_adapter/error_mapper.h"
@@ -959,9 +960,16 @@ grpc::Status AIQueryServiceImpl::Query(
             a2a_adapter_->setRequestTimeout(timeout_sec);
         }
 
-        // Process query via A2A adapter
+        // Process query via A2A adapter. P24 C0: register the in-flight call
+        // in the shared abort registry; the blocking sync call has no
+        // mid-call trigger today (honest C2 boundary), but the flag is
+        // installed on the HTTP client for any future cancellation entry
+        // point.
+        const std::string in_flight_url = a2a_adapter_->getConfig().orchestrator_url;
+        InFlightRegistration in_flight(in_flight_url, request_id);
         common::TraceContext::current()->startSpan("process_query", "server");
-        success = a2a_adapter_->processQuery(enriched_req, response);
+        success = a2a_adapter_->processQuery(enriched_req, response,
+                                             in_flight.flag());
         common::TraceContext::current()->endSpan();
 
         if (circuit_breaker_) {
@@ -1294,9 +1302,14 @@ grpc::Status AIQueryServiceImpl::QueryStream(
     }
 
     common::TraceContext::current()->startSpan("process_query_stream", "server");
+    // P24 C0: register the in-flight call; cancellation detected inside the
+    // relay below aborts the SSE transfer instead of only stopping event
+    // consumption.
+    const std::string in_flight_url = a2a_adapter_->getConfig().orchestrator_url;
+    InFlightRegistration in_flight(in_flight_url, request_id);
     a2a_adapter_->processQueryStreaming(enriched_req,
         [&context, writer, &cancelled, &write_failed, &lower_error,
-         &streamed_content](const agent_communication::AIStreamEvent& event) {
+         &streamed_content, request_id](const agent_communication::AIStreamEvent& event) {
 
             // Relay filter: lower-layer terminal events are dropped; the
             // service emits the single terminal event after the run ends.
@@ -1313,6 +1326,8 @@ grpc::Status AIQueryServiceImpl::QueryStream(
 
             if (context->IsCancelled()) {
                 cancelled = true;
+                // P24 C0: client disconnected — abort the SSE transfer.
+                InFlightAbortRegistry::instance().cancelInFlightByRequest(request_id);
                 return;
             }
 
@@ -1322,6 +1337,8 @@ grpc::Status AIQueryServiceImpl::QueryStream(
 
             if (!writer->Write(event)) {
                 write_failed = true;
+                // P24 C0: the response stream is gone — abort the transfer.
+                InFlightAbortRegistry::instance().cancelInFlightByRequest(request_id);
             }
         });
     common::TraceContext::current()->endSpan();
