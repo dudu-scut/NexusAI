@@ -192,7 +192,7 @@ cp .env.example .env         # 填入 LLM_API_KEY 等实际值
 
 ```bash
 ./run.sh build               # CMake + make 编译
-./run.sh test                # 运行全部 37 套测试
+./run.sh test                # 运行全部 36 套测试
 ```
 
 **4. 启动后端（Linux / WSL2 内）**
@@ -301,7 +301,7 @@ agent-communication-and-tool-selection-framework/
 │       └── types/proto.ts           #   与 proto/ 字段级对齐的类型定义
 │
 ├── gateway/proxy/                   # Node.js JSON-gRPC 网关代理 + 契约测试
-├── tests/                           # C++ 测试（37 套，GTest + RapidCheck）
+├── tests/                           # C++ 测试（36 套，GTest + RapidCheck）
 │   └── e2e/                         #   发布 E2E 脚本
 ├── examples/                        # Agent 接入示例（Python）
 ├── docs/                            # 项目文档
@@ -343,7 +343,7 @@ agent-communication-and-tool-selection-framework/
 
 ## 测试与验证
 
-### C++ 测试（Linux / WSL2 内，37 套）
+### C++ 测试（Linux / WSL2 内，36 套）
 
 GTest 集成测试与 RapidCheck 属性测试相结合，覆盖 durable 查询管线、查询域仓储契约、预算仓储契约、工作流控制契约、Agent 运行时仓储契约、路由属性、熔断器、任务状态机等。涉及 PostgreSQL 的用例连接真实数据库执行，缺失环境变量时按约定 SKIP 而非伪造通过。
 

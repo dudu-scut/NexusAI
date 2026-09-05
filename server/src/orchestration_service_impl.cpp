@@ -29,6 +29,7 @@
 
 #include <queue>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -191,7 +192,9 @@ grpc::Status OrchestrationServiceImpl::executePlan(
         log.owner_id = user_id;
         log.conversation_id = context_id;
         log.request_text = "ExecutePlan (user-approved DAG)";
-        log.route_decision = "execute-plan";
+        // The column is jsonb (COALESCE(NULLIF($5,'')::jsonb)) — a bare
+        // string would throw 22P02 and fail every durable ExecutePlan.
+        log.route_decision = nlohmann::json{{"mode", "execute-plan"}}.dump();
         log.execution_plan = plan_snapshot.dump();
         log.status = "running";
         if (!domain_repo_->createQueryLog(log)) {
@@ -362,6 +365,10 @@ grpc::Status OrchestrationServiceImpl::executePlan(
         auto params = a2a::MessageSendParams::create().with_message(msg);
         auto a2a_response = client.send_message(params);
         if (a2a_response.is_task()) {
+            // P24 C1②: remember the task id so a later timeout/disconnect
+            // can send a best-effort protocol-level tasks/cancel.
+            InFlightAbortRegistry::instance().setInFlightTaskId(
+                agent_url, in_flight.flag(), a2a_response.as_task().id());
             for (const auto& artifact : a2a_response.as_task().artifacts()) {
                 if (artifact.content().has_value()) {
                     return artifact.content().value();
@@ -376,10 +383,30 @@ grpc::Status OrchestrationServiceImpl::executePlan(
     try {
         // Client-disconnect propagation + executed-only health accounting.
         auto cancelled_probe = [context]() { return context->IsCancelled(); };
-        // P24 C0: timed-out / disconnected subtasks abort their in-flight
-        // A2A call (scoped to this request, same as the handler DAG path).
+        // P24 C0/C1: timed-out / disconnected subtasks abort their
+        // in-flight A2A call (scoped to this request, same as the handler
+        // DAG path) and send a best-effort protocol-level tasks/cancel.
         auto on_cancel = [request_id](const std::string& agent_url) {
-            InFlightAbortRegistry::instance().cancelInFlight(agent_url, request_id);
+            auto& registry = InFlightAbortRegistry::instance();
+            registry.cancelInFlight(agent_url, request_id);
+            const std::string task_id =
+                registry.inFlightTaskId(agent_url, request_id);
+            if (!task_id.empty()) {
+                try {
+                    std::thread([agent_url, task_id]() {
+                        try {
+                            a2a::A2AClient client(agent_url);
+                            client.set_timeout(3);
+                            client.cancel_task(task_id);
+                        } catch (...) {
+                            // Best effort — remote agents may not implement cancel.
+                        }
+                    }).detach();
+                } catch (const std::exception&) {
+                    // Thread creation failed — the local abort above already
+                    // bounded the transfer; the protocol-level cancel is lost.
+                }
+            }
         };
         auto results = task_executor_->execute(plan, call_agent, nullptr, on_cancel,
                                                cancelled_probe);
@@ -449,6 +476,22 @@ grpc::Status OrchestrationServiceImpl::executePlan(
             trace_row.trace_payload = payload.dump();
             trace_row.status = "completed";
             domain_repo_->updateTrace(trace_row);
+
+            // Token ledger for the debited reservation (same estimate the
+            // reserve used): without it the daily cost report never saw
+            // ExecutePlan traffic while budget counters had been charged.
+            common::TokenUsageLedgerRecord usage;
+            usage.id = "usage-" + request_id;
+            usage.owner_id = user_id;
+            usage.query_log_id = request_id;
+            usage.model = "execute-plan";
+            usage.prompt_tokens =
+                static_cast<std::int64_t>(64 + dag.nodes_size() * 128);
+            usage.completion_tokens =
+                static_cast<std::int64_t>(aggregated.final_answer.size()) / 4;
+            usage.estimated = true;
+            usage.cost_usd = "0";
+            domain_repo_->appendTokenUsageLedger(usage);
         }
 
         auto* status = response->mutable_status();
@@ -461,13 +504,14 @@ grpc::Status OrchestrationServiceImpl::executePlan(
 
     } catch (const std::exception& e) {
         LOG_ERROR("ExecutePlan failed: " + trace_id + " - " + e.what());
+        const std::string safe_error = QueryHelpers::sanitizeErrorMessage(e.what());
         // P15 P2(g): failure terminal state (durable mode).
         if (durable) {
             common::QueryLogRecord log;
             log.id = request_id;
             log.owner_id = user_id;
             log.conversation_id = context_id;
-            log.response_text = e.what();
+            log.response_text = safe_error;
             log.status = "failed";
             domain_repo_->updateQueryLog(log);
 
@@ -480,9 +524,9 @@ grpc::Status OrchestrationServiceImpl::executePlan(
         }
         auto* status = response->mutable_status();
         status->set_code(-1);
-        status->set_message(std::string("DAG execution failed: ") + e.what());
+        status->set_message("DAG execution failed: " + safe_error);
         return grpc::Status(grpc::StatusCode::INTERNAL,
-                           std::string("DAG execution failed: ") + e.what());
+                            "DAG execution failed: " + safe_error);
     }
     } catch (const std::exception& e) {
         // Crash guard: PG/Redis infrastructure faults (durable init or

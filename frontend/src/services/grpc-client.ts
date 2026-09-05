@@ -173,8 +173,15 @@ export function queryStream(
   const controller = new AbortController()
   let timedOut = false
   const timeoutId = setTimeout(() => { timedOut = true; controller.abort() }, 130_000)
+  // External-signal listener must be removable: the fetch/read loop outlives
+  // the abort decision, and a leaked closure pins the controller/reader for
+  // every Start/Stop cycle of a long-lived session.
+  const onExternalAbort = () => controller.abort()
   if (signal) {
-    signal.addEventListener('abort', () => controller.abort())
+    signal.addEventListener('abort', onExternalAbort, { once: true })
+  }
+  const detachExternalAbort = () => {
+    if (signal) signal.removeEventListener('abort', onExternalAbort)
   }
 
   return fetch(url, {
@@ -251,9 +258,11 @@ export function queryStream(
         }
       }
       clearTimeout(timeoutId)
+      detachExternalAbort()
     })
     .catch((err) => {
       clearTimeout(timeoutId)
+      detachExternalAbort()
       // Emit error for timeout abort or non-abort errors; skip only user-initiated abort
       if (err.name === 'AbortError' && !timedOut) return
       onEvent({

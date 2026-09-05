@@ -2,6 +2,7 @@
 
 #include <string>
 #include <cstdlib>
+#include <atomic>
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
 #include <sstream>
@@ -50,6 +51,28 @@ public:
     }
 
     /**
+     * @brief Call the LLM API with timeout and a P24 C2 abort flag.
+     *
+     * The base-class default delegates to the 3-arg form so test fakes that
+     * only override the older variants keep working (abort is then simply
+     * not observed by the fake). LLMClient overrides this to install an
+     * XFERINFO hook so a cancelled request interrupts the transfer.
+     */
+    virtual std::string chat(const std::string& system_prompt,
+                    const std::string& user_message,
+                    int timeout_seconds,
+                    const std::atomic<bool>* abort_flag) {
+        // Test fakes usually override the 3-arg form only — keep virtual
+        // dispatch when no abort observation is requested so scripted
+        // planner tests keep working unchanged.
+        if (abort_flag != nullptr) {
+            return chatWithTimeout(system_prompt, user_message,
+                                   timeout_seconds, abort_flag);
+        }
+        return chat(system_prompt, user_message, timeout_seconds);
+    }
+
+    /**
      * @brief Call the LLM API with a per-call timeout (A3 / P20⑧).
      *
      * Deadline-derived budget: callers pass min(default, remaining budget)
@@ -72,7 +95,8 @@ protected:
      */
     std::string chatWithTimeout(const std::string& system_prompt,
                                 const std::string& user_message,
-                                int timeout_seconds) {
+                                int timeout_seconds,
+                                const std::atomic<bool>* abort_flag = nullptr) {
         // Build the OpenAI-compatible request JSON
         json messages = json::array();
 
@@ -96,7 +120,8 @@ protected:
         std::string request_str = request_body.dump();
 
         // Send the HTTP request
-        std::string response = send_post_request(request_str, timeout_seconds);
+        std::string response = send_post_request(request_str, timeout_seconds,
+                                                 abort_flag);
 
         // Parse the response
         try {
@@ -141,7 +166,17 @@ private:
         return size * nmemb;
     }
 
-    std::string send_post_request(const std::string& data, int timeout_seconds) {
+    // P24 C2: XFERINFO progress hook — a non-zero return aborts the
+    // transfer (same mechanism as a2a/src/core/http_client.cpp).
+    static int abort_progress_callback(void* clientp,
+                                       curl_off_t, curl_off_t,
+                                       curl_off_t, curl_off_t) {
+        const auto* flag = static_cast<const std::atomic<bool>*>(clientp);
+        return (flag && flag->load(std::memory_order_relaxed)) ? 1 : 0;
+    }
+
+    std::string send_post_request(const std::string& data, int timeout_seconds,
+                                  const std::atomic<bool>* abort_flag = nullptr) {
         CURL* curl = curl_easy_init();
         if (!curl) {
             throw std::runtime_error("Failed to initialize CURL");
@@ -167,6 +202,14 @@ private:
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_data);
         curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
         curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_l);
+        if (abort_flag) {
+            // P24 C2: the progress meter must be on for the XFERINFO hook
+            // to fire (see http_client.cpp for the NOPROGRESS=1 pitfall).
+            curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+            curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION,
+                             abort_progress_callback);
+            curl_easy_setopt(curl, CURLOPT_XFERINFODATA, abort_flag);
+        }
 
         // Perform the request
         CURLcode res = curl_easy_perform(curl);

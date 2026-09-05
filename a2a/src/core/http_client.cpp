@@ -394,10 +394,17 @@ void HttpClient::post_stream(const std::string& url,
     if (resolve_list.get()) {
         curl_easy_setopt(curl.get(), CURLOPT_RESOLVE, resolve_list.get());
     }
-    // P20: in-flight abort channel (DAG subtask cancellation).
+    // P20: in-flight abort channel (DAG subtask cancellation). Without a
+    // flag, install a silent no-op hook: NOPROGRESS=0 is required for the
+    // LOW_SPEED liveness check, but with no XFERINFOFUNCTION libcurl would
+    // fall back to printing its default progress meter to stderr on every
+    // streaming call.
     if (impl_->abort_flag_) {
         curl_easy_setopt(curl.get(), CURLOPT_XFERINFOFUNCTION, abort_check_callback);
         curl_easy_setopt(curl.get(), CURLOPT_XFERINFODATA, impl_->abort_flag_);
+    } else {
+        curl_easy_setopt(curl.get(), CURLOPT_XFERINFOFUNCTION,
+                         [](void*, curl_off_t, curl_off_t, curl_off_t, curl_off_t) { return 0; });
     }
 
     // Set headers

@@ -34,6 +34,9 @@ export const useChatStore = defineStore('chat', () => {
 
   function sendQuestion(text: string, planOnly = false) {
     if (isStreaming.value || !text.trim()) return
+    // B1: a delivered plan awaits confirmation — block new questions so
+    // "confirm" cannot accidentally execute the wrong (newer) message's plan.
+    if (messages.value.some((m) => m.awaitingConfirmation)) return
 
     messages.value.push({
       id: crypto.randomUUID(),
@@ -129,11 +132,18 @@ export const useChatStore = defineStore('chat', () => {
           // The stream ends right after this marker with no terminal event,
           // so close the streaming state HERE — otherwise the finally block
           // misreads the EOF as a connection loss (P2-6).
-          msg.awaitingConfirmation = true
+          if (msg.executionPlan) {
+            msg.awaitingConfirmation = true
+            addActivity('thinking', 'Plan ready — awaiting confirmation')
+          } else {
+            // Malformed plan JSON above: surface it instead of silently
+            // entering a confirmation flow with nothing to confirm.
+            msg.error = 'Plan delivery failed (malformed plan payload)'
+            addActivity('error', msg.error)
+          }
           msg.streaming = false
           isStreaming.value = false
           abortController.value = null
-          addActivity('thinking', 'Plan ready — awaiting confirmation')
         } else if (event.content && event.content !== 'thinking') {
           // Status contents are intents/descriptions, not agent names —
           // agent attribution arrives via the plan / subtask events.
@@ -158,7 +168,11 @@ export const useChatStore = defineStore('chat', () => {
           }
           addActivity('thinking', `Execution plan: ${plan.tasks?.length || 0} subtask(s)`)
         } catch {
-          // malformed plan JSON, ignore
+          // Malformed plan JSON: surface it — the awaiting_confirmation
+          // marker checks executionPlan, so the confirm bar never appears
+          // for an undeliverable plan.
+          msg.error = 'Plan delivery failed (malformed plan payload)'
+          addActivity('error', msg.error)
         }
         break
 
@@ -194,10 +208,11 @@ export const useChatStore = defineStore('chat', () => {
 
       case 'complete':
         msg.streaming = false
-        msg.awaitingConfirmation = false
-        msg.processingTimeMs = event.timestamp
-          ? Date.now() - msg.timestamp
-          : undefined
+        // awaitingConfirmation is intentionally NOT cleared here: the
+        // plan-only confirm/abandon flow owns that flag (the proxy no
+        // longer synthesizes a complete frame for awaiting_confirmation
+        // streams — gateway contract).
+        msg.processingTimeMs = Date.now() - msg.timestamp
         isStreaming.value = false
         abortController.value = null
         addActivity('complete', 'Query completed', {

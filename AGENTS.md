@@ -14,7 +14,7 @@ This file provides guidance to AI coding agents (ZCode / Lingma / Claude Code) w
 ```bash
 # 构建 / 测试 / 运行（WSL2 内）
 ./run.sh build                # cmake + make（输出到 build/）
-./run.sh test                 # 全部 37 套测试（ctest --output-on-failure --timeout 30）
+./run.sh test                 # 全部 36 套测试（ctest --output-on-failure --timeout 30）
 ./run.sh test -R <name>       # 运行单个测试（附加参数透传给 ctest）
 cd build && ctest -N          # 列出全部测试名
 cd build && ctest --output-on-failure -R test_agent_router_properties   # 单测示例
@@ -120,7 +120,7 @@ db/             → PostgreSQL 迁移 V001–V015（PostgreSQL 是唯一持久�
 
 键分三类（memory_service.h 有权威标注，新增键必须归类）：
 
-- **事实源**（PG 无表、暂居 Redis，待 V014 迁移）：`nexusai:memory:<uid>`（Tier-2 hints）、`nexusai:summary:*`（Tier-3 摘要）、`user_profile:<uid>`（画像）。
+- **事实源→投影（V015 已收口）**：`nexusai:memory:<uid>`（Tier-2 hints）、`nexusai:summary:*`（Tier-3 摘要）、`user_profile:<uid>`（画像）已由 V015/V004 迁入 PG（批次八 B5/C1），这些 Redis 键降级为 cache-only 投影——写入路径为"PG 成功 → DEL Redis 键"，读取为"PG miss → Redis → 回填 insert-if-absent"。
 - **cache-only**（PG 为事实源的投影，丢失可重建）：`nexusai:conv:*`、`auth:session:<token_hash>`（拦截器层会话缓存）。
 - **transient**（可丢、无业务后果）：限流计数、分布式短锁、预算实时计数面、`nexusai:last_agent:*`、`profile:queued:<uid>`/`profile:pending`（画像提取调度）、`trace:spans:<id>`（span 批量冗余，PG 兜底读取）。
 

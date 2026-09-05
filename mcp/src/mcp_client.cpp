@@ -688,8 +688,8 @@ bool MCPClient::connectSSE() {
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, this);
     curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, sseHeaderCallback);
     curl_easy_setopt(curl, CURLOPT_HEADERDATA, this);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, config_.connect_timeout_ms / 1000);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, config_.connect_timeout_ms / 1000);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, (config_.connect_timeout_ms + 999) / 1000);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, (config_.connect_timeout_ms + 999) / 1000);
     
     // Set API key if provided
     struct curl_slist* headers = nullptr;
@@ -799,7 +799,7 @@ bool MCPClient::sendRequestSSE(const MCPRequest& request) {
     curl_easy_setopt(curl, CURLOPT_POST, 1L);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_request.c_str());
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, json_request.length());
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, config_.request_timeout_ms / 1000);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, (config_.request_timeout_ms + 999) / 1000);
     
     // Set the response callback
     std::string response_data;

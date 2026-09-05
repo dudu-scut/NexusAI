@@ -45,7 +45,7 @@ sudo apt-get install -y \
 ```bash
 LLM_API_KEY=your-api-key-here
 LLM_MODEL=deepseek-v4-flash
-LLM_API_URL=https://api.deepseek.com
+LLM_API_URL=https://api.deepseek.com/v1/chat/completions
 ```
 
 | 变量 | 必填 | 说明 |

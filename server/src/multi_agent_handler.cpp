@@ -30,6 +30,7 @@
 #include <chrono>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 
 #include "ai_query.grpc.pb.h"
@@ -407,6 +408,10 @@ grpc::Status MultiAgentHandler::handleQuery(
     agent_communication::AIQueryResponse* response,
     const std::string& request_id) {
 
+    // P24 C2: request-level cancellation token — the planner and the
+    // aggregator read it so a cancelled request's LLM work self-aborts.
+    auto cancel_token = InFlightAbortRegistry::instance().tokenFor(request_id);
+
     // Propagate gRPC deadline to A2A call timeouts
     auto gpr_deadline = context->deadline();
     int effective_timeout_seconds = rpc_config_->timeout_seconds;
@@ -438,7 +443,7 @@ grpc::Status MultiAgentHandler::handleQuery(
             try {
                 plan = task_planner_->plan(
                     question, prunedSkillsForPlanning(agent_router_, question, agent_router_->getAllSkillDescriptions()),
-                    llm_timeout_seconds);
+                    llm_timeout_seconds, cancel_token.get());
             } catch (const std::exception& e) {
                 LOG_ERROR("Planning failed for sync query: " + request_id + " - " + e.what());
                 plan.is_single_agent = true;
@@ -527,7 +532,8 @@ grpc::Status MultiAgentHandler::handleQuery(
         plan = orchestrator::ExecutionPlan{};
         try {
             plan = task_planner_->plan(question, prunedSkillsForPlanning(agent_router_, question, agent_router_->getAllSkillDescriptions()),
-                                       planningTimeoutFor(context, rpc_config_->timeout_seconds));
+                                       planningTimeoutFor(context, rpc_config_->timeout_seconds),
+                                       cancel_token.get());
         } catch (const std::exception& e) {
             LOG_ERROR("Planning failed on fast-path retry: " + request_id + " - " + e.what());
             plan.is_single_agent = true;
@@ -567,7 +573,30 @@ grpc::Status MultiAgentHandler::handleQuery(
     // P20: a timed-out subtask aborts its in-flight A2A call (scoped to this
     // request — concurrent requests sharing the agent URL are not touched).
     auto on_cancel = [request_id](const std::string& agent_url) {
-        InFlightAbortRegistry::instance().cancelInFlight(agent_url, request_id);
+        auto& registry = InFlightAbortRegistry::instance();
+        // P20/P24: local abort of the in-flight transfer first.
+        registry.cancelInFlight(agent_url, request_id);
+        // P24 C1②: best-effort protocol-level tasks/cancel so the remote
+        // agent can stop work it already started. Detached: the collector
+        // thread must not block on the round trip; the fire-and-forget
+        // thread is bounded by the 3s HTTP timeout.
+        const std::string task_id = registry.inFlightTaskId(agent_url, request_id);
+        if (!task_id.empty()) {
+            try {
+                std::thread([agent_url, task_id]() {
+                    try {
+                        a2a::A2AClient client(agent_url);
+                        client.set_timeout(3);
+                        client.cancel_task(task_id);
+                    } catch (...) {
+                        // Best effort — remote agents may not implement cancel.
+                    }
+                }).detach();
+            } catch (const std::exception&) {
+                // Thread creation failed — the local abort above already
+                // bounded the transfer; the protocol-level cancel is lost.
+            }
+        }
     };
     // Client-disconnect propagation: the executor checks this at every layer
     // boundary and stops launching new work when the RPC is cancelled.
@@ -576,7 +605,8 @@ grpc::Status MultiAgentHandler::handleQuery(
     try {
         auto results = task_executor_->execute(plan, call_agent, nullptr, on_cancel,
                                                cancelled_probe);
-        auto aggregated = result_aggregator_->aggregate(plan, results);
+        auto aggregated = result_aggregator_->aggregate(plan, results,
+                                    cancel_token.get());
 
         // One invocation fact per executed subtask (owner from auth context).
         for (const auto& entry : results) {
@@ -653,6 +683,9 @@ grpc::Status MultiAgentHandler::handleQueryStream(
     grpc::ServerWriter<agent_communication::AIStreamEvent>* writer,
     const std::string& request_id) {
 
+    // P24 C2: request-level cancellation token (see handleQuery).
+    auto cancel_token = InFlightAbortRegistry::instance().tokenFor(request_id);
+
     tls_stream_result = StreamResultSlot{};
     auto start_time = std::chrono::steady_clock::now();
     std::string question = request->question();
@@ -683,7 +716,7 @@ grpc::Status MultiAgentHandler::handleQueryStream(
         } else {
             try {
                 plan = task_planner_->plan(question, prunedSkillsForPlanning(agent_router_, question, agent_router_->getAllSkillDescriptions()),
-                                           llm_timeout_seconds);
+                                           llm_timeout_seconds, cancel_token.get());
             } catch (const std::exception& e) {
                 LOG_ERROR("Planning failed for query: " + request_id + " - " + e.what());
                 plan.is_single_agent = true;
@@ -766,7 +799,8 @@ grpc::Status MultiAgentHandler::handleQueryStream(
         plan = orchestrator::ExecutionPlan{};
         try {
             plan = task_planner_->plan(question, prunedSkillsForPlanning(agent_router_, question, agent_router_->getAllSkillDescriptions()),
-                                       planningTimeoutFor(context, rpc_config_->timeout_seconds));
+                                       planningTimeoutFor(context, rpc_config_->timeout_seconds),
+                                       cancel_token.get());
         } catch (const std::exception& e) {
             LOG_ERROR("Planning failed on fast-path retry: " + request_id + " - " + e.what());
             plan.is_single_agent = true;
@@ -842,7 +876,30 @@ grpc::Status MultiAgentHandler::handleQueryStream(
     // P20: a timed-out subtask aborts its in-flight A2A call (scoped to this
     // request — concurrent requests sharing the agent URL are not touched).
     auto on_cancel = [request_id](const std::string& agent_url) {
-        InFlightAbortRegistry::instance().cancelInFlight(agent_url, request_id);
+        auto& registry = InFlightAbortRegistry::instance();
+        // P20/P24: local abort of the in-flight transfer first.
+        registry.cancelInFlight(agent_url, request_id);
+        // P24 C1②: best-effort protocol-level tasks/cancel so the remote
+        // agent can stop work it already started. Detached: the collector
+        // thread must not block on the round trip; the fire-and-forget
+        // thread is bounded by the 3s HTTP timeout.
+        const std::string task_id = registry.inFlightTaskId(agent_url, request_id);
+        if (!task_id.empty()) {
+            try {
+                std::thread([agent_url, task_id]() {
+                    try {
+                        a2a::A2AClient client(agent_url);
+                        client.set_timeout(3);
+                        client.cancel_task(task_id);
+                    } catch (...) {
+                        // Best effort — remote agents may not implement cancel.
+                    }
+                }).detach();
+            } catch (const std::exception&) {
+                // Thread creation failed — the local abort above already
+                // bounded the transfer; the protocol-level cancel is lost.
+            }
+        }
     };
     // Client-disconnect propagation into the DAG (R3): the executor stops
     // launching new layers once the RPC context is cancelled.
@@ -871,7 +928,8 @@ grpc::Status MultiAgentHandler::handleQueryStream(
 
         auto results = task_executor_->execute(plan, call_agent, progress_cb,
                                                on_cancel, cancelled_probe);
-        auto aggregated = result_aggregator_->aggregate(plan, results);
+        auto aggregated = result_aggregator_->aggregate(plan, results,
+                                    cancel_token.get());
 
         // P13(d)/A2: surface non-fatal warnings (dropped subtasks) as status
         // events — the final_answer itself also carries the notice.
@@ -885,9 +943,12 @@ grpc::Status MultiAgentHandler::handleQueryStream(
 
         // Client disconnected mid-DAG: surface CANCELLED instead of a
         // completed (and billed) run — same contract as the sync path.
+        // P24 C2: mark the request-level token (write_cb already wrote it
+        // when events flowed; this covers the no-event window).
         if (context->IsCancelled()) {
             auto duration_cancel = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - start_time);
+            InFlightAbortRegistry::instance().cancelInFlightByRequest(request_id);
             update_status_(request_id, "cancelled", "", "", "");
             record_metrics_("QueryStream", duration_cancel.count(), false);
             tls_stream_result.answer = "";
@@ -1062,6 +1123,16 @@ MultiAgentHandler::SingleStreamOutcome MultiAgentHandler::executeSingleAgentStre
         auto end_time = std::chrono::steady_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
             end_time - start_time);
+        // P24 C1①: a transport exception raised by our own disconnect
+        // abort is a cancellation, not an agent failure — reporting it as
+        // "failed" would pollute health metrics and mislead the client.
+        if (cancelled || context->IsCancelled()) {
+            update_status_(request_id, "cancelled", "", "", "");
+            recordInvocationFact(request_id, plan.single_agent_id,
+                                 plan.single_agent_skill, "cancelled",
+                                 duration.count());
+            return SingleStreamOutcome::Cancelled;
+        }
         // Probe failures may be retried by the caller — do not publish a
         // "failed" task status that the retry would flip back to "completed".
         if (!fast_path_probe) {
@@ -1209,17 +1280,22 @@ MultiAgentHandler::buildCallAgent(const agent_communication::AIQueryRequest* req
             .with_role(a2a::MessageRole::User)
             .with_text(enriched_prompt);
 
-        auto params = a2a::MessageSendParams::create().with_message(msg);
-        auto a2a_response = client.send_message(params);
-        if (a2a_response.is_task()) {
-            for (const auto& artifact : a2a_response.as_task().artifacts()) {
-                if (artifact.content().has_value()) {
-                    return artifact.content().value();
+            auto params = a2a::MessageSendParams::create().with_message(msg);
+            auto a2a_response = client.send_message(params);
+            if (a2a_response.is_task()) {
+                // P24 C1②: remember the task id on the live in-flight entry
+                // so a later timeout/disconnect can send a best-effort
+                // protocol-level tasks/cancel (entry cleanup is RAII).
+                InFlightAbortRegistry::instance().setInFlightTaskId(
+                    agent_url, in_flight.flag(), a2a_response.as_task().id());
+                for (const auto& artifact : a2a_response.as_task().artifacts()) {
+                    if (artifact.content().has_value()) {
+                        return artifact.content().value();
+                    }
                 }
+            } else if (a2a_response.is_message()) {
+                return a2a_response.as_message().get_text();
             }
-        } else if (a2a_response.is_message()) {
-            return a2a_response.as_message().get_text();
-        }
         return "";
     };
 }

@@ -159,6 +159,13 @@ void ProfileSummarizer::processPending(QueryDomainRepository* domain_repo) {
             break;  // queue drained
         }
         try {
+            // The dedup guard must be released on EVERY exit of this
+            // iteration, including the early `continue`s below — a stranded
+            // guard starves the affected user's profile extraction forever
+            // (hsetnx in maybeScheduleProfileExtraction would never pass).
+            auto release_queue_guard = [&]() {
+                redis.hdel("profile:queued", user_id);
+            };
             // 4a. Gather conversation data from Redis hash
             //     Key pattern: "nexusai:memory:<user_id>" (user long-term memory)
             std::map<std::string, std::string> user_memory;
@@ -224,6 +231,7 @@ void ProfileSummarizer::processPending(QueryDomainRepository* domain_repo) {
 
             if (conversation_history.empty()) {
                 // No data to extract — skip this user (guard released below)
+                release_queue_guard();
                 continue;
             }
 
@@ -291,6 +299,7 @@ void ProfileSummarizer::processPending(QueryDomainRepository* domain_repo) {
             if (res != CURLE_OK) {
                 LOG_ERROR("ProfileSummarizer: LLM API call failed for user " +
                           user_id + ": " + curl_easy_strerror(res));
+                release_queue_guard();
                 continue;  // skip this user, try next
             }
 
@@ -308,12 +317,14 @@ void ProfileSummarizer::processPending(QueryDomainRepository* domain_repo) {
             } catch (const json::exception& e) {
                 LOG_ERROR("ProfileSummarizer: Failed to parse LLM response for " +
                           user_id + ": " + e.what());
+                release_queue_guard();
                 continue;
             }
 
             if (profile_text.empty()) {
                 LOG_WARN("ProfileSummarizer: Empty profile from LLM for user " +
                          user_id);
+                release_queue_guard();
                 continue;
             }
 

@@ -161,20 +161,23 @@ std::string MemoryService::getUserMemory(const std::string& user_id) const {
     // Cache-aside rebuild: a Redis-only hint set (pre-V015 data) is
     // backfilled into PG so the durable source converges.
     if (domain_repo_) {
-        try {
-            for (const auto& [key, value] : all) {
-                UserMemoryHintRecord hint;
-                hint.owner_id = user_id;
-                hint.key = key;
-                hint.value = value;
-                hint.source = "redis-backfill";
-                // P2-1: insert-if-absent — a stale projection read must
-                // never overwrite a newer durable value written between our
-                // PG miss and this backfill.
+        for (const auto& [key, value] : all) {
+            UserMemoryHintRecord hint;
+            hint.owner_id = user_id;
+            hint.key = key;
+            hint.value = value;
+            hint.source = "redis-backfill";
+            // P2-1: insert-if-absent — a stale projection read must never
+            // overwrite a newer durable value written between our PG miss
+            // and this backfill.
+            try {
                 domain_repo_->insertUserMemoryHintIfAbsent(hint);
+            } catch (const std::exception&) {
+                // P24 review: two concurrent backfills can both pass the
+                // NOT EXISTS check and the loser hits unique_violation.
+                // Absorb per key — losing the race means the durable value
+                // is newer, and the remaining keys must still backfill.
             }
-        } catch (const std::exception&) {
-            // Best-effort; the read already succeeded.
         }
     }
     return text;
@@ -332,6 +335,17 @@ void MemoryService::setCrossAgentSummaryFor(const std::string& context_id,
     // SETEX: the agent-specialized summary is a cache entry with a bounded
     // lifetime (default 7 days), keyed per taking-over agent.
     redis_->setex(summaryKeyFor(context_id, agent_id), ttl_seconds, summary);
+    // P24 review: the per-agent row also lands in PG (V015
+    // cross_agent_summaries) — without the write-through a restart lost the
+    // specialization and listCrossAgentSummaries' per-agent filter was dead
+    // code. Redis stays the read path; PG is the durable copy.
+    if (domain_repo_) {
+        try {
+            domain_repo_->upsertCrossAgentSummary(context_id, agent_id, summary);
+        } catch (const std::exception&) {
+            // Best-effort projection; the Redis entry already served the read.
+        }
+    }
 }
 
 std::string MemoryService::getCrossAgentSummaryFor(

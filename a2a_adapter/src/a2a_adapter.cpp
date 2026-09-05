@@ -158,6 +158,16 @@ bool A2AAdapter::processQuery(
             // retries are pending must stop the loop instead of hammering a
             // backend that just tripped. Per-attempt accounting also keeps
             // the breaker statistics from being diluted by retries.
+            // P24: a client disconnect aborted the previous attempt — stop
+            // retrying and do not pollute the breaker with cancel noise (a
+            // burst of disconnects must not open the breaker on a healthy
+            // backend).
+            if (abort_flag && abort_flag->load(std::memory_order_relaxed)) {
+                auto* status = response->mutable_status();
+                status->set_code(static_cast<int>(grpc::StatusCode::CANCELLED));
+                status->set_message("Request cancelled");
+                return false;
+            }
             if (!cb->isRequestAllowed()) {
                 auto* status = response->mutable_status();
                 status->set_code(static_cast<int>(grpc::StatusCode::UNAVAILABLE));
@@ -173,6 +183,14 @@ bool A2AAdapter::processQuery(
                 // record here + a record in the outer catch would double-
                 // count one failure and trip the breaker early).
                 const std::string what = e.what();
+                // P24: the abort flag raised mid-transfer — cancellation,
+                // not a transient transport failure.
+                if (abort_flag && abort_flag->load(std::memory_order_relaxed)) {
+                    auto* status = response->mutable_status();
+                    status->set_code(static_cast<int>(grpc::StatusCode::CANCELLED));
+                    status->set_message("Request cancelled");
+                    return false;
+                }
                 const bool transport = what.rfind("CURL error:", 0) == 0 ||
                                        what.rfind("HTTP request failed:", 0) == 0;
                 if (!transport) {
@@ -512,13 +530,20 @@ void A2AAdapter::processQueryStreaming(
         callback(complete_event);
 
     } catch (const std::exception& e) {
-        // Record streaming failure to circuit breaker
-        streaming_cb->recordFailure();
+        // P24: a disconnect-driven abort is cancellation — do not record a
+        // failure that would open the breaker on a healthy backend.
+        const bool aborted =
+            abort_flag && abort_flag->load(std::memory_order_relaxed);
+
+        if (!aborted) {
+            streaming_cb->recordFailure();
+        }
 
         // Send error event
         agent_communication::AIStreamEvent error_event;
         response_adapter_->buildStreamEvent(
-            e.what(), request.context_id(), "error", &error_event);
+            aborted ? "Request cancelled" : e.what(),
+            request.context_id(), "error", &error_event);
         callback(error_event);
     }
 }
@@ -687,6 +712,14 @@ bool A2AAdapter::processQueryDirect(
         return true;
 
     } catch (const a2a::A2AException& e) {
+        // P24: our own disconnect abort is cancellation, not an agent
+        // failure — skip the breaker and surface CANCELLED.
+        if (abort_flag && abort_flag->load(std::memory_order_relaxed)) {
+            auto* status = response->mutable_status();
+            status->set_code(static_cast<int>(grpc::StatusCode::CANCELLED));
+            status->set_message("Request cancelled");
+            return false;
+        }
         // Record failure to circuit breaker
         direct_cb->recordFailure();
         auto* status = response->mutable_status();
@@ -701,6 +734,13 @@ bool A2AAdapter::processQueryDirect(
         status->set_message(error_msg);
         return false;
     } catch (const std::exception& e) {
+        // P24: same cancellation carve-out for transport-level aborts.
+        if (abort_flag && abort_flag->load(std::memory_order_relaxed)) {
+            auto* status = response->mutable_status();
+            status->set_code(static_cast<int>(grpc::StatusCode::CANCELLED));
+            status->set_message("Request cancelled");
+            return false;
+        }
         // Record failure to circuit breaker
         direct_cb->recordFailure();
         auto* status = response->mutable_status();
@@ -947,12 +987,18 @@ void A2AAdapter::processQueryStreamingDirect(
         callback(complete_event);
 
     } catch (const std::exception& e) {
-        // Record streaming direct failure to circuit breaker
-        streaming_direct_cb->recordFailure();
+        // P24: same cancellation carve-out for the direct streaming path.
+        const bool aborted =
+            abort_flag && abort_flag->load(std::memory_order_relaxed);
+
+        if (!aborted) {
+            streaming_direct_cb->recordFailure();
+        }
 
         agent_communication::AIStreamEvent error_event;
         response_adapter_->buildStreamEvent(
-            e.what(), request.context_id(), "error", &error_event);
+            aborted ? "Request cancelled" : e.what(),
+            request.context_id(), "error", &error_event);
         callback(error_event);
     }
 }

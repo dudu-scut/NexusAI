@@ -20,7 +20,8 @@ ResultAggregator::ResultAggregator(const AggregatorConfig& config)
 
 AggregatedResult ResultAggregator::aggregate(
     const ExecutionPlan& plan,
-    const std::unordered_map<std::string, SubTaskResult>& results) {
+    const std::unordered_map<std::string, SubTaskResult>& results,
+    const std::atomic<bool>* abort_flag) {
 
     auto start = std::chrono::steady_clock::now();
 
@@ -55,7 +56,7 @@ AggregatedResult ResultAggregator::aggregate(
 
     // Route to strategy
     if (config_.default_strategy == "llm_synthesize" && llm_client_) {
-        auto [answer, used_fallback] = aggregateLLMSynthesize(plan, results);
+        auto [answer, used_fallback] = aggregateLLMSynthesize(plan, results, abort_flag);
         agg.final_answer = answer;
         // Label the strategy truthfully: the internal concat fallback must
         // not be reported as a successful llm_synthesize run.
@@ -130,7 +131,8 @@ std::string ResultAggregator::aggregateConcat(
 
 std::pair<std::string, bool> ResultAggregator::aggregateLLMSynthesize(
     const ExecutionPlan& plan,
-    const std::unordered_map<std::string, SubTaskResult>& results) {
+    const std::unordered_map<std::string, SubTaskResult>& results,
+    const std::atomic<bool>* abort_flag) {
 
     // Build context from all successful subtask results
     std::string context;
@@ -173,7 +175,9 @@ std::pair<std::string, bool> ResultAggregator::aggregateLLMSynthesize(
     }
 
     try {
-        std::string answer = llm_client_->chat(system_prompt, user_message);
+        std::string answer =
+            llm_client_->chat(system_prompt, user_message,
+                              LLMClient::kDefaultChatTimeoutSeconds, abort_flag);
         if (answer.empty()) {
             // LLM returned empty response — fall back to concat
             return {aggregateConcat(plan, results), true};

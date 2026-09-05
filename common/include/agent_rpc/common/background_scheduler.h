@@ -69,7 +69,14 @@ public:
     }
 
     void stop() {
-        running_.store(false);
+        // Publish the flag under queue_mutex_: a worker that has just
+        // evaluated the wait predicate (running_==true, queue empty) and is
+        // about to block would otherwise miss this notification and sleep
+        // forever, hanging the joins below (classic lost wakeup).
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            running_.store(false);
+        }
         queue_cv_.notify_all();
 
         if (coordinator_.joinable()) coordinator_.join();

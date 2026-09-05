@@ -4,6 +4,7 @@
 #include <json/json.h>
 #include <sstream>
 #include <thread>
+#include <vector>
 #include <chrono>
 #include <unordered_map>
 #include <cmath>
@@ -375,11 +376,20 @@ std::string ConsulServiceRegistry::getServiceId(const common::ServiceEndpoint& e
 
 void ConsulServiceRegistry::healthCheckLoop() {
     while (health_check_running_) {
+        // Snapshot the ids under the lock, then run the (blocking, up to
+        // 10s per call) heartbeats OUTSIDE it — holding services_mutex_
+        // across HTTP would stall register/discover for N×10s while Consul
+        // is unreachable.
+        std::vector<std::string> service_ids;
         {
             std::lock_guard<std::mutex> lock(services_mutex_);
+            service_ids.reserve(registered_services_.size());
             for (const auto& pair : registered_services_) {
-                updateHeartbeat(pair.first);
+                service_ids.push_back(pair.first);
             }
+        }
+        for (const auto& id : service_ids) {
+            updateHeartbeat(id);
         }
 
         std::this_thread::sleep_for(std::chrono::seconds(30));

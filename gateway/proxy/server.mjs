@@ -241,7 +241,17 @@ function streamCall(serviceName, methodName, body, metadata, res) {
 
   stream.on('data', (event) => {
     if (ended) return;
-    if (event && (event.event_type === 'complete' || event.event_type === 'error')) {
+    // B1/P24 contract: a plan-only run ends with status awaiting_confirmation
+    // and NO terminal event from the server. That marker is authoritative —
+    // treat it as terminal so the fallback complete frame below is never
+    // synthesized for it (the synthetic frame used to clobber the frontend's
+    // awaiting-confirmation state and break the confirm/abandon flow).
+    if (
+      event &&
+      (event.event_type === 'complete' ||
+        event.event_type === 'error' ||
+        (event.event_type === 'status' && event.content === 'awaiting_confirmation'))
+    ) {
       completeSeen = true;
     }
     const json = JSON.stringify(sanitizeBuffers(event));

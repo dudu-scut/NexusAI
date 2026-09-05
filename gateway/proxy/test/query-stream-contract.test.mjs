@@ -24,7 +24,15 @@ test('proxy streamCall tracks completeSeen and relays terminal events', () => {
   const streamCall = server.slice(start, server.indexOf('\n// HTTP Request Handler'));
 
   assert.match(streamCall, /let completeSeen = false;/);
-  assert.match(streamCall, /event_type === 'complete' \|\| event\.event_type === 'error'/);
+  assert.match(streamCall, /event_type === 'complete'/);
+  assert.match(streamCall, /event_type === 'error'/);
+  // B1/P24: a plan-only stream ends with status awaiting_confirmation and no
+  // terminal event — the proxy must treat that marker as terminal so the
+  // fallback complete frame never clobbers the frontend's confirm flow.
+  assert.match(
+    streamCall,
+    /event\.event_type === 'status' && event\.content === 'awaiting_confirmation'/,
+  );
   assert.match(streamCall, /completeSeen = true;/);
 });
 

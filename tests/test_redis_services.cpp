@@ -8,6 +8,7 @@
 
 #include "agent_rpc/common/redis_client.h"
 #include "agent_rpc/common/memory_service.h"
+#include "agent_rpc/server/in_flight_registry.h"
 #include "agent_rpc/server/query_helpers.h"
 
 #include "ai_query.pb.h"
@@ -464,5 +465,65 @@ TEST_F(MemoryFixture, AgentSwitchHonorsCrossAgentSummarySwitch) {
     redis.del("nexusai:last_agent:" + ctx);
 }
 #endif  // _WIN32
+
+// ── P24 C0/C1/C2: InFlightAbortRegistry (header-only, no Redis needed) ──
+
+TEST(InFlightAbortRegistryTest, CancelByRequestPreArmsFutureCalls) {
+    auto& registry = agent_rpc::server::InFlightAbortRegistry::instance();
+    EXPECT_FALSE(registry.isRequestCancelled("p24-tok-req"));
+    registry.cancelInFlightByRequest("p24-tok-req");
+    EXPECT_TRUE(registry.isRequestCancelled("p24-tok-req"));
+
+    // A fresh call of the cancelled request registers pre-armed...
+    auto flag = registry.registerInFlight("http://p24-tok-agent", "p24-tok-req");
+    ASSERT_NE(flag, nullptr);
+    EXPECT_TRUE(flag->load());
+    registry.unregisterInFlight("http://p24-tok-agent", flag);
+
+    // ...while a concurrent request's call does not.
+    auto other = registry.registerInFlight("http://p24-tok-agent", "p24-tok-other");
+    EXPECT_FALSE(other->load());
+    registry.unregisterInFlight("http://p24-tok-agent", other);
+}
+
+TEST(InFlightAbortRegistryTest, CancelByRequestFlipsLiveCallsAndIsolatesOthers) {
+    auto& registry = agent_rpc::server::InFlightAbortRegistry::instance();
+    auto f1 = registry.registerInFlight("http://p24-iso-a", "p24-iso-r1");
+    auto f2 = registry.registerInFlight("http://p24-iso-b", "p24-iso-r1");
+    auto f3 = registry.registerInFlight("http://p24-iso-a", "p24-iso-r2");
+
+    registry.cancelInFlightByRequest("p24-iso-r1");
+    EXPECT_TRUE(f1->load());
+    EXPECT_TRUE(f2->load());
+    // R18: another request sharing the same agent URL is untouched.
+    EXPECT_FALSE(f3->load());
+
+    registry.unregisterInFlight("http://p24-iso-a", f1);
+    registry.unregisterInFlight("http://p24-iso-b", f2);
+    registry.unregisterInFlight("http://p24-iso-a", f3);
+}
+
+TEST(InFlightAbortRegistryTest, UrlScopedCancelDoesNotMarkRequestToken) {
+    auto& registry = agent_rpc::server::InFlightAbortRegistry::instance();
+    auto flag = registry.registerInFlight("http://p24-url-agent", "p24-url-req");
+    // DAG subtask timeout aborts ONE call — the request-level token must
+    // stay untouched so sibling subtasks and the planning LLM keep running.
+    registry.cancelInFlight("http://p24-url-agent", "p24-url-req");
+    EXPECT_TRUE(flag->load());
+    EXPECT_FALSE(registry.isRequestCancelled("p24-url-req"));
+    registry.unregisterInFlight("http://p24-url-agent", flag);
+}
+
+TEST(InFlightAbortRegistryTest, TaskIdRoundTripAndRaiiCleanup) {
+    auto& registry = agent_rpc::server::InFlightAbortRegistry::instance();
+    auto flag = registry.registerInFlight("http://p24-task-agent", "p24-task-req");
+    EXPECT_EQ(registry.inFlightTaskId("http://p24-task-agent", "p24-task-req"), "");
+    registry.setInFlightTaskId("http://p24-task-agent", flag, "task-abc");
+    EXPECT_EQ(registry.inFlightTaskId("http://p24-task-agent", "p24-task-req"),
+              "task-abc");
+    // RAII unregister clears the entry — no task-id leakage.
+    registry.unregisterInFlight("http://p24-task-agent", flag);
+    EXPECT_EQ(registry.inFlightTaskId("http://p24-task-agent", "p24-task-req"), "");
+}
 
 }  // namespace agent_rpc::tests

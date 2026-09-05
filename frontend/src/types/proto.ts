@@ -83,7 +83,7 @@ export interface Artifact {
 
 export interface AIStreamEvent {
   event_id: string
-  event_type: 'partial' | 'status' | 'complete' | 'error' | 'plan' | 'subtask_start' | 'subtask_complete'
+  event_type: 'partial' | 'status' | 'complete' | 'error' | 'plan' | 'subtask_start' | 'subtask_complete' | 'snapshot'
   content: string
   task_state: string
   context_id: string

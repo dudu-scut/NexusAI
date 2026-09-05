@@ -121,7 +121,7 @@
            confirmation) + P1(f) phase-1 edit panel (agent dropdown +
            editable descriptions; dependency editing is phase 2) -->
       <div
-        v-if="lastExecutionPlan && !chatStore.isStreaming && !lastErrorMessage"
+        v-if="lastExecutionPlan && !chatStore.isStreaming && !lastErrorMessage && !awaitingPlan"
         class="retry-bar"
       >
         <span class="retry-reason">已完成计划：{{ lastExecutionPlan.tasks.length }} 个子任务</span>
@@ -427,7 +427,13 @@ const rerunningPlan = ref(false)
 
 async function rerunLastPlan() {
   const plan = lastExecutionPlan.value
-  if (!plan || rerunningPlan.value) return
+  if (rerunningPlan.value) return
+  if (!plan) {
+    // B1: a silent return here left the confirm bar with no feedback —
+    // always tell the user when there is nothing to execute.
+    toast?.addToast({ type: 'error', message: '没有可执行的计划' })
+    return
+  }
   rerunningPlan.value = true
   try {
     const dag: DAGStructure = {
@@ -441,6 +447,11 @@ async function rerunLastPlan() {
     const response = await executePlan(dag, chatStore.contextId)
     addActivity('complete', `Plan re-executed: trace ${response.trace_id}`)
     toast?.addToast({ type: 'success', message: '计划已重新执行' })
+    // The delivered plan has now been executed — drop any lingering
+    // awaiting-confirmation flags so the confirm bar cannot double-run it.
+    for (const m of chatStore.messages) {
+      if (m.awaitingConfirmation) m.awaitingConfirmation = false
+    }
   } catch (error) {
     addActivity('error', `Plan re-execution failed: ${(error as Error).message}`)
     toast?.addToast({ type: 'error', message: '计划重跑失败' })
@@ -473,6 +484,17 @@ const awaitingPlan = computed(() =>
 )
 
 async function confirmPlan() {
+  // B1: execute the plan of the message that is awaiting confirmation —
+  // NOT the dynamic last-message plan, which a newer blocked-delivered
+  // message could otherwise hijack.
+  const awaitingMsg = chatStore.messages.find((m) => m.awaitingConfirmation)
+  if (!awaitingMsg?.executionPlan) {
+    toast?.addToast({ type: 'error', message: '没有可执行的计划' })
+    for (const m of chatStore.messages) {
+      if (m.awaitingConfirmation) m.awaitingConfirmation = false
+    }
+    return
+  }
   await rerunLastPlan()
   for (const m of chatStore.messages) {
     if (m.awaitingConfirmation) m.awaitingConfirmation = false

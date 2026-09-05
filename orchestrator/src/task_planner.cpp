@@ -30,7 +30,8 @@ TaskPlanner::TaskPlanner(const TaskPlannerConfig& config, std::unique_ptr<LLMCli
 ExecutionPlan TaskPlanner::plan(
     const std::string& query,
     const std::unordered_map<std::string, std::string>& available_skills,
-    int llm_timeout_seconds) {
+    int llm_timeout_seconds,
+    const std::atomic<bool>* abort_flag) {
 
     ExecutionPlan plan;
     plan.original_query = query;
@@ -72,7 +73,7 @@ ExecutionPlan TaskPlanner::plan(
 
             std::string response = llm_client_->chat(
                 "你是一个任务规划器，严格按照 JSON 格式返回结果，不要输出其他内容。",
-                attempt_prompt, llm_timeout_seconds);
+                attempt_prompt, llm_timeout_seconds, abort_flag);
             auto attempt_end = std::chrono::steady_clock::now();
 
             // Estimate-based accounting: LLMClient::chat() does not expose

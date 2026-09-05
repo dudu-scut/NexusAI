@@ -1,6 +1,7 @@
 #include <a2a/server/task_manager.hpp>
 #include <a2a/server/memory_task_store.hpp>
 #include <a2a/core/exception.hpp>
+#include <mutex>
 #include <sstream>
 
 namespace a2a {
@@ -37,6 +38,15 @@ public:
     TaskCallback on_task_cancelled_;
     TaskCallback on_task_updated_;
     AgentCardCallback on_agent_card_query_;
+
+    // Serializes the check-then-act sequences in cancel_task() and
+    // update_status(): both read is_terminal() and then write via the
+    // store in separate store-level lock acquisitions, so a worker
+    // completion racing a cancellation could otherwise overwrite a
+    // terminal state (Completed over Canceled, or the reverse).
+    // All status writes in the process go through this class, so one
+    // mutex here closes the window.
+    std::mutex status_transition_mutex_;
 };
 
 TaskManager::TaskManager(std::shared_ptr<ITaskStore> task_store)
@@ -105,7 +115,12 @@ AgentTask TaskManager::cancel_task(const std::string& task_id) {
     
     AgentTask task = *task_opt;
     
-    // Check if task can be cancelled
+    // Check if task can be cancelled. The check and the write share the
+    // status-transition lock: without it, a completion landing between
+    // the two would be overwritten by Canceled. Re-read under the lock —
+    // the copy taken above may already be stale.
+    std::lock_guard<std::mutex> transition_lock(impl_->status_transition_mutex_);
+    task = *impl_->task_store_->get_task(task_id);
     if (task.is_terminal()) {
         throw A2AException(
             "Task is in terminal state and cannot be cancelled",
@@ -135,6 +150,9 @@ void TaskManager::update_status(const std::string& task_id,
     // includes the terminal→terminal path (a late worker completion writing
     // Completed over Canceled, "cancel-then-resurrect"). Late messages are
     // still recorded to history, but the state transition is dropped.
+    // P24 review: check and write share the status-transition lock (see
+    // Impl) so a concurrent cancellation cannot interleave.
+    std::lock_guard<std::mutex> transition_lock(impl_->status_transition_mutex_);
     auto current_opt = impl_->task_store_->get_task(task_id);
     if (!current_opt.has_value()) {
         throw A2AException("Task not found: " + task_id, ErrorCode::TaskNotFound);

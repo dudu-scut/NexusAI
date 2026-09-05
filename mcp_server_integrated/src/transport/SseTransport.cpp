@@ -185,12 +185,19 @@ namespace vx::transport {
         client_connected_.store(true);
         sse_active_.store(true);
 
+        // Per-connection state MUST live in the closure: cpp-httplib serves
+        // responses from a thread pool, so a thread_local here would leak
+        // state across unrelated SSE connections handled by the same thread
+        // (the endpoint handshake event would be skipped on the second
+        // connection, leaving that client without a session URL).
+        auto conn_state = std::make_shared<std::pair<bool, std::chrono::steady_clock::time_point>>(
+            true, std::chrono::steady_clock::now());
         res.set_content_provider(
             "text/event-stream",
-            [this](size_t offset, httplib::DataSink& sink) -> bool {
+            [this, conn_state](size_t offset, httplib::DataSink& sink) -> bool {
                 using clock = std::chrono::steady_clock;
-                static thread_local bool first_call = true;
-                static thread_local auto last_ping = clock::now();
+                bool& first_call = conn_state->first;
+                clock::time_point& last_ping = conn_state->second;
                 const auto ping_interval = std::chrono::seconds(15);
 
                 auto terminate = [this]() -> bool {

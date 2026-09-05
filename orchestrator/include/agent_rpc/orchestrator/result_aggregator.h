@@ -56,7 +56,8 @@ public:
      */
     AggregatedResult aggregate(
         const ExecutionPlan& plan,
-        const std::unordered_map<std::string, SubTaskResult>& results);
+        const std::unordered_map<std::string, SubTaskResult>& results,
+        const std::atomic<bool>* abort_flag = nullptr);
 
 private:
     std::string aggregateConcat(
@@ -68,7 +69,8 @@ private:
     // concat output internally (empty context / empty answer / exception).
     std::pair<std::string, bool> aggregateLLMSynthesize(
         const ExecutionPlan& plan,
-        const std::unordered_map<std::string, SubTaskResult>& results);
+        const std::unordered_map<std::string, SubTaskResult>& results,
+        const std::atomic<bool>* abort_flag);
 
     AggregatorConfig config_;
     std::unique_ptr<LLMClient> llm_client_;

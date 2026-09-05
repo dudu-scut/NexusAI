@@ -39,6 +39,9 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <memory>
+#include <mutex>
+#include <unordered_set>
 
 namespace agent_rpc {
 namespace server {
@@ -585,9 +588,12 @@ void AIQueryServiceImpl::finalizeDurableQuery(DurableQueryRun& run, const std::s
 
     // Token ledger: one estimate-only entry per request_id, never per retry.
     // The entry id is the deduplication key: the repository reports the
-    // conflict instead of throwing, so retries may call this unconditionally
-    // (a request rejected first and retried successfully is billed exactly
-    // once). There is no provider settlement yet (estimated=true).
+    // conflict instead of throwing, so retries may call this unconditionally.
+    // Note: "rejected" is itself a terminal replay state, so the "rejected
+    // first, retried successfully" path never reaches this code — a retry
+    // after budget rejection must use a new request_id (see the replay
+    // short-circuit in beginDurableRows). There is no provider settlement
+    // yet (estimated=true).
     common::TokenUsageLedgerRecord usage;
     usage.id = "usage-" + run.request_id;
     usage.owner_id = run.owner_id;
@@ -800,6 +806,48 @@ void AIQueryServiceImpl::writeAgentSwitchMemory(
                                target_agent_name, target_agent_duties);
 }
 
+namespace {
+
+// P24 review: process-local dedup for concurrent same-request_id pipelines.
+// A client retry while the first attempt is still executing must not run the
+// query twice (double LLM cost, competing terminal writes). Crash recovery
+// stays intact: the entry is removed when the RPC handler unwinds, so a
+// stale "running" row left by a crashed run is re-executable.
+std::mutex g_inflight_dedup_mutex;
+std::unordered_set<std::string> g_inflight_dedup;
+
+class InflightRequestGuard {
+public:
+    // Null when the request is already executing in this process.
+    static std::unique_ptr<InflightRequestGuard> tryAcquire(
+        const std::string& request_id) {
+        {
+            std::lock_guard<std::mutex> lock(g_inflight_dedup_mutex);
+            if (!g_inflight_dedup.insert(request_id).second) {
+                return nullptr;
+            }
+        }
+        return std::unique_ptr<InflightRequestGuard>(
+            new InflightRequestGuard(request_id));
+    }
+
+    ~InflightRequestGuard() {
+        std::lock_guard<std::mutex> lock(g_inflight_dedup_mutex);
+        g_inflight_dedup.erase(request_id_);
+    }
+
+    InflightRequestGuard(const InflightRequestGuard&) = delete;
+    InflightRequestGuard& operator=(const InflightRequestGuard&) = delete;
+
+private:
+    explicit InflightRequestGuard(const std::string& request_id)
+        : request_id_(request_id) {}
+
+    std::string request_id_;
+};
+
+} // namespace
+
 grpc::Status AIQueryServiceImpl::Query(
     grpc::ServerContext* context,
     const agent_communication::AIQueryRequest* request,
@@ -837,6 +885,14 @@ grpc::Status AIQueryServiceImpl::Query(
     std::string context_id = request->context_id();
     if (context_id.empty()) {
         context_id = "ctx-" + request_id;
+    }
+
+    // P24 review: reject a concurrent same-request_id duplicate before any
+    // durable row is touched.
+    auto inflight_guard = InflightRequestGuard::tryAcquire(request_id);
+    if (!inflight_guard) {
+        return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                            "Request already in progress: " + request_id);
     }
 
     LOG_INFO("Processing AI query: " + request_id);
@@ -985,8 +1041,10 @@ grpc::Status AIQueryServiceImpl::Query(
 
     // Client disconnected mid-execution: persist cancelled instead of
     // finalizing a completed (and billed) run — same contract as the
-    // streaming path.
+    // streaming path. P24 C2: also mark the request-level cancellation
+    // token so any straggler call of this request self-aborts.
     if (context->IsCancelled()) {
+        InFlightAbortRegistry::instance().cancelInFlightByRequest(request_id);
         finalizeDurableQuery(run, "cancelled", "", "Request cancelled");
         helpers_.updateTaskStatus(request_id, "cancelled");
         return grpc::Status(grpc::StatusCode::CANCELLED, "Request cancelled");
@@ -1123,6 +1181,13 @@ grpc::Status AIQueryServiceImpl::QueryStream(
     std::string context_id = request->context_id();
     if (context_id.empty()) {
         context_id = "ctx-" + request_id;
+    }
+
+    // P24 review: same in-flight dedup as the sync Query path.
+    auto inflight_guard = InflightRequestGuard::tryAcquire(request_id);
+    if (!inflight_guard) {
+        return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                            "Request already in progress: " + request_id);
     }
 
     LOG_INFO("Processing streaming AI query: " + request_id);

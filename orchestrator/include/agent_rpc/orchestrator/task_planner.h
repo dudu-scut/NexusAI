@@ -101,7 +101,8 @@ public:
      */
     ExecutionPlan plan(const std::string& query,
                        const std::unordered_map<std::string, std::string>& available_skills,
-                       int llm_timeout_seconds = 20);
+                       int llm_timeout_seconds = 20,
+                       const std::atomic<bool>* abort_flag = nullptr);
 
     /**
      * Pre-resolve agents for each subtask in the plan using AgentRouter.
