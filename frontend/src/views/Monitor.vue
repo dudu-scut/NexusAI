@@ -263,7 +263,7 @@ async function loadMonitorData() {
     }
 
     const metricsResults = await Promise.all(
-      agents.map(a => getAgentMetrics(a.service_name || a.tags?.[0] || 'unknown')),
+      agents.map(a => getAgentMetrics(`${a.service_name}-${a.host}-${a.port}`)),
     )
     const metricsList = metricsResults.map(r => r.data)
 

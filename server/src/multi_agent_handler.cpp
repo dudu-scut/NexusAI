@@ -39,6 +39,68 @@ namespace server {
 
 namespace {
 
+// A3/P20-8: the planning LLM must not run a full 20s when the request's
+// remaining gRPC deadline budget is already tight. Returns the per-call
+// timeout (bounded by kMaxPlanningTimeoutSeconds) or 0 when the remaining
+// budget is too small to plan at all — the caller then falls straight to
+// the single-agent baseline instead of paying for a doomed plan call.
+constexpr int kMaxPlanningTimeoutSeconds = 20;
+constexpr int kPlanningReserveSeconds = 5;    // execution headroom
+constexpr int kMinPlanningBudgetSeconds = 3;  // below this, skip planning
+// B6 route-then-plan: prune the planning prompt's skill list to the
+// embedding-nearest subset (NEXUSAI_PLAN_SKILL_PRUNE=1, default off).
+// Skill set selection happens entirely at the call site — plan() itself is
+// untouched. Falls back to the full set when the pruner yields nothing
+// (planning against an empty set would disable the whole DAG).
+std::unordered_map<std::string, std::string> prunedSkillsForPlanning(
+    orchestrator::AgentRouter* router, const std::string& question,
+    std::unordered_map<std::string, std::string> all_skills) {
+    const bool enabled =
+        agent_rpc::common::envOrDefault("NEXUSAI_PLAN_SKILL_PRUNE", "0") == "1";
+    if (!enabled || !router || all_skills.empty()) {
+        return all_skills;
+    }
+    constexpr int kPruneTopK = 20;
+    constexpr float kPruneThreshold = 0.6f;
+    constexpr size_t kMaxPrunedSkills = 50;
+    auto ranked = router->rankSkillsBySimilarity(question, kPruneTopK, kPruneThreshold);
+    if (ranked.empty()) {
+        return all_skills;  // embedding tier unavailable — legacy behavior
+    }
+    std::unordered_map<std::string, std::string> subset;
+    for (const auto& [skill, similarity] : ranked) {
+        if (subset.size() >= kMaxPrunedSkills) break;
+        auto it = all_skills.find(skill);
+        if (it != all_skills.end()) {
+            subset.emplace(skill, it->second);
+        }
+    }
+    if (subset.empty()) {
+        return all_skills;  // ranked names missed the registry map — fail open
+    }
+    LOG_INFO("Skill pruning for planning: " + std::to_string(all_skills.size()) +
+             " -> " + std::to_string(subset.size()) + " skills (query similarity)");
+    return subset;
+}
+
+int planningTimeoutFor(grpc::ServerContext* context, int effective_timeout_seconds) {
+    if (context == nullptr ||
+        context->deadline() == std::chrono::system_clock::time_point::max()) {
+        return std::min(kMaxPlanningTimeoutSeconds,
+                        std::max(1, effective_timeout_seconds));
+    }
+    const auto remaining = std::chrono::duration_cast<std::chrono::seconds>(
+        context->deadline() - std::chrono::system_clock::now()).count();
+    if (remaining < kMinPlanningBudgetSeconds) {
+        return 0;
+    }
+    const long long capped = remaining - kPlanningReserveSeconds;
+    const long long bounded = std::min<long long>(
+        capped, std::max(1, effective_timeout_seconds));
+    return static_cast<int>(std::max<long long>(
+        1, std::min<long long>(kMaxPlanningTimeoutSeconds, bounded)));
+}
+
 // MultiAgentHandler never emits terminal stream events. The top-level
 // AIQueryServiceImpl::QueryStream is the single emitter of "complete" and
 // "error" events; this thread-local slot hands the accumulated answer/error
@@ -350,22 +412,73 @@ grpc::Status MultiAgentHandler::handleQuery(
 
     auto start_time = std::chrono::steady_clock::now();
     std::string question = request->question();
+    const int llm_timeout_seconds =
+        planningTimeoutFor(context, effective_timeout_seconds);
 
     // Step 1: Plan — decide single vs multi-agent. The P10 fast path may
-    // skip the planning LLM entirely for high-confidence single intents.
+    // skip the planning LLM entirely for high-confidence single intents;
+    // A3: a nearly-exhausted deadline budget skips the doomed 20s planning
+    // call and falls straight to the single-agent baseline.
     orchestrator::ExecutionPlan plan;
     bool fast_path_active = tryBuildFastPathPlan(question, plan);
     if (!fast_path_active) {
-        try {
-            plan = task_planner_->plan(question, agent_router_->getAllSkillDescriptions());
-        } catch (const std::exception& e) {
-            LOG_ERROR("Planning failed for sync query: " + request_id + " - " + e.what());
+        if (llm_timeout_seconds <= 0) {
+            LOG_WARN("Remaining deadline budget too small to plan, falling back to single agent: " + request_id);
             plan.is_single_agent = true;
+        } else {
+            try {
+                plan = task_planner_->plan(
+                    question, prunedSkillsForPlanning(agent_router_, question, agent_router_->getAllSkillDescriptions()),
+                    llm_timeout_seconds);
+            } catch (const std::exception& e) {
+                LOG_ERROR("Planning failed for sync query: " + request_id + " - " + e.what());
+                plan.is_single_agent = true;
+            }
         }
     }
 
     // Pre-resolve agents for all subtasks
     task_planner_->resolveAgents(plan, *agent_router_);
+
+    // B1: plan-only runs NEVER execute — including single-agent plans and
+    // fast-path hits (P1-3). Deliver the plan JSON as the answer payload;
+    // the top level finalizes the run as "planned" and execution happens via
+    // a follow-up ExecutePlan call after user confirmation.
+    if (request->plan_only()) {
+        nlohmann::json plan_only_json;
+        plan_only_json["original_query"] = plan.original_query;
+        plan_only_json["single_agent"] = plan.is_single_agent;
+        plan_only_json["tasks"] = nlohmann::json::array();
+        if (plan.is_single_agent) {
+            nlohmann::json tj;
+            tj["id"] = "t1";
+            tj["description"] = plan.original_query;
+            tj["skill"] = plan.single_agent_skill;
+            tj["depends_on"] = nlohmann::json::array();
+            tj["agent_id"] = plan.single_agent_id;
+            tj["agent_name"] = plan.single_agent_name;
+            plan_only_json["tasks"].push_back(std::move(tj));
+        } else {
+            for (const auto& t : plan.tasks) {
+                nlohmann::json tj;
+                tj["id"] = t.id;
+                tj["description"] = t.description;
+                tj["skill"] = t.required_skill;
+                tj["depends_on"] = t.depends_on;
+                tj["agent_id"] = t.preferred_agent_id;
+                tj["agent_name"] = t.preferred_agent_name;
+                plan_only_json["tasks"].push_back(std::move(tj));
+            }
+        }
+        response->set_answer(plan_only_json.dump());
+        response->set_request_id(request_id);
+        response->set_task_id(request_id);
+        auto* st = response->mutable_status();
+        st->set_code(0);
+        st->set_message("plan-only");
+        update_status_(request_id, "planned", "", "", "");
+        return grpc::Status::OK;
+    }
 
     // Single-agent fast path. Metrics/invocation facts are recorded ONLY at
     // the final terminal state: a failed fast-path attempt is an internal
@@ -404,7 +517,8 @@ grpc::Status MultiAgentHandler::handleQuery(
         LOG_WARN("P10 single-intent fast path failed, retrying with full planning: " + request_id);
         plan = orchestrator::ExecutionPlan{};
         try {
-            plan = task_planner_->plan(question, agent_router_->getAllSkillDescriptions());
+            plan = task_planner_->plan(question, prunedSkillsForPlanning(agent_router_, question, agent_router_->getAllSkillDescriptions()),
+                                       planningTimeoutFor(context, rpc_config_->timeout_seconds));
         } catch (const std::exception& e) {
             LOG_ERROR("Planning failed on fast-path retry: " + request_id + " - " + e.what());
             plan.is_single_agent = true;
@@ -441,13 +555,18 @@ grpc::Status MultiAgentHandler::handleQuery(
     update_status_(request_id, "working", "", "", "");
 
     auto call_agent = buildCallAgent(request, effective_timeout_seconds);
-    // P20: a timed-out subtask aborts its in-flight A2A call.
-    auto on_cancel = [this](const std::string& agent_url) {
-        cancelInFlight(agent_url);
+    // P20: a timed-out subtask aborts its in-flight A2A call (scoped to this
+    // request — concurrent requests sharing the agent URL are not touched).
+    auto on_cancel = [this, request_id](const std::string& agent_url) {
+        cancelInFlight(agent_url, request_id);
     };
+    // Client-disconnect propagation: the executor checks this at every layer
+    // boundary and stops launching new work when the RPC is cancelled.
+    auto cancelled_probe = [context]() { return context->IsCancelled(); };
 
     try {
-        auto results = task_executor_->execute(plan, call_agent, nullptr, on_cancel);
+        auto results = task_executor_->execute(plan, call_agent, nullptr, on_cancel,
+                                               cancelled_probe);
         auto aggregated = result_aggregator_->aggregate(plan, results);
 
         // One invocation fact per executed subtask (owner from auth context).
@@ -463,7 +582,13 @@ grpc::Status MultiAgentHandler::handleQuery(
                 }
             }
             // Prefer the actually executed agent (routing fallback may pick
-            // a different agent than the pre-resolved preference).
+            // a different agent than the pre-resolved preference). Results
+            // that never reached an agent (fabricated timeout/cancel/resolve
+            // failures) are skipped: they carry no signal about the agent's
+            // health and would poison the 30s evaluation loop (R4).
+            if (!result.executed) {
+                continue;
+            }
             std::string actual_agent_id =
                 result.agent_id.empty() ? agent_id : result.agent_id;
             if (!actual_agent_id.empty()) {
@@ -535,19 +660,72 @@ grpc::Status MultiAgentHandler::handleQueryStream(
     }
 
     // Step 1: Plan. The P10 fast path may skip the planning LLM entirely
-    // for high-confidence single intents.
+    // for high-confidence single intents. A3: the planning call honors the
+    // remaining deadline budget and is skipped entirely when too little
+    // budget remains (straight to the single-agent baseline).
     orchestrator::ExecutionPlan plan;
     bool fast_path_active = tryBuildFastPathPlan(question, plan);
     if (!fast_path_active) {
-        try {
-            plan = task_planner_->plan(question, agent_router_->getAllSkillDescriptions());
-        } catch (const std::exception& e) {
-            LOG_ERROR("Planning failed for query: " + request_id + " - " + e.what());
+        const int llm_timeout_seconds =
+            planningTimeoutFor(context, rpc_config_->timeout_seconds);
+        if (llm_timeout_seconds <= 0) {
+            LOG_WARN("Remaining deadline budget too small to plan, falling back to single agent: " + request_id);
             plan.is_single_agent = true;
+        } else {
+            try {
+                plan = task_planner_->plan(question, prunedSkillsForPlanning(agent_router_, question, agent_router_->getAllSkillDescriptions()),
+                                           llm_timeout_seconds);
+            } catch (const std::exception& e) {
+                LOG_ERROR("Planning failed for query: " + request_id + " - " + e.what());
+                plan.is_single_agent = true;
+            }
         }
     }
 
     task_planner_->resolveAgents(plan, *agent_router_);
+
+    // B1: plan-only runs NEVER execute — including single-agent plans and
+    // fast-path hits (P1-3). Deliver the plan event plus the confirmation
+    // marker and stop; execution happens via a follow-up ExecutePlan call
+    // after user confirmation.
+    if (request->plan_only()) {
+        nlohmann::json plan_only_json;
+        plan_only_json["original_query"] = plan.original_query;
+        plan_only_json["tasks"] = nlohmann::json::array();
+        if (plan.is_single_agent) {
+            nlohmann::json tj;
+            tj["id"] = "t1";
+            tj["description"] = plan.original_query;
+            tj["skill"] = plan.single_agent_skill;
+            tj["depends_on"] = nlohmann::json::array();
+            tj["agent_id"] = plan.single_agent_id;
+            tj["agent_name"] = plan.single_agent_name;
+            plan_only_json["tasks"].push_back(std::move(tj));
+        } else {
+            for (const auto& t : plan.tasks) {
+                nlohmann::json tj;
+                tj["id"] = t.id;
+                tj["description"] = t.description;
+                tj["skill"] = t.required_skill;
+                tj["depends_on"] = t.depends_on;
+                tj["agent_id"] = t.preferred_agent_id;
+                tj["agent_name"] = t.preferred_agent_name;
+                plan_only_json["tasks"].push_back(std::move(tj));
+            }
+        }
+        agent_communication::AIStreamEvent plan_event;
+        plan_event.set_event_type("plan");
+        plan_event.set_content(plan_only_json.dump());
+        plan_event.set_context_id(context_id);
+        writer->Write(plan_event);
+        agent_communication::AIStreamEvent confirm_event;
+        confirm_event.set_event_type("status");
+        confirm_event.set_content("awaiting_confirmation");
+        confirm_event.set_context_id(context_id);
+        writer->Write(confirm_event);
+        update_status_(request_id, "planned", "", "", "");
+        return grpc::Status::OK;
+    }
 
     // Single-agent fast path. No terminal event is emitted anywhere in this
     // branch; AIQueryServiceImpl owns the single terminal emission.
@@ -578,7 +756,8 @@ grpc::Status MultiAgentHandler::handleQueryStream(
         tls_stream_result = StreamResultSlot{};
         plan = orchestrator::ExecutionPlan{};
         try {
-            plan = task_planner_->plan(question, agent_router_->getAllSkillDescriptions());
+            plan = task_planner_->plan(question, prunedSkillsForPlanning(agent_router_, question, agent_router_->getAllSkillDescriptions()),
+                                       planningTimeoutFor(context, rpc_config_->timeout_seconds));
         } catch (const std::exception& e) {
             LOG_ERROR("Planning failed on fast-path retry: " + request_id + " - " + e.what());
             plan.is_single_agent = true;
@@ -613,6 +792,18 @@ grpc::Status MultiAgentHandler::handleQueryStream(
             tj["agent_id"] = t.preferred_agent_id;
             tj["agent_name"] = t.preferred_agent_name;
         }
+        // P12(a): candidate provenance — confidence is a real cosine
+        // similarity only when confidence_source == "embedding"; "ranking"
+        // values are placeholders and must be labelled as such in the UI.
+        tj["candidates"] = nlohmann::json::array();
+        for (const auto& cand : t.candidate_agents) {
+            nlohmann::json cj;
+            cj["agent_id"] = cand.agent_id;
+            cj["agent_name"] = cand.agent_name;
+            cj["confidence"] = cand.confidence;
+            cj["confidence_source"] = cand.confidence_source;
+            tj["candidates"].push_back(std::move(cj));
+        }
         plan_json["tasks"].push_back(tj);
     }
 
@@ -639,10 +830,14 @@ grpc::Status MultiAgentHandler::handleQueryStream(
     }
 
     auto call_agent = buildCallAgent(request, effective_timeout_seconds);
-    // P20: a timed-out subtask aborts its in-flight A2A call.
-    auto on_cancel = [this](const std::string& agent_url) {
-        cancelInFlight(agent_url);
+    // P20: a timed-out subtask aborts its in-flight A2A call (scoped to this
+    // request — concurrent requests sharing the agent URL are not touched).
+    auto on_cancel = [this, request_id](const std::string& agent_url) {
+        cancelInFlight(agent_url, request_id);
     };
+    // Client-disconnect propagation into the DAG (R3): the executor stops
+    // launching new layers once the RPC context is cancelled.
+    auto cancelled_probe = [context]() { return context->IsCancelled(); };
 
     try {
         orchestrator::ProgressCallback progress_cb =
@@ -665,8 +860,30 @@ grpc::Status MultiAgentHandler::handleQueryStream(
                 writer->Write(stream_event);
             };
 
-        auto results = task_executor_->execute(plan, call_agent, progress_cb, on_cancel);
+        auto results = task_executor_->execute(plan, call_agent, progress_cb,
+                                               on_cancel, cancelled_probe);
         auto aggregated = result_aggregator_->aggregate(plan, results);
+
+        // P13(d)/A2: surface non-fatal warnings (dropped subtasks) as status
+        // events — the final_answer itself also carries the notice.
+        for (const auto& warning : aggregated.warnings) {
+            agent_communication::AIStreamEvent warn_event;
+            warn_event.set_event_type("status");
+            warn_event.set_content(warning);
+            warn_event.set_context_id(context_id);
+            writer->Write(warn_event);
+        }
+
+        // Client disconnected mid-DAG: surface CANCELLED instead of a
+        // completed (and billed) run — same contract as the sync path.
+        if (context->IsCancelled()) {
+            auto duration_cancel = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start_time);
+            update_status_(request_id, "cancelled", "", "", "");
+            record_metrics_("QueryStream", duration_cancel.count(), false);
+            tls_stream_result.answer = "";
+            return grpc::Status(grpc::StatusCode::CANCELLED, "Request cancelled");
+        }
 
         // One invocation fact per executed subtask (owner from auth context).
         for (const auto& entry : results) {
@@ -679,6 +896,11 @@ grpc::Status MultiAgentHandler::handleQueryStream(
                     skill_name = task.required_skill;
                     break;
                 }
+            }
+            // R4: skip fabricated (never-executed) results — no health
+            // signal, no invocation fact.
+            if (!result.executed) {
+                continue;
             }
             // Prefer the actually executed agent (routing fallback may pick
             // a different agent than the pre-resolved preference).
@@ -819,7 +1041,11 @@ MultiAgentHandler::SingleStreamOutcome MultiAgentHandler::executeSingleAgentStre
         auto end_time = std::chrono::steady_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
             end_time - start_time);
-        update_status_(request_id, "failed", "", "", e.what());
+        // Probe failures may be retried by the caller — do not publish a
+        // "failed" task status that the retry would flip back to "completed".
+        if (!fast_path_probe) {
+            update_status_(request_id, "failed", "", "", e.what());
+        }
         if (!fast_path_probe) {
             record_metrics_("QueryStream", duration.count(), false);
             recordInvocationFact(request_id, plan.single_agent_id,
@@ -843,8 +1069,8 @@ MultiAgentHandler::SingleStreamOutcome MultiAgentHandler::executeSingleAgentStre
     }
     if (!lower_error.empty()) {
         tls_stream_result.error = lower_error;
-        update_status_(request_id, "failed", "", "", lower_error);
         if (!fast_path_probe) {
+            update_status_(request_id, "failed", "", "", lower_error);
             auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - start_time).count();
             recordInvocationFact(request_id, plan.single_agent_id,
@@ -858,8 +1084,8 @@ MultiAgentHandler::SingleStreamOutcome MultiAgentHandler::executeSingleAgentStre
     }
     if (write_failed) {
         tls_stream_result.error = "Failed to write stream event";
-        update_status_(request_id, "failed", "", "", "Failed to write stream event");
         if (!fast_path_probe) {
+            update_status_(request_id, "failed", "", "", "Failed to write stream event");
             auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - start_time).count();
             recordInvocationFact(request_id, plan.single_agent_id,
@@ -896,8 +1122,9 @@ std::function<std::string(const std::string&, const std::string&)>
 MultiAgentHandler::buildCallAgent(const agent_communication::AIQueryRequest* request,
                                   int effective_timeout_seconds) {
     std::string memory_ctx = QueryHelpers::buildMemoryContext(request);
+    const std::string owner_request_id = request ? request->request_id() : "";
 
-    return [this, memory_ctx, effective_timeout_seconds](
+    return [this, memory_ctx, effective_timeout_seconds, owner_request_id](
                const std::string& agent_url,
                const std::string& prompt) -> std::string {
         std::string enriched_prompt = prompt;
@@ -918,7 +1145,8 @@ MultiAgentHandler::buildCallAgent(const agent_communication::AIQueryRequest* req
         auto abort_flag = std::make_shared<std::atomic<bool>>(false);
         {
             std::lock_guard<std::mutex> lock(in_flight_mutex_);
-            in_flight_calls_.emplace(agent_url, abort_flag);
+            in_flight_calls_.emplace(agent_url,
+                                     InFlightCall{abort_flag, owner_request_id});
         }
         auto unregister = [this, &agent_url, abort_flag]() {
             unregisterInFlight(agent_url, abort_flag);
@@ -988,16 +1216,21 @@ MultiAgentHandler::buildCallAgent(const agent_communication::AIQueryRequest* req
     };
 }
 
-void MultiAgentHandler::cancelInFlight(const std::string& agent_url) {
-    // Collect all live flags for the URL first (lock scope), then flip them
-    // outside the lock; a timed-out subtask aborts every call sharing its
-    // target URL.
+void MultiAgentHandler::cancelInFlight(const std::string& agent_url,
+                                       const std::string& owner_request_id) {
+    // Collect the live flags for the URL that belong to THIS request first
+    // (lock scope), then flip them outside the lock. A timed-out subtask
+    // aborts only its own request's calls sharing the URL — concurrent
+    // requests targeting the same agent keep their in-flight calls intact.
     std::vector<std::shared_ptr<std::atomic<bool>>> flags;
     {
         std::lock_guard<std::mutex> lock(in_flight_mutex_);
         auto range = in_flight_calls_.equal_range(agent_url);
         for (auto it = range.first; it != range.second; ++it) {
-            flags.push_back(it->second);
+            if (it->second.owner_request_id == owner_request_id ||
+                it->second.owner_request_id.empty()) {
+                flags.push_back(it->second.flag);
+            }
         }
     }
     for (auto& flag : flags) {
@@ -1011,7 +1244,7 @@ void MultiAgentHandler::unregisterInFlight(
     std::lock_guard<std::mutex> lock(in_flight_mutex_);
     auto range = in_flight_calls_.equal_range(agent_url);
     for (auto it = range.first; it != range.second; ++it) {
-        if (it->second == flag) {
+        if (it->second.flag == flag) {
             in_flight_calls_.erase(it);
             return;
         }

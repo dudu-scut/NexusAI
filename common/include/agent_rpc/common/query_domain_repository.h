@@ -87,11 +87,65 @@ struct RouteQualityRecord {
     std::string id;
     std::string owner_id;
     std::string agent_id;
+    // V013 widened the uniqueness to (owner_id, agent_id, skill_name); the
+    // skill dimension is part of the record and the upsert conflict target.
+    std::string skill_name;
     std::int64_t sample_count = 0;
     std::string average_rating;
     std::string routing_weight;
     std::string created_at;
     std::string updated_at;
+};
+
+// B4 (P14d): one durable health-evaluation snapshot per agent, written by
+// the 30s health_evaluation loop and reloaded at startup as the live-metrics
+// baseline (freshness-gated; the in-memory ring buffer stays authoritative
+// for per-call samples).
+struct AgentHealthSnapshotRecord {
+    std::string agent_id;
+    std::string health_status;   // HEALTHY / DEGRADED / UNHEALTHY / UNKNOWN
+    double success_rate = 0.0;
+    double ema_latency_ms = 0.0;
+    std::int64_t total_calls = 0;
+};
+
+// B5 (P17n): user profile row mirroring the V004 user_profiles columns —
+// identity/preferences travel as JSONB text (same JSON documents the
+// ProfileSummarizer stores in Redis).
+struct UserProfileRecord {
+    std::string user_id;
+    std::string identity;          // JSON object text
+    std::string preferences;       // JSON array text
+    std::string context_snapshot;  // JSON object text
+};
+
+// C1 (V015): memory-domain durable records. user_memory_hints retires the
+// last "[事实源] Redis" keys; user_memory_events is the append-only fact
+// stream (方向5) written alongside every hint mutation.
+struct UserMemoryHintRecord {
+    std::string owner_id;
+    std::string key;
+    std::string value;
+    std::string source = "segment";
+};
+struct UserMemoryEventRecord {
+    std::string owner_id;
+    std::string key;
+    std::string value;
+    std::string op;   // upsert / delete / conflict
+};
+// One batched mutation for applyUserMemoryHintBatch: the whole hint batch is
+// applied in a single transaction so a mid-batch PG fault cannot leave a
+// half-applied durable state while the fallback path rewrites the full set
+// into the projection (P2-2).
+struct UserMemoryHintOp {
+    enum class Kind { Upsert, Delete };
+    Kind kind = Kind::Upsert;
+    std::string key;
+    std::string value;
+    std::string source;
+    bool append_history = false;
+    std::string event_op;   // "" = no event row; else upsert/delete/conflict
 };
 
 // [PR-E] Workflow-control records mirroring the V011 durable-domain tables.
@@ -255,6 +309,41 @@ public:
     std::optional<RouteQualityRecord> getRouteQuality(const std::string& owner_id,
                                                       const std::string& agent_id);
     bool upsertRouteQuality(const RouteQualityRecord& quality);
+
+    // B4 (P14d): durable health-evaluation snapshots (V014
+    // agent_health_snapshots). max_age_seconds filters stale rows on read so
+    // the startup seeding never revives an ancient verdict.
+    bool upsertAgentHealthSnapshot(const AgentHealthSnapshotRecord& snapshot);
+    std::vector<AgentHealthSnapshotRecord> listAgentHealthSnapshots(
+        std::int64_t max_age_seconds = 600);
+
+    // B5 (P17n): user profile PG wiring (V004 user_profiles — the table
+    // predates the Redis-side profile flow). upsert succeeds → caller
+    // invalidates the Redis projection ("PG success → DEL Redis").
+    bool upsertUserProfile(const UserProfileRecord& profile);
+    std::optional<UserProfileRecord> getUserProfile(const std::string& user_id);
+
+    // C1 (V015): long-term memory hints. append_history moves the previous
+    // value into the JSONB history column (C2 方向3, fact-type keys).
+    bool upsertUserMemoryHint(const UserMemoryHintRecord& hint,
+                              bool append_history);
+    // P2-1: cache-aside rebuild helper — inserts only when the (owner, key)
+    // row does not exist yet, so a stale projection read can never overwrite
+    // a newer durable value.
+    bool insertUserMemoryHintIfAbsent(const UserMemoryHintRecord& hint);
+    bool deleteUserMemoryHint(const std::string& owner_id, const std::string& key);
+    std::vector<UserMemoryHintRecord> listUserMemoryHints(const std::string& owner_id);
+    bool insertUserMemoryEvent(const UserMemoryEventRecord& event);
+    bool applyUserMemoryHintBatch(const std::string& owner_id,
+                                  const std::vector<UserMemoryHintOp>& ops);
+
+    // C1 (V015): cross-agent summaries, keyed (context, target agent) with
+    // target_agent_id "" = context-level. Reads keep the 7-day TTL semantics.
+    bool upsertCrossAgentSummary(const std::string& context_id,
+                                 const std::string& target_agent_id,
+                                 const std::string& summary);
+    std::vector<std::pair<std::string, std::string>> listCrossAgentSummaries(
+        const std::string& context_id);
 
     // Short aliases retain the domain wording used by callers without adding
     // another SQL path or changing ownership semantics.

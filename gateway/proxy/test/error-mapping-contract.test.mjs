@@ -67,6 +67,14 @@ const CASES = [
   { username: 'err-exists', code: grpc.status.ALREADY_EXISTS, name: 'ALREADY_EXISTS', http: 409 },
   { username: 'err-exhausted', code: grpc.status.RESOURCE_EXHAUSTED, name: 'RESOURCE_EXHAUSTED', http: 429 },
   { username: 'err-cancelled', code: grpc.status.CANCELLED, name: 'CANCELLED', http: 499 },
+  // Batch-8 R9: the backend returns these frequently (ExecutePlan argument
+  // validation, circuit-open UNAVAILABLE, deadline contraction, unimplemented
+  // RPCs) — they must not collapse into a generic 500.
+  { username: 'err-invalid', code: grpc.status.INVALID_ARGUMENT, name: 'INVALID_ARGUMENT', http: 400 },
+  { username: 'err-precondition', code: grpc.status.FAILED_PRECONDITION, name: 'FAILED_PRECONDITION', http: 412 },
+  { username: 'err-unimplemented', code: grpc.status.UNIMPLEMENTED, name: 'UNIMPLEMENTED', http: 501 },
+  { username: 'err-unavailable', code: grpc.status.UNAVAILABLE, name: 'UNAVAILABLE', http: 503 },
+  { username: 'err-deadline', code: grpc.status.DEADLINE_EXCEEDED, name: 'DEADLINE_EXCEEDED', http: 504 },
 ];
 
 // Mock gRPC backend (real grpc-js server over the repo protos)
@@ -277,7 +285,7 @@ test('client abort cancels the upstream gRPC stream', async () => {
 
 // 5. Static guards on the mapping table
 
-test('proxy source pins the six required status mappings', () => {
+test('proxy source pins the required status mappings', () => {
   const server = fs.readFileSync(path.join(root, 'gateway/proxy/server.mjs'), 'utf8');
 
   // The guards pin the GRPC_HTTP_STATUS mapping CODE, not a
@@ -288,8 +296,17 @@ test('proxy source pins the six required status mappings', () => {
   assert.match(server, /\[grpc\.status\.ALREADY_EXISTS\]:\s*409/);
   assert.match(server, /\[grpc\.status\.RESOURCE_EXHAUSTED\]:\s*429/);
   assert.match(server, /\[grpc\.status\.CANCELLED\]:\s*499/);
+  // R9: no silent collapse into a generic 500 for these codes.
+  assert.match(server, /\[grpc\.status\.INVALID_ARGUMENT\]:\s*400/);
+  assert.match(server, /\[grpc\.status\.FAILED_PRECONDITION\]:\s*412/);
+  assert.match(server, /\[grpc\.status\.UNIMPLEMENTED\]:\s*501/);
+  assert.match(server, /\[grpc\.status\.UNAVAILABLE\]:\s*503/);
+  assert.match(server, /\[grpc\.status\.DEADLINE_EXCEEDED\]:\s*504/);
   // Abort propagation must exist for the single streaming code path.
   assert.match(server, /stream\.cancel\(\)/);
+  // R10: a trailing gRPC error after an in-band terminal event must not
+  // inject a second error frame.
+  assert.match(server, /if \(completeSeen\)/);
 });
 
 test('teardown', async () => {

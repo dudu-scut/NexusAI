@@ -36,6 +36,15 @@ struct SubTaskResult {
     bool success = false;
     int64_t duration_ms = 0;
     std::string error_message;
+    // False when the subtask never reached an agent (global deadline hit at
+    // a layer boundary, cancellation before launch, or target resolution
+    // failed). Fabricated failure results must not pollute per-agent health
+    // metrics: callers gate recordAgentCall/metrics on this flag.
+    bool executed = true;
+    // B3/P20-7: true when a write-shaped (SideEffect) subtask timed out —
+    // the external action MAY have applied, so the result must be reported
+    // as unknown rather than a plain retryable failure.
+    bool uncertain = false;
     // Actual agent that executed the subtask (preferred agent when it was
     // healthy, otherwise the routing fallback pick). Populated by
     // executeSubtask so server-layer callers can record per-agent metrics
@@ -94,13 +103,19 @@ public:
      * @param on_cancel         Optional callback invoked with the agent URL of
      *                          a subtask whose execution timed out (P20); null
      *                          keeps the legacy no-cancel behavior
+     * @param cancelled         Optional probe checked at every layer boundary;
+     *                          when it returns true, all remaining subtasks are
+     *                          marked failed with executed=false and execution
+     *                          stops (client-disconnect propagation). Null keeps
+     *                          the run-to-completion behavior.
      * @return Map of subtask_id → SubTaskResult
      */
     std::unordered_map<std::string, SubTaskResult> execute(
         const ExecutionPlan& plan,
         const AgentCallFn& call_agent,
         const ProgressCallback& on_progress = nullptr,
-        const CancelFn& on_cancel = nullptr);
+        const CancelFn& on_cancel = nullptr,
+        const std::function<bool()>& cancelled = nullptr);
 
 private:
     // Topological sort into layers (same-layer = parallel, cross-layer = serial)

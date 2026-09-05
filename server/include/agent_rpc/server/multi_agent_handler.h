@@ -166,11 +166,19 @@ private:
     // blocking HTTP transfer via the HttpClient progress callback.
     // multimap + flag-matched erase: parallel subtasks may share one URL,
     // so a URL can carry several live flags.
-    void cancelInFlight(const std::string& agent_url);
+    // Each entry carries its owning request_id: cancellation is scoped to
+    // the request that timed out, so a concurrent request hitting the same
+    // agent URL is never aborted as collateral (R18).
+    struct InFlightCall {
+        std::shared_ptr<std::atomic<bool>> flag;
+        std::string owner_request_id;
+    };
+    void cancelInFlight(const std::string& agent_url,
+                        const std::string& owner_request_id);
     void unregisterInFlight(const std::string& agent_url,
                             const std::shared_ptr<std::atomic<bool>>& flag);
     std::mutex in_flight_mutex_;
-    std::unordered_multimap<std::string, std::shared_ptr<std::atomic<bool>>>
+    std::unordered_multimap<std::string, InFlightCall>
         in_flight_calls_;
 
     // P10: injected fast-path skill resolver (null → router embedding tier).

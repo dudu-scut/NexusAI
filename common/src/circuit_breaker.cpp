@@ -19,6 +19,10 @@ void CircuitBreaker::recordSuccess() {
     stats_.successful_requests++;
     stats_.last_success_time = std::chrono::steady_clock::now();
 
+    if (state_ == CircuitState::HALF_OPEN) {
+        probe_in_flight_ = false;
+    }
+
     updateFailureRate();
 
     if (state_ == CircuitState::HALF_OPEN &&
@@ -33,6 +37,10 @@ void CircuitBreaker::recordFailure() {
     stats_.total_requests++;
     stats_.failed_requests++;
     stats_.last_failure_time = std::chrono::steady_clock::now();
+
+    if (state_ == CircuitState::HALF_OPEN) {
+        probe_in_flight_ = false;
+    }
 
     updateFailureRate();
 
@@ -49,14 +57,30 @@ bool CircuitBreaker::isRequestAllowed() {
             return true;
 
         case CircuitState::OPEN:
-            if (shouldAttemptReset()) {
-                transitionToHalfOpen();
-                return true;
+            if (!shouldAttemptReset()) {
+                return false;
             }
-            return false;
-
+            transitionToHalfOpen();
+            [[fallthrough]];
         case CircuitState::HALF_OPEN:
-            return stats_.total_requests < config_.success_threshold;
+            // A probe phase that overstays half_open_timeout returns to OPEN
+            // instead of trickling forever (the config knob existed but was
+            // never consulted).
+            if (config_.half_open_timeout.count() > 0 &&
+                std::chrono::steady_clock::now() - last_state_change_ >=
+                    config_.half_open_timeout) {
+                transitionToOpen();
+                return false;
+            }
+            // Single in-flight probe: the admission slot is reserved here so
+            // N concurrent callers cannot all pass before any of them records
+            // an outcome (probe storm). Extra traffic waits for the next
+            // attempt window — standard half-open behavior.
+            if (probe_in_flight_ || stats_.total_requests >= config_.success_threshold) {
+                return false;
+            }
+            probe_in_flight_ = true;
+            return true;
 
         default:
             return false;
@@ -72,6 +96,7 @@ void CircuitBreaker::reset() {
     std::lock_guard<std::mutex> lock(stats_mutex_);
     stats_ = CircuitBreakerStats{};
     state_ = CircuitState::CLOSED;
+    probe_in_flight_ = false;
     last_state_change_ = std::chrono::steady_clock::now();
     LOG_INFO("Circuit breaker reset");
 }
@@ -85,6 +110,7 @@ void CircuitBreaker::transitionToOpen() {
     if (state_ != CircuitState::OPEN) {
         state_ = CircuitState::OPEN;
         last_state_change_ = std::chrono::steady_clock::now();
+        probe_in_flight_ = false;
         LOG_WARN("Circuit breaker opened due to failures");
     }
 }
@@ -95,6 +121,7 @@ void CircuitBreaker::transitionToHalfOpen() {
         last_state_change_ = std::chrono::steady_clock::now();
         stats_.successful_requests = 0;
         stats_.total_requests = 0;
+        probe_in_flight_ = false;
         LOG_INFO("Circuit breaker half-opened for testing");
     }
 }
@@ -104,6 +131,7 @@ void CircuitBreaker::transitionToClosed() {
         state_ = CircuitState::CLOSED;
         last_state_change_ = std::chrono::steady_clock::now();
         stats_ = CircuitBreakerStats{};
+        probe_in_flight_ = false;
         LOG_INFO("Circuit breaker closed - service recovered");
     }
 }

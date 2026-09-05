@@ -34,14 +34,14 @@ NexusAI 是一个基于 C++20 与 gRPC 构建的高性能多 Agent 协作与智�
 5. **组装系统上下文**：从 PostgreSQL 读取会话消息与记忆摘要，组装 SystemContext 注入 AI 查询。
 6. **单次终结**：以 compare-exchange 原子操作保证 finalize 恰好执行一次，写入消息、查询日志、追踪与 Token 台账。
 
-管线以确定性主键实现幂等：消息 id 固定派生为 `msg-user-<request_id>` 与 `msg-assistant-<request_id>`，Token 台账主键为 `usage-<request_id>`。同一 `request_id` 的重试永远只产生一条预算预留与一条台账；客户端断开会持久化 cancelled 终态；预算拒绝持久化 rejected 终态。
+管线以确定性主键实现幂等：消息 id 固定派生为 `msg-user-<request_id>` 与 `msg-assistant-<request_id>`，Token 台账主键为 `usage-<request_id>`。同一 `request_id` 的重试永远只产生一条预算预留与一条台账；已终结的请求再次被调用会**短路返回落库结果**，不会重跑 LLM；终态行带状态守卫，任何迟到写入都无法回退已持久化的终态（completed / failed / cancelled / rejected / planned）。客户端断开会持久化 cancelled 终态；预算拒绝持久化 rejected 终态。
 
 ### PostgreSQL 为持久事实源
 
-- 会话、查询日志、链路追踪、预算预留、Token 台账、反馈、分享、Agent 注册表等全部业务事实落库 PostgreSQL，由 `db/migrations` 下 V001–V013 共 13 条只追加迁移建表。
+- 会话、查询日志、链路追踪、预算预留、Token 台账、反馈、分享、Agent 注册表等全部业务事实落库 PostgreSQL，由 `db/migrations` 下 V001–V015 共 15 条只追加迁移建表（V014 健康快照、V015 记忆域）。
 - RPC 服务端启动时自行执行迁移并记录校验和，不存在独立的 migrate 服务；迁移失败即启动中止。
 - Redis 清空后所有业务数据仍可完整读取；Redis 仅用于对话历史缓存、Agent 心跳存活标记、限流与短时锁。
-- 旧的 `sql/` 目录仅为参考 schema，不再执行。
+- 旧 `sql/` 参考 schema 已从仓库移除（内容被 V001+ 迁移完全取代）。
 
 ### DAG 任务编排引擎
 
@@ -76,15 +76,15 @@ TraceContext 以嵌套 Span 结构实现全链路追踪并跨线程自动传播�
 
 ### 三层记忆系统
 
-记忆服务在每次查询前自动整合上下文注入 AI 请求：对话历史按 Agent 粒度隔离并支持尾部裁剪；用户长期记忆基于 Hash 存储偏好特征并自动更新；跨 Agent 摘要由 LLM 生成以保障 Agent 切换时的连贯性。
+记忆服务在每次查询前自动整合上下文注入 AI 请求：对话历史按 Agent 粒度隔离；用户长期记忆以 PostgreSQL 为事实源（V015 `user_memory_hints`，变更走批量事务并记录 append-only 事件表），Redis 仅作读投影（写后失效、读时重建），事实型/偏好型键冲突分别走规则覆盖保留历史与候选集消歧；用户陈述的事实经 `SystemContext.user_facts` 独立字段注入，与平台推断的画像（`[User Profile]`）分层区分；跨 Agent 摘要由 LLM 按目标 Agent 职责特化生成。大规模 hints 下可开启 Top-K 向量召回（`NEXUSAI_MEMORY_VECTOR_RECALL`）。
 
 ### 网关错误语义
 
-Node.js 网关将 gRPC 状态码映射为六种 HTTP 语义码：UNAUTHENTICATED → 401、PERMISSION_DENIED → 403、NOT_FOUND → 404、RESOURCE_EXHAUSTED → 429、CANCELLED → 499、ALREADY_EXISTS → 409。一元调用错误返回统一结构化错误体；SSE 流以 in-band 结构化 error 事件传递错误后关闭；浏览器断开经网关传播为后端 stream.cancel()，服务端据此持久化 cancelled 终态。
+Node.js 网关将 gRPC 状态码映射为稳定的 HTTP 语义码：UNAUTHENTICATED → 401、PERMISSION_DENIED → 403、NOT_FOUND → 404、ALREADY_EXISTS → 409、RESOURCE_EXHAUSTED → 429、CANCELLED → 499、INVALID_ARGUMENT → 400、FAILED_PRECONDITION → 412、UNIMPLEMENTED → 501、UNAVAILABLE → 503、DEADLINE_EXCEEDED → 504（INTERNAL/UNKNOWN/DATA_LOSS → 500）。一元调用错误返回统一结构化错误体；SSE 流以 in-band 结构化 error 事件传递错误后关闭，且已投递终态事件后不再追加第二帧错误；浏览器断开经网关传播为后端 stream.cancel()，服务端据此持久化 cancelled 终态。
 
 ### 认证与安全
 
-密码采用 OpenSSL scrypt（EVP_PBE_scrypt，32 字节随机盐）哈希存储，会话令牌为 UUID 并在 Redis 中按 24 小时 TTL 管理。gRPC 拦截器对全部接口鉴权，白名单内的公开 RPC 免认证。匹配 `NEXUSAI_ADMIN_USERNAME` 的用户在注册时获得 ADMIN 角色，作为 RegisterAgent / UnregisterAgent 等管理面 RPC 的强制门槛。
+密码采用 OpenSSL scrypt（EVP_PBE_scrypt，32 字节随机盐）哈希存储；会话令牌为 32 字节 CSPRNG 随机数，服务端仅存 SHA-256 摘要，会话事实源在 PostgreSQL `auth_sessions`（登出/封禁即时撤销），拦截器层附带短 TTL 读缓存（撤销延迟有上限）。gRPC 拦截器对全部接口鉴权，白名单内的公开 RPC 免认证。匹配 `NEXUSAI_ADMIN_USERNAME` 的用户在注册时获得 ADMIN 角色，作为 RegisterAgent / UnregisterAgent 等管理面 RPC 的强制门槛。
 
 ## 架构概览
 
@@ -119,7 +119,7 @@ Node.js 网关将 gRPC 状态码映射为六种 HTTP 语义码：UNAUTHENTICATED
              ┌────────────▼────────────┐       ┌────────────▼──────────┐
              │  Redis (:6379)          │       │  PostgreSQL (:5432)   │
              │  缓存·心跳·限流·短锁     │       │  持久事实源            │
-             └────────────┬────────────┘       │  V001–V013 只追加迁移  │
+             └────────────┬────────────┘       │  V001–V015 只追加迁移  │
                           │                    └───────────────────────┘
              ┌────────────▼────────────┐
              │  外部 Agent              │
@@ -170,15 +170,16 @@ docker compose down
 ./run.sh stop
 ```
 
-### 方式二：本地开发模式（WSL2 + Windows）
+### 方式二：本地开发模式（Linux 原生，或 Windows 下的 WSL2）
 
-C++ 后端的编译、测试与运行必须在 WSL2 Ubuntu 中进行，且仓库应检出到 Linux 文件系统（不要放在 `/mnt/c` 下）；前端与网关代理在 Windows 原生运行。
+C++ 后端的编译、测试与运行在 **Linux 原生环境或 Windows 下的 WSL2 Ubuntu** 中进行（WSL2 方式建议把仓库检出到 Linux 文件系统，不要放在 `/mnt/c` 下）；前端与网关代理运行在宿主机终端（Windows PowerShell 或任意 Linux shell）均可。
 
-**1. 环境准备（WSL2 内）**
+**1. 环境准备（Linux / WSL2 内）**
+
+> 注：`scripts/` 为本地辅助脚本，已不入库（本机工作区保留）。新环境可手动安装依赖：gRPC/protobuf 开发包、libpqxx、hiredis、GTest、RapidCheck、curl 等（或按需自建 bootstrap 脚本），随后：
 
 ```bash
-./scripts/bootstrap-wsl.sh   # 安装 WSL2 工具链
-./run.sh setup               # 检测开发环境
+./run.sh setup               # 检测开发环境，缺依赖会明确列出
 ```
 
 **2. 配置环境变量**
@@ -187,27 +188,27 @@ C++ 后端的编译、测试与运行必须在 WSL2 Ubuntu 中进行，且仓库
 cp .env.example .env         # 填入 LLM_API_KEY 等实际值
 ```
 
-**3. 编译与测试（WSL2 内）**
+**3. 编译与测试（Linux / WSL2 内）**
 
 ```bash
 ./run.sh build               # CMake + make 编译
 ./run.sh test                # 运行全部 37 套测试
 ```
 
-**4. 启动后端（WSL2 内）**
+**4. 启动后端（Linux / WSL2 内）**
 
 ```bash
 ./run.sh start-all           # 启动容器化后端栈（等价于 ./run.sh gateway）
 ```
 
-**5. 启动网关代理（Windows PowerShell）**
+**5. 启动网关代理（宿主机终端）**
 
 ```powershell
 $env:GRPC_TARGET="localhost:50051"
 node gateway/proxy/server.mjs    # 监听 :8081
 ```
 
-**6. 启动前端（Windows PowerShell）**
+**6. 启动前端（宿主机终端）**
 
 ```bash
 cd frontend && npm ci        # 首次安装依赖
@@ -218,13 +219,9 @@ cd frontend && npm run dev   # Vite 开发服务器
 
 > 注意：生产模式（docker compose）前端端口为 8080，开发模式（npm run dev）为 5173，两者不通用，访问前请确认启动方式。
 
-**7. 注册 Agent（WSL2 内，可选）**
+**7. 注册 Agent（Linux / WSL2 内，可选）**
 
-```bash
-./scripts/register_agents.sh
-```
-
-RegisterAgent 为 ADMIN 专属 RPC，登录用户须匹配 `NEXUSAI_ADMIN_USERNAME` 配置。
+通过 `client/` 交互式 CLI 或自定义脚本调用 `RegisterAgent`（ADMIN 专属 RPC，登录用户须匹配 `NEXUSAI_ADMIN_USERNAME` 配置）。
 
 ### 环境要求
 
@@ -293,7 +290,7 @@ agent-communication-and-tool-selection-framework/
 ├── client/                          # gRPC CLI + Agent 注册 SDK
 │
 ├── db/
-│   └── migrations/                  # V001–V013 只追加迁移（权威 schema）
+│   └── migrations/                  # V001–V015 只追加迁移（权威 schema）
 │
 ├── frontend/                        # Vue 3 + TypeScript + Vite
 │   └── src/
@@ -308,8 +305,7 @@ agent-communication-and-tool-selection-framework/
 │   └── e2e/                         #   发布 E2E 脚本
 ├── examples/                        # Agent 接入示例（Python）
 ├── docs/                            # 项目文档
-├── sql/                             # PostgreSQL 旧参考 schema（不执行）
-├── scripts/                         # 辅助脚本（bootstrap-wsl / register_agents）
+├── docker/                          # 容器构建文件
 ├── docker-compose.yml               # 一键容器栈（5 服务）
 ├── run.sh                           # 统一运行脚本
 ├── .env.example                     # 环境变量示例
@@ -347,7 +343,7 @@ agent-communication-and-tool-selection-framework/
 
 ## 测试与验证
 
-### C++ 测试（WSL2 内，37 套）
+### C++ 测试（Linux / WSL2 内，37 套）
 
 GTest 集成测试与 RapidCheck 属性测试相结合，覆盖 durable 查询管线、查询域仓储契约、预算仓储契约、工作流控制契约、Agent 运行时仓储契约、路由属性、熔断器、任务状态机等。涉及 PostgreSQL 的用例连接真实数据库执行，缺失环境变量时按约定 SKIP 而非伪造通过。
 
@@ -356,7 +352,7 @@ GTest 集成测试与 RapidCheck 属性测试相结合，覆盖 durable 查询�
 cd build && ctest --output-on-failure   # 等价方式
 ```
 
-### 网关契约测试（98 例）
+### 网关契约测试（116 例）
 
 位于 `gateway/proxy/test/`，覆盖平台契约、gRPC→HTTP 错误映射运行时契约、proto 与前端类型定义的字段级防漂移契约、前端静态守卫：
 
@@ -369,7 +365,7 @@ cd gateway/proxy && npm test
 `tests/e2e/e2e_pr_g_release.py` 启动编译产物 rpc_server 进程，连接真实 Docker PostgreSQL/Redis 与真实 HTTP A2A Agent，6 个场景共 25 个断言全部通过 psql 直查 PostgreSQL 验证，不做任何 mock：
 
 ```bash
-# WSL 仓库根目录（前置：./run.sh build、compose 的 postgres/redis 已发布宿主端口、grpcurl、psql）
+# Linux/WSL2 仓库根目录（前置：./run.sh build、compose 的 postgres/redis 已发布宿主端口、grpcurl、psql）
 python3 tests/e2e/e2e_pr_g_release.py
 ```
 
@@ -410,7 +406,7 @@ cd frontend && npm run build
 
 1. **实现 A2A AgentCard**：声明 Agent 的技能、端点、版本等元数据。
 2. **实现 A2A 接口**：支持 `message/send`（同步）或 `message/stream`（SSE 流式）。
-3. **启动并注册**：运行 Agent 服务后，由具备 ADMIN 角色的用户通过 `scripts/register_agents.sh` 注册到 gRPC Server。
+3. **启动并注册**：运行 Agent 服务后，由具备 ADMIN 角色的用户调用 `RegisterAgent` RPC 注册到 gRPC Server（`client/` CLI 可用）。
 
 Python 示例 Agent 见 [examples/](examples/) 目录（echo / math / translator / orchestrator）。
 
@@ -423,7 +419,7 @@ Python 示例 Agent 见 [examples/](examples/) 目录（echo / math / translator
 - etcd 注册中心不在本地支持边界内，仅当显式配置 `RPC_REGISTRY_ADDRESS=etcd://` 时可达。
 - MCP/RAG 为可选模块，默认关闭，需 `-DENABLE_MCP=ON` 构建。
 - Cron 定时调度与 Canary 灰度已按本地目标边界移除。
-- 用户画像摘要具备真实的 Redis + LLM 处理逻辑，但画像目前仅写入 Redis，未持久化到 PostgreSQL。
+- 用户画像链路已闭环：LLM 提取后写入 PostgreSQL（V004 `user_profiles`，成功即失效缓存投影）并在查询时读回注入；冲突消歧的消费者（画像重算）为规划中方向。
 
 ## 许可证
 

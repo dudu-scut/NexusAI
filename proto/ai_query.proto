@@ -30,6 +30,9 @@ message SystemContext {
     string user_memory = 2;                // Tier 2: long-term user memory (formatted text)
     string conversation_history = 3;       // Tier 1: current agent conversation history
     string cross_agent_summary = 4;        // Context summary when switching agents
+    // C2 方向4: hard facts the user stated (hints), separated from the
+    // platform-inferred profile text in user_memory ("[User Profile]").
+    string user_facts = 5;
 }
 
 // AI query request
@@ -47,6 +50,12 @@ message AIQueryRequest {
     // long-term memory (memory hints / agent-switch summary) write path;
     // budget/owner/trace/cost processing matches a normal query exactly.
     bool sandbox = 10;
+    // B1/U4 two-phase execution: when true, the run stops after planning —
+    // the plan event is delivered and the query_log is finalized as
+    // "planned" without executing the DAG. Execution is driven by a
+    // follow-up ExecutePlan call after user confirmation (frontend shows a
+    // confirm button). Budget for the planning LLM call is charged.
+    bool plan_only = 11;
 }
 
 // Artifact
@@ -82,14 +91,18 @@ message AIStreamEvent {
     //   "plan"              — multi-agent execution plan (content: ExecutionPlan JSON)
     //   "subtask_start"     — subtask started (task_state: subtask_id)
     //   "subtask_complete"  — subtask completed (task_state: subtask_id, content: result summary)
+    // Note: ObserveSession (sharing_service) also emits "snapshot" events on
+    // this message type. Fields trace_summary / activity_json /
+    // intervention_required are RESERVED but not yet wired end-to-end (no
+    // producer/consumer pair yet) — do not build behavior against them.
     string event_type = 2;
     string content = 3;
     string task_state = 4;
     string context_id = 5;
     int64 timestamp = 6;
-    string trace_summary = 8;      // Trace summary on 'complete' events
-    string activity_json = 9;      // JSON activity record for feed
-    bool intervention_required = 10; // True when user action is needed
+    string trace_summary = 8;      // reserved: trace summary on 'complete' events (not wired)
+    string activity_json = 9;      // reserved: JSON activity record for feed (not wired)
+    bool intervention_required = 10; // reserved: true when user action is needed (not wired)
 }
 
 // Query status request

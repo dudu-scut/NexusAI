@@ -11,6 +11,7 @@
 #include <future>
 #include <queue>
 #include <sstream>
+#include <unordered_set>
 
 namespace agent_rpc {
 namespace orchestrator {
@@ -64,7 +65,8 @@ std::unordered_map<std::string, SubTaskResult> TaskExecutor::execute(
     const ExecutionPlan& plan,
     const AgentCallFn& call_agent,
     const ProgressCallback& on_progress,
-    const CancelFn& on_cancel) {
+    const CancelFn& on_cancel,
+    const std::function<bool()>& cancelled) {
 
     std::unordered_map<std::string, SubTaskResult> results;
 
@@ -89,6 +91,26 @@ std::unordered_map<std::string, SubTaskResult> TaskExecutor::execute(
         task_map[t.id] = &t;
     }
 
+    // Client-disconnect propagation: when the probe reports cancellation,
+    // every not-yet-executed subtask is marked failed with executed=false
+    // (no agent was contacted, so per-agent health metrics must not be
+    // polluted) and execution stops immediately. Takes the start layer as a
+    // parameter because it is defined before the layer cursor.
+    auto markRemainingCancelled = [&](size_t from_layer) {
+        for (size_t li = from_layer; li < layers.size(); ++li) {
+            for (const auto& tid : layers[li]) {
+                if (results.find(tid) == results.end()) {
+                    SubTaskResult r;
+                    r.subtask_id = tid;
+                    r.success = false;
+                    r.executed = false;
+                    r.error_message = "Cancelled before execution";
+                    results[tid] = std::move(r);
+                }
+            }
+        }
+    };
+
     // Execute layer by layer
     size_t layer_idx = 0;
     for (const auto& layer : layers) {
@@ -102,11 +124,17 @@ std::unordered_map<std::string, SubTaskResult> TaskExecutor::execute(
                         SubTaskResult r;
                         r.subtask_id = tid;
                         r.success = false;
+                        r.executed = false;
                         r.error_message = "Global timeout exceeded";
                         results[tid] = std::move(r);
                     }
                 }
             }
+            break;
+        }
+
+        if (cancelled && cancelled()) {
+            markRemainingCancelled(layer_idx);
             break;
         }
 
@@ -134,6 +162,7 @@ std::unordered_map<std::string, SubTaskResult> TaskExecutor::execute(
                 SubTaskResult r;
                 r.subtask_id = tid;
                 r.success = false;
+                r.executed = false;
                 r.error_message = "Global timeout exceeded";
                 results[tid] = std::move(r);
                 // Mark remaining layers as timed out
@@ -143,6 +172,7 @@ std::unordered_map<std::string, SubTaskResult> TaskExecutor::execute(
                             SubTaskResult rr;
                             rr.subtask_id = rtid;
                             rr.success = false;
+                            rr.executed = false;
                             rr.error_message = "Global timeout exceeded";
                             results[rtid] = std::move(rr);
                         }
@@ -164,6 +194,7 @@ std::unordered_map<std::string, SubTaskResult> TaskExecutor::execute(
                 SubTaskResult r;
                 r.subtask_id = tid;
                 r.success = false;
+                r.executed = false;
                 r.error_message = e.what();
                 if (on_progress) {
                     on_progress({SubTaskEventType::FAILED, tid, r.error_message});
@@ -216,13 +247,29 @@ std::unordered_map<std::string, SubTaskResult> TaskExecutor::execute(
             auto remaining_now = std::chrono::duration_cast<std::chrono::milliseconds>(
                 global_deadline - std::chrono::steady_clock::now());
             auto wait_for = std::min(subtask_cap, remaining_now);
+            auto wait_start = std::chrono::steady_clock::now();
             auto status = fut.wait_for(wait_for);
             if (status == std::future_status::ready) {
                 result = fut.get();
             } else {
                 result.subtask_id = tid;
                 result.success = false;
-                result.error_message = "Subtask timeout exceeded";
+                // A real attempt was in flight — executed stays true so the
+                // timeout counts as a genuine health sample; record the
+                // actual wait duration instead of a misleading 0ms.
+                result.duration_ms = static_cast<int64_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - wait_start).count());
+                result.error_message = (wait_for >= remaining_now)
+                    ? "Global timeout exceeded"
+                    : "Subtask timeout exceeded";
+                // B3/P20-7: a write-shaped task may have already applied its
+                // effect — report UNCERTAIN instead of a plain failure.
+                if (st.effect == SubTask::Effect::SideEffect) {
+                    result.uncertain = true;
+                    result.error_message +=
+                        "; side-effect may have applied (unknown)";
+                }
                 // P20: abort the in-flight A2A call instead of leaving a
                 // zombie thread blocked until its HTTP timeout.
                 if (on_cancel && !cancel_url.empty()) {
@@ -279,6 +326,7 @@ std::unordered_map<std::string, SubTaskResult> TaskExecutor::execute(
                     SubTaskResult r;
                     r.subtask_id = tid;
                     r.success = false;
+                    r.executed = false;
                     r.error_message = e.what();
                     if (on_progress) {
                         on_progress({SubTaskEventType::FAILED, tid, r.error_message});
@@ -345,21 +393,45 @@ std::unordered_map<std::string, SubTaskResult> TaskExecutor::execute(
 
                     SubTaskResult result;
                     if (remaining <= std::chrono::milliseconds(0)) {
-                        // Deadline already passed — mark as timed out
+                        // Deadline already passed. The future was already
+                        // launched, so the worker may have a real HTTP call
+                        // in flight — keep executed=true and abort it, same
+                        // as the wait-timeout branch below (P3-2).
                         result.subtask_id = tid;
                         result.success = false;
                         result.error_message = "Global timeout exceeded";
+                        auto dead_target = layer_targets.find(tid);
+                        if (on_cancel && dead_target != layer_targets.end() &&
+                            !dead_target->second.first.empty()) {
+                            on_cancel(dead_target->second.first);
+                        }
                     } else {
                         // P20: wait no longer than the per-subtask cap OR the
                         // remaining global budget, whichever is tighter.
                         auto wait_for = std::min(subtask_cap, remaining);
+                        auto wait_start = std::chrono::steady_clock::now();
                         auto status = fut.wait_for(wait_for);
                         if (status == std::future_status::ready) {
                             result = fut.get();
                         } else {
                             result.subtask_id = tid;
                             result.success = false;
-                            result.error_message = "Global timeout exceeded (task did not complete in time)";
+                            // Real attempt in flight — executed stays true;
+                            // record the actual wait duration.
+                            result.duration_ms = static_cast<int64_t>(
+                                std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() - wait_start).count());
+                            result.error_message = (wait_for >= remaining)
+                                ? "Global timeout exceeded"
+                                : "Subtask timeout exceeded";
+                            // B3/P20-7: write-shaped task → UNCERTAIN.
+                            auto task_it = task_map.find(tid);
+                            if (task_it != task_map.end() &&
+                                task_it->second->effect == SubTask::Effect::SideEffect) {
+                                result.uncertain = true;
+                                result.error_message +=
+                                    "; side-effect may have applied (unknown)";
+                            }
                             // P20: abort the in-flight A2A call.
                             auto target_it = layer_targets.find(tid);
                             if (on_cancel && target_it != layer_targets.end() &&
@@ -421,11 +493,29 @@ std::vector<std::vector<std::string>> TaskExecutor::topologicalLayers(
     std::unordered_map<std::string, int> in_degree;
     std::unordered_map<std::string, std::vector<std::string>> dependents;
 
+    // Pass 1: collect the known id set (forward references allowed) and guard
+    // against duplicate task ids — a duplicated id would be emitted once via
+    // the shared in_degree map while total_emitted is compared against the
+    // raw task count, faking a "Circular dependency detected" failure.
+    std::unordered_set<std::string> known_ids;
     for (const auto& t : tasks) {
-        if (in_degree.find(t.id) == in_degree.end()) {
-            in_degree[t.id] = 0;
+        known_ids.insert(t.id);
+    }
+
+    // Pass 2: build in-degrees. First occurrence of an id wins; dependencies
+    // pointing at ids outside the task set are ignored (they can never be
+    // emitted, so counting them would wedge in_degree above zero and fake a
+    // cycle for an actually acyclic plan).
+    std::unordered_set<std::string> processed;
+    for (const auto& t : tasks) {
+        if (!processed.insert(t.id).second) {
+            continue;
         }
+        in_degree[t.id] = 0;
         for (const auto& dep : t.depends_on) {
+            if (known_ids.find(dep) == known_ids.end()) {
+                continue;
+            }
             dependents[dep].push_back(t.id);
             in_degree[t.id]++;
         }
@@ -470,11 +560,12 @@ std::vector<std::vector<std::string>> TaskExecutor::topologicalLayers(
     }
 
     // Cycle detection: if not all tasks were emitted, there's a cycle
+    // (in_degree holds one entry per unique task id).
     size_t total_emitted = 0;
     for (const auto& layer : layers) {
         total_emitted += layer.size();
     }
-    if (total_emitted < tasks.size()) {
+    if (total_emitted < in_degree.size()) {
         throw std::runtime_error(
             "Circular dependency detected in execution plan: " +
             std::to_string(tasks.size() - total_emitted) + " task(s) in cycle");

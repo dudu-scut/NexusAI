@@ -134,27 +134,73 @@
       </div>
 
       <div v-if="editingPlan" class="plan-editor glass">
-        <div v-for="task in editedTasks" :key="task.id" class="plan-editor-row">
+        <div
+          v-for="task in editedTasks"
+          :key="task.id"
+          class="plan-editor-row"
+          :class="{ 'plan-editor-row--cyclic': cyclicNodes.includes(task.id) }"
+        >
           <span class="plan-task-id">{{ task.id }}</span>
           <textarea
             v-model="task.description"
             class="plan-desc-input"
             rows="2"
+            :placeholder="cyclicNodes.includes(task.id) ? '位于依赖循环中' : ''"
           />
           <select v-model="task.agent_id" class="plan-agent-select">
             <option value="">自动路由</option>
             <option
               v-for="agent in availableAgents"
               :key="agent.service_name"
-              :value="agent.service_name"
+              :value="agentRegistryId(agent)"
             >
               {{ agent.service_name }}
             </option>
           </select>
+          <select
+            :value="''"
+            class="plan-dep-select"
+            title="选择依赖的前置任务"
+            @change="addDependency(task, ($event.target as HTMLSelectElement).value); ($event.target as HTMLSelectElement).value = ''"
+          >
+            <option value="" disabled>+ 依赖</option>
+            <option
+              v-for="other in editedTasks"
+              :key="'dep-' + other.id"
+              :value="other.id"
+              :disabled="other.id === task.id || task.dependencies.includes(other.id)"
+            >
+              {{ other.id }}
+            </option>
+          </select>
+          <div v-if="task.dependencies.length" class="plan-dep-chips">
+            <span
+              v-for="dep in task.dependencies"
+              :key="dep"
+              class="plan-dep-chip"
+              title="点击移除依赖"
+              @click="removeDependency(task, dep)"
+            >{{ dep }} ×</span>
+          </div>
         </div>
-        <button class="btn-send" :disabled="submittingPlan" @click="submitEditedPlan">
-          {{ submittingPlan ? '执行中…' : '执行编辑后的计划' }}
+        <div class="plan-editor-actions">
+          <button class="btn-text retry-btn" @click="addPlanTask">+ 添加子任务</button>
+          <button class="btn-send" :disabled="submittingPlan" @click="submitEditedPlan">
+            {{ submittingPlan ? '执行中…' : '执行编辑后的计划' }}
+          </button>
+        </div>
+      </div>
+
+      <!-- B1/U4 plan-only: confirm/abandon the delivered plan -->
+      <div
+        v-if="awaitingPlan && !chatStore.isStreaming"
+        class="retry-bar"
+      >
+        <span class="retry-reason">计划已生成，等待确认执行</span>
+        <button class="btn-text retry-btn" :disabled="rerunningPlan" @click="confirmPlan">
+          {{ rerunningPlan ? '执行中…' : '确认执行' }}
         </button>
+        <button class="btn-text retry-btn" @click="abandonPlan">放弃</button>
       </div>
 
       <div class="chat-input-area">
@@ -172,6 +218,15 @@
             @input="autoResize"
             ref="textareaRef"
           />
+          <button
+            v-if="!chatStore.isStreaming"
+            class="btn-text retry-btn"
+            :class="{ 'plan-only-active': planOnlyMode }"
+            :title="planOnlyMode ? '仅生成计划（不执行），确认后执行' : '切换为仅生成计划'"
+            @click="planOnlyMode = !planOnlyMode"
+          >
+            {{ planOnlyMode ? '仅计划 ✓' : '仅计划' }}
+          </button>
           <button
             v-if="chatStore.isStreaming"
             class="btn-stop"
@@ -280,7 +335,8 @@ function handleSend() {
   if (composing.value) return
   const text = inputText.value.trim()
   if (!text) return
-  chatStore.sendQuestion(text)
+  chatStore.sendQuestion(text, planOnlyMode.value)
+  planOnlyMode.value = false
   inputText.value = ''
   if (textareaRef.value) {
     textareaRef.value.style.height = 'auto'
@@ -398,6 +454,50 @@ async function rerunLastPlan() {
 const editingPlan = ref(false)
 const submittingPlan = ref(false)
 const availableAgents = ref<ServiceInfo[]>([])
+
+// The server registry key is the composite id "service_name-host-port"
+// (agent_service.cpp), not the bare service_name. The plan editor dropdown
+// and metrics lookups must submit that id — a bare service_name silently
+// misses router->getAgent() and falls back to description routing.
+function agentRegistryId(agent: ServiceInfo): string {
+  return `${agent.service_name}-${agent.host}-${agent.port}`
+}
+
+// A4 phase 2: dependency editing state.
+const cyclicNodes = ref<string[]>([])
+
+// B1/U4: plan-only toggle + confirm/abandon of a delivered plan.
+const planOnlyMode = ref(false)
+const awaitingPlan = computed(() =>
+  chatStore.messages.some((m) => m.awaitingConfirmation),
+)
+
+async function confirmPlan() {
+  await rerunLastPlan()
+  for (const m of chatStore.messages) {
+    if (m.awaitingConfirmation) m.awaitingConfirmation = false
+  }
+}
+
+function abandonPlan() {
+  for (const m of chatStore.messages) {
+    if (m.awaitingConfirmation) {
+      m.awaitingConfirmation = false
+      m.content += '\n[计划已放弃]'
+    }
+  }
+  addActivity('thinking', 'Plan abandoned by user')
+}
+
+function addDependency(task: { id: string; dependencies: string[] }, dep: string) {
+  if (!dep || dep === task.id || task.dependencies.includes(dep)) return
+  task.dependencies.push(dep)
+}
+
+function removeDependency(task: { id: string; dependencies: string[] }, dep: string) {
+  const idx = task.dependencies.indexOf(dep)
+  if (idx >= 0) task.dependencies.splice(idx, 1)
+}
 const editedTasks = ref<
   Array<{ id: string; description: string; agent_id: string; dependencies: string[] }>
 >([])
@@ -428,6 +528,16 @@ async function openPlanEditor() {
 
 async function submitEditedPlan() {
   if (submittingPlan.value) return
+  // A4 phase 2: client-side Kahn pre-check — a cyclic edit is rejected with
+  // the offending nodes highlighted instead of a mid-execution server error.
+  const cyclic = findCycleNodes(editedTasks.value)
+  if (cyclic.length > 0) {
+    cyclicNodes.value = cyclic
+    toast?.addToast({ type: 'error', message: '依赖关系存在循环，无法执行' })
+    addActivity('error', `Plan has a dependency cycle involving: ${cyclic.join(', ')}`)
+    return
+  }
+  cyclicNodes.value = []
   submittingPlan.value = true
   try {
     const dag: DAGStructure = {
@@ -448,6 +558,47 @@ async function submitEditedPlan() {
   } finally {
     submittingPlan.value = false
   }
+}
+
+// A4 phase 2: add a new subtask row to the edited plan.
+function addPlanTask() {
+  let seq = editedTasks.value.length + 1
+  let id = `n${seq}`
+  while (editedTasks.value.some(t => t.id === id)) {
+    id = `n${++seq}`
+  }
+  editedTasks.value.push({ id, description: '', agent_id: '', dependencies: [] })
+}
+
+// A4 phase 2: Kahn topological check — returns the ids on/leading-into a
+// cycle (nodes never emitted), empty when the dependency graph is a DAG.
+function findCycleNodes(
+  tasks: Array<{ id: string; dependencies: string[] }>,
+): string[] {
+  const inDegree = new Map<string, number>()
+  const dependents = new Map<string, string[]>()
+  for (const t of tasks) {
+    if (!inDegree.has(t.id)) inDegree.set(t.id, 0)
+    for (const dep of t.dependencies) {
+      if (dep === t.id || !tasks.some(x => x.id === dep)) continue // self/unknown dep
+      inDegree.set(t.id, (inDegree.get(t.id) ?? 0) + 1)
+      const list = dependents.get(dep) ?? []
+      list.push(t.id)
+      dependents.set(dep, list)
+    }
+  }
+  const queue = [...inDegree.entries()].filter(([, d]) => d === 0).map(([id]) => id)
+  const emitted = new Set<string>()
+  while (queue.length) {
+    const id = queue.shift() as string
+    emitted.add(id)
+    for (const nxt of dependents.get(id) ?? []) {
+      const d = (inDegree.get(nxt) ?? 0) - 1
+      inDegree.set(nxt, d)
+      if (d === 0) queue.push(nxt)
+    }
+  }
+  return tasks.filter(t => !emitted.has(t.id)).map(t => t.id)
 }
 
 // Auto-scroll
@@ -1099,5 +1250,45 @@ textarea::placeholder {
   .feature-card {
     animation: none;
   }
+}
+
+/* A4 phase 2: plan editor dependency editing */
+.plan-editor-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.plan-editor-row--cyclic .plan-desc-input {
+  border-color: #e05252;
+  background: rgba(224, 82, 82, 0.08);
+}
+.plan-dep-select {
+  max-width: 110px;
+  border-radius: 8px;
+  padding: 4px 6px;
+  font-size: 12px;
+}
+.plan-dep-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  width: 100%;
+}
+.plan-dep-chip {
+  cursor: pointer;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: rgba(120, 120, 140, 0.18);
+}
+.plan-dep-chip:hover {
+  background: rgba(224, 82, 82, 0.25);
+}
+.plan-editor-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 4px;
 }
 </style>

@@ -151,9 +151,11 @@ void AgentRouter::shutdown() {
     initialized_ = false;
 }
 
-std::optional<AgentInfo> AgentRouter::selectAgent(
+AgentRouter::RouteDecision AgentRouter::selectAgentDetailed(
     const std::string& question,
     const std::vector<std::string>& required_skills) {
+
+    RouteDecision decision;
 
     // Phase 1: Determine skills to match (intent analysis).
     // Restructured pipeline: Embedding → LLM → Keyword → Fallback
@@ -170,12 +172,16 @@ std::optional<AgentInfo> AgentRouter::selectAgent(
         // (a cached intent costs zero extra embed calls).
         std::vector<float> query_vector;
         bool have_query_vector = false;
+        double embedding_similarity = 0.0;
         if (isEmbeddingEnabled()) {
-            std::string emb_skill =
-                analyzeRequiredSkillEmbedding(question, &query_vector);
+            std::string emb_skill = analyzeRequiredSkillEmbedding(
+                question, &query_vector, &embedding_similarity);
             have_query_vector = !query_vector.empty();
             if (!emb_skill.empty()) {
                 skills_to_match.push_back(emb_skill);
+                decision.skill = emb_skill;
+                decision.source = "embedding";
+                decision.confidence = embedding_similarity;
             }
         }
 
@@ -188,6 +194,8 @@ std::optional<AgentInfo> AgentRouter::selectAgent(
                 if (have_query_vector) {
                     storeIntentCache(query_vector, llm_skill);
                 }
+                decision.skill = llm_skill;
+                decision.source = "llm";
             }
         }
 
@@ -197,14 +205,19 @@ std::optional<AgentInfo> AgentRouter::selectAgent(
             std::string detected_skill = analyzeRequiredSkill(question);
             if (!detected_skill.empty()) {
                 skills_to_match.push_back(detected_skill);
+                decision.skill = detected_skill;
+                decision.source = "idf";
             }
         }
 
         // Tier 3: Fallback — mark for Phase 2 to pick any healthy agent
         if (skills_to_match.empty()) {
             used_fallback = true;
+            decision.source = "fallback";
         }
     }
+
+    decision.used_fallback = used_fallback;
 
     // Phase 2: Filter candidates under the lock, then run strategy selection
     // OUTSIDE the lock — quality lookups may hit PostgreSQL via the injected
@@ -214,7 +227,7 @@ std::optional<AgentInfo> AgentRouter::selectAgent(
         std::lock_guard<std::mutex> lock(agents_mutex_);
 
         if (agents_.empty()) {
-            return std::nullopt;
+            return decision;
         }
 
         // Build candidate list.
@@ -249,10 +262,20 @@ std::optional<AgentInfo> AgentRouter::selectAgent(
     }
 
     if (candidates.empty()) {
-        return std::nullopt;
+        return decision;
     }
 
-    return selectByStrategy(candidates);
+    decision.agent = selectByStrategy(candidates, question);
+    return decision;
+}
+
+std::optional<AgentInfo> AgentRouter::selectAgent(
+    const std::string& question,
+    const std::vector<std::string>& required_skills) {
+    // P12(a): thin forwarder — the four-tier body lives in
+    // selectAgentDetailed so callers can also obtain the routing
+    // confidence/source metadata.
+    return selectAgentDetailed(question, required_skills).agent;
 }
 
 AgentRouter::DispatchResult AgentRouter::dispatch(
@@ -341,17 +364,30 @@ std::vector<AgentInfo> AgentRouter::findHealthyAgentsWithSkills(
 
 void AgentRouter::updateAgentList(const std::vector<AgentInfo>& agents) {
     std::lock_guard<std::mutex> lock(agents_mutex_);
-    
+
+    // Snapshot the OLD skill set first: skills carried only by agents that
+    // disappear wholesale must still have their cached intents invalidated
+    // (the loop below only sees the NEW list).
+    std::vector<std::string> old_skills;
+    for (const auto& [id, agent] : agents_) {
+        (void)id;
+        old_skills.insert(old_skills.end(), agent.skills.begin(), agent.skills.end());
+    }
+
     agents_.clear();
     for (const auto& agent : agents) {
         agents_[agent.id] = agent;
     }
     rebuildSkillKeywordIndex();
     // P10(c): the cache stores intents keyed by skill name (agent_id slot
-    // carries the skill); invalidate every known skill because the skill
-    // set just changed wholesale. (MCP-only member — no-op otherwise.)
+    // carries the skill); invalidate the old skill set plus every known new
+    // skill because the skill set just changed wholesale. (MCP-only member —
+    // no-op otherwise.)
 #ifdef AGENT_RPC_ENABLE_MCP
     if (intent_cache_) {
+        for (const auto& skill : old_skills) {
+            intent_cache_->invalidateAgent(skill);
+        }
         for (const auto& [id, agent] : agents_) {
             (void)id;
             for (const auto& skill : agent.skills) {
@@ -653,7 +689,8 @@ void AgentRouter::rebuildSkillKeywordIndex() {
     }
 }
 
-AgentInfo AgentRouter::selectByStrategy(const std::vector<AgentInfo>& candidates) {
+AgentInfo AgentRouter::selectByStrategy(const std::vector<AgentInfo>& candidates,
+                                        const std::string& lb_key) {
     if (candidates.size() == 1) {
         return candidates[0];
     }
@@ -669,7 +706,7 @@ AgentInfo AgentRouter::selectByStrategy(const std::vector<AgentInfo>& candidates
         default:
             // For skill match, weight by quality coefficient from feedback (Batch 2).
             // Fall back to round-robin if Redis is unavailable (all coefficients equal default).
-            return selectWeightedByQualityWithFallback(candidates);
+            return selectWeightedByQualityWithFallback(candidates, lb_key);
     }
 }
 
@@ -727,7 +764,8 @@ AgentInfo AgentRouter::selectWeightedByQuality(const std::vector<AgentInfo>& can
     return candidates.back();
 }
 
-AgentInfo AgentRouter::selectWeightedByQualityWithFallback(const std::vector<AgentInfo>& candidates) {
+AgentInfo AgentRouter::selectWeightedByQualityWithFallback(const std::vector<AgentInfo>& candidates,
+                                                           const std::string& lb_key) {
     // Check if all candidates have the same quality coefficient (default 0.75),
     // which happens when Redis is unavailable or no feedback data exists.
     // In that case, fall back to round-robin for fair load distribution.
@@ -739,7 +777,7 @@ AgentInfo AgentRouter::selectWeightedByQualityWithFallback(const std::vector<Age
     // to the same legacy path instead of dropping the request.
     ensureLbInitialized();
     if (lb_manager_) {
-        if (auto picked = selectViaLoadBalancer(candidates)) {
+        if (auto picked = selectViaLoadBalancer(candidates, lb_key)) {
             return *picked;
         }
     }
@@ -817,7 +855,7 @@ void AgentRouter::ensureLbInitialized() {
 }
 
 std::optional<AgentInfo> AgentRouter::selectViaLoadBalancer(
-    const std::vector<AgentInfo>& candidates) {
+    const std::vector<AgentInfo>& candidates, const std::string& lb_key) {
     // Composition semantics (P8):
     // 1. Health filtering already happened when the candidate list was built
     //    (skill match keeps healthy agents only, and circuit-broken agents
@@ -879,7 +917,17 @@ std::optional<AgentInfo> AgentRouter::selectViaLoadBalancer(
                 lb_endpoint_fingerprint_ = fingerprint;
             }
         }
-        const common::ServiceEndpoint picked = lb_manager_->selectEndpoint(endpoints);
+        // consistent_hash must be DETERMINISTIC (same key → same endpoint):
+        // the generic selectEndpoint() picks a fresh random key per call,
+        // which made the strategy indistinguishable from random. Route by
+        // the caller-provided key (the user question) through the FNV-1a
+        // ring instead. Other strategies keep the stateful selectEndpoint().
+        std::optional<common::ServiceEndpoint> by_key;
+        if (!lb_key.empty()) {
+            by_key = lb_manager_->selectEndpointByKey(lb_key, endpoints);
+        }
+        const common::ServiceEndpoint picked =
+            by_key ? *by_key : lb_manager_->selectEndpoint(endpoints);
 
         // Map the picked endpoint back onto the original AgentInfo.
         auto id_it = picked.metadata.find("agent_id");
@@ -1202,7 +1250,8 @@ AgentRouter::searchBestSkillEmbeddingLockedWithVector(
 
 std::string AgentRouter::analyzeRequiredSkillEmbedding(
     const std::string& question,
-    std::vector<float>* out_query_vector) {
+    std::vector<float>* out_query_vector,
+    double* out_similarity) {
     if (!isEmbeddingEnabled()) return {};
 
     embedding_query_count_.fetch_add(1);
@@ -1232,6 +1281,9 @@ std::string AgentRouter::analyzeRequiredSkillEmbedding(
     auto best = searchBestSkillEmbeddingLockedWithVector(query_embedding);
     if (best && best->second >= embedding_config_.high_threshold) {
         embedding_hit_count_.fetch_add(1);
+        if (out_similarity) {
+            *out_similarity = best->second;
+        }
         return best->first;
     }
 
@@ -1278,7 +1330,8 @@ bool AgentRouter::isEmbeddingEnabled() const { return false; }
 void AgentRouter::buildSkillEmbeddingIndex() {}
 
 std::string AgentRouter::analyzeRequiredSkillEmbedding(const std::string&,
-                                                       std::vector<float>*) { return {}; }
+                                                       std::vector<float>*,
+                                                       double*) { return {}; }
 
 void AgentRouter::storeIntentCache(const std::vector<float>&,
                                    const std::string&) {}
@@ -1293,6 +1346,47 @@ AgentRouter::searchBestSkillEmbeddingLockedWithVector(
 std::optional<AgentRouter::HighConfidenceSkill>
 AgentRouter::resolveHighConfidenceSkill(const std::string&) { return std::nullopt; }
 #endif
+
+std::vector<std::pair<std::string, double>> AgentRouter::rankSkillsBySimilarity(
+    const std::string& question, int top_k, float threshold) {
+    std::vector<std::pair<std::string, double>> ranked;
+#ifdef AGENT_RPC_ENABLE_MCP
+    if (!isEmbeddingEnabled() || top_k <= 0) {
+        return ranked;
+    }
+    std::vector<float> query_embedding;
+    {
+        std::lock_guard<std::mutex> lock(embedding_mutex_);
+        try {
+            query_embedding = embedding_service_->embed(question);
+        } catch (const std::exception&) {
+            return ranked;  // embedding unavailable — caller uses full set
+        }
+        const auto hits = skill_index_->search(query_embedding, top_k, threshold);
+        // Per-agent duplicate entries (one entry per agent × skill) share the
+        // same skill name — aggregate by name keeping the best similarity so
+        // a skill with N registered agents ranks once.
+        std::unordered_map<std::string, double> best;
+        for (const auto& hit : hits) {
+            double& current = best[hit.tool.name];
+            if (hit.similarity > current) {
+                current = hit.similarity;
+            }
+        }
+        ranked.reserve(best.size());
+        for (const auto& [skill, similarity] : best) {
+            ranked.emplace_back(skill, similarity);
+        }
+        std::sort(ranked.begin(), ranked.end(),
+                  [](const auto& a, const auto& b) { return a.second > b.second; });
+    }
+#else
+    (void)question;
+    (void)top_k;
+    (void)threshold;
+#endif
+    return ranked;
+}
 
 std::string AgentRouter::findFallbackAgent(const std::string& skill_name, const std::string& exclude_agent_id) {
     std::lock_guard<std::mutex> lock(agents_mutex_);

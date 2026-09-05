@@ -17,6 +17,8 @@
 #include "ai_query.pb.h"
 
 #include <future>
+#include <tuple>
+#include <unordered_map>
 
 #ifdef _WIN32
 #include <objbase.h>
@@ -43,6 +45,10 @@ struct HintDedupIndex {
     std::mutex mutex;
     std::unique_ptr<agent_rpc::mcp::rag::EmbeddingService> embedding;
     std::unique_ptr<agent_rpc::mcp::rag::VectorIndex> index;
+    // B7 (P11): composite text → (key, value), so the recall side can map a
+    // search hit back to the structured hint instead of a raw string.
+    std::unordered_map<std::string, std::pair<std::string, std::string>>
+        kv_by_text_;
 
     bool ensureInitializedLocked() {
         if (embedding) return true;
@@ -87,6 +93,37 @@ struct HintDedupIndex {
         } catch (const std::exception&) {
             // Best-effort: a missed dedup entry only costs a future embed.
         }
+    }
+
+    // B7 (P11): remember a structured hint (composite text is the embedding
+    // and the index key; the kv map enables structured recall).
+    void rememberHint(const std::string& key, const std::string& value) {
+        const std::string text = key + ": " + value;
+        remember(text);
+        std::lock_guard<std::mutex> lock(mutex);
+        kv_by_text_[text] = {key, value};
+    }
+
+    // B7 (P11): top-k structured hints most similar to the query text.
+    std::vector<std::tuple<std::string, std::string, double>> searchSimilar(
+        const std::string& query_text, int top_k, float threshold) {
+        std::vector<std::tuple<std::string, std::string, double>> out;
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!ensureInitializedLocked()) return out;
+        try {
+            auto vec = embedding->embed(query_text);
+            auto hits = index->search(vec, top_k, threshold);
+            for (const auto& hit : hits) {
+                auto it = kv_by_text_.find(hit.tool.name);
+                if (it != kv_by_text_.end()) {
+                    out.emplace_back(it->second.first, it->second.second,
+                                     static_cast<double>(hit.similarity));
+                }
+            }
+        } catch (const std::exception&) {
+            // Recall is best-effort — callers fall back to full injection.
+        }
+        return out;
     }
 };
 
@@ -460,7 +497,7 @@ void QueryHelpers::maybeExtractMemorySegment(
 #ifdef AGENT_RPC_ENABLE_MCP
                         if (dedup_enabled) {
                             for (const auto& [k, v] : hints) {
-                                hintDedupIndex().remember(k + ": " + v);
+                                hintDedupIndex().rememberHint(k, v);
                             }
                         }
 #endif
@@ -493,6 +530,22 @@ void QueryHelpers::maybeExtractMemorySegment(
     }
 }
 
+std::vector<QueryHelpers::RelevantHint> QueryHelpers::recallRelevantHints(
+    const std::string& query_text, int top_k, float threshold) {
+    std::vector<QueryHelpers::RelevantHint> out;
+#ifdef AGENT_RPC_ENABLE_MCP
+    for (const auto& [key, value, similarity] :
+         hintDedupIndex().searchSimilar(query_text, top_k, threshold)) {
+        out.push_back(QueryHelpers::RelevantHint{key, value, similarity});
+    }
+#else
+    (void)query_text;
+    (void)top_k;
+    (void)threshold;
+#endif
+    return out;
+}
+
 std::string QueryHelpers::buildMemoryContext(
     const agent_communication::AIQueryRequest* request) {
     std::string memory_ctx;
@@ -500,6 +553,12 @@ std::string QueryHelpers::buildMemoryContext(
         const auto& sys_ctx = request->system_context();
         if (!sys_ctx.user_memory().empty()) {
             memory_ctx += "[User Context]\n" + sys_ctx.user_memory() + "\n";
+        }
+        // C2 direction 4 (P1-1): user-stated facts live in the dedicated
+        // user_facts field — they MUST reach the prompt or the Tier-2
+        // memory write/read loop silently loses its payload.
+        if (!sys_ctx.user_facts().empty()) {
+            memory_ctx += "[User Facts]\n" + sys_ctx.user_facts() + "\n";
         }
         if (!sys_ctx.cross_agent_summary().empty()) {
             memory_ctx += "[Prior Context]\n" + sys_ctx.cross_agent_summary() + "\n";

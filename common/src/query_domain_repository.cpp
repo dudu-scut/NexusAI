@@ -122,6 +122,7 @@ RouteQualityRecord routeQualityFromRow(const Row& row) {
         .id = row["id"].template as<std::string>(),
         .owner_id = row["owner_id"].template as<std::string>(),
         .agent_id = row["agent_id"].template as<std::string>(),
+        .skill_name = row["skill_name"].template as<std::string>(),
         .sample_count = row["sample_count"].template as<std::int64_t>(),
         .average_rating = row["average_rating"].template as<std::string>(),
         .routing_weight = row["routing_weight"].template as<std::string>(),
@@ -445,10 +446,16 @@ std::optional<QueryLogRecord> QueryDomainRepository::getLatestQueryLogByConversa
 bool QueryDomainRepository::updateQueryLog(const QueryLogRecord& query_log) {
     bool updated = false;
     store_.executeTransaction([&](pqxx::work& transaction) {
+        // Terminal states are immutable: a late retry (same request_id) or a
+        // racing run must never roll a persisted terminal state back to
+        // anything else. Transitions from "running"/"pending" stay free.
         const auto result = execParams(
             transaction,
             "UPDATE query_logs SET response_text = $3, model = $4, status = $5, "
-            "updated_at = NOW() WHERE owner_id = $1 AND id = $2 RETURNING id",
+            "updated_at = NOW() WHERE owner_id = $1 AND id = $2 "
+            "AND (status IS NULL OR status NOT IN "
+            "('completed', 'failed', 'cancelled', 'rejected', 'planned')) "
+            "RETURNING id",
             query_log.owner_id, query_log.id, query_log.response_text, query_log.model,
             query_log.status);
         updated = !result.empty();
@@ -500,12 +507,16 @@ std::optional<TraceRecord> QueryDomainRepository::getTraceById(const std::string
 bool QueryDomainRepository::updateTrace(const TraceRecord& trace) {
     bool updated = false;
     store_.executeTransaction([&](pqxx::work& transaction) {
+        // Terminal states are immutable (same contract as updateQueryLog).
         const auto result = execParams(
             transaction,
             "UPDATE traces SET "
             "trace_payload = COALESCE(NULLIF($3, '')::jsonb, trace_payload), "
             "status = $4, updated_at = NOW() "
-            "WHERE owner_id = $1 AND id = $2 RETURNING id",
+            "WHERE owner_id = $1 AND id = $2 "
+            "AND (status IS NULL OR status NOT IN "
+            "('completed', 'failed', 'cancelled', 'rejected', 'planned')) "
+            "RETURNING id",
             trace.owner_id, trace.id, trace.trace_payload, trace.status);
         updated = !result.empty();
     });
@@ -582,10 +593,14 @@ std::optional<RouteQualityRecord> QueryDomainRepository::getRouteQuality(
     store_.executeTransaction([&](pqxx::work& transaction) {
         const auto result = execParams(
             transaction,
-            "SELECT id, owner_id, agent_id, sample_count, "
+            "SELECT id, owner_id, agent_id, skill_name, sample_count, "
             "average_rating::text AS average_rating, routing_weight::text AS routing_weight, "
             "created_at::text AS created_at, updated_at::text AS updated_at "
-            "FROM agent_route_quality WHERE owner_id = $1 AND agent_id = $2",
+            "FROM agent_route_quality WHERE owner_id = $1 AND agent_id = $2 "
+            // V013 made (owner, agent, skill) the uniqueness grain, so a plain
+            // (owner, agent) lookup can match several skill rows — keep the
+            // read deterministic instead of implementation-ordered.
+            "ORDER BY updated_at DESC, skill_name ASC LIMIT 1",
             owner_id, agent_id);
         if (!result.empty()) {
             quality = routeQualityFromRow(result.front());
@@ -600,22 +615,312 @@ bool QueryDomainRepository::upsertRouteQuality(const RouteQualityRecord& quality
         const auto result = execParams(
             transaction,
             "INSERT INTO agent_route_quality "
-            "(id, owner_id, agent_id, sample_count, average_rating, routing_weight, created_at, updated_at) "
-            "VALUES ($1, $2, $3, $4, COALESCE(NULLIF($5, '')::numeric, 0::numeric), "
-            "COALESCE(NULLIF($6, '')::numeric, 1::numeric), "
-            "COALESCE(NULLIF($7, '')::timestamptz, NOW()), "
-            "COALESCE(NULLIF($8, '')::timestamptz, NOW())) "
-            "ON CONFLICT (owner_id, agent_id) DO UPDATE SET "
+            "(id, owner_id, agent_id, skill_name, sample_count, average_rating, routing_weight, created_at, updated_at) "
+            "VALUES ($1, $2, $3, $4, $5, COALESCE(NULLIF($6, '')::numeric, 0::numeric), "
+            "COALESCE(NULLIF($7, '')::numeric, 1::numeric), "
+            "COALESCE(NULLIF($8, '')::timestamptz, NOW()), "
+            "COALESCE(NULLIF($9, '')::timestamptz, NOW())) "
+            // V013 replaced (owner_id, agent_id) uniqueness with the
+            // skill-scoped constraint; the old conflict target no longer
+            // exists and would fail at runtime (42P10-style error).
+            "ON CONFLICT (owner_id, agent_id, skill_name) DO UPDATE SET "
             "sample_count = EXCLUDED.sample_count, "
             "average_rating = EXCLUDED.average_rating, "
             "routing_weight = EXCLUDED.routing_weight, "
             "updated_at = EXCLUDED.updated_at "
             "RETURNING id",
-            quality.id, quality.owner_id, quality.agent_id, quality.sample_count,
-            quality.average_rating, quality.routing_weight, quality.created_at, quality.updated_at);
+            quality.id, quality.owner_id, quality.agent_id, quality.skill_name,
+            quality.sample_count, quality.average_rating, quality.routing_weight,
+            quality.created_at, quality.updated_at);
         written = !result.empty();
     });
     return written;
+}
+
+// ============================================================================
+// B4 (P14d): agent health snapshots — durable projection of the 30s
+// health_evaluation verdicts (V014 agent_health_snapshots).
+// ============================================================================
+
+bool QueryDomainRepository::upsertAgentHealthSnapshot(
+    const AgentHealthSnapshotRecord& snapshot) {
+    bool written = false;
+    store_.executeTransaction([&](pqxx::work& transaction) {
+        const auto result = execParams(
+            transaction,
+            "INSERT INTO agent_health_snapshots "
+            "(agent_id, health_status, success_rate, ema_latency_ms, total_calls, sampled_at) "
+            "VALUES ($1, $2, $3, $4, $5, NOW()) "
+            "ON CONFLICT (agent_id) DO UPDATE SET "
+            "health_status = EXCLUDED.health_status, "
+            "success_rate = EXCLUDED.success_rate, "
+            "ema_latency_ms = EXCLUDED.ema_latency_ms, "
+            "total_calls = EXCLUDED.total_calls, "
+            "sampled_at = NOW() "
+            "RETURNING agent_id",
+            snapshot.agent_id, snapshot.health_status, snapshot.success_rate,
+            snapshot.ema_latency_ms, snapshot.total_calls);
+        written = !result.empty();
+    });
+    return written;
+}
+
+std::vector<AgentHealthSnapshotRecord> QueryDomainRepository::listAgentHealthSnapshots(
+    std::int64_t max_age_seconds) {
+    std::vector<AgentHealthSnapshotRecord> snapshots;
+    if (max_age_seconds <= 0) {
+        max_age_seconds = 600;
+    }
+    store_.executeTransaction([&](pqxx::work& transaction) {
+        const auto result = execParams(
+            transaction,
+            "SELECT agent_id, health_status, success_rate::text AS success_rate, "
+            "ema_latency_ms::text AS ema_latency_ms, total_calls "
+            "FROM agent_health_snapshots "
+            "WHERE sampled_at > NOW() - ($1::text || ' seconds')::interval "
+            "ORDER BY agent_id",
+            std::to_string(max_age_seconds));
+        for (const auto& row : result) {
+            AgentHealthSnapshotRecord record;
+            record.agent_id = row["agent_id"].template as<std::string>();
+            record.health_status = row["health_status"].template as<std::string>();
+            record.success_rate = std::stod(row["success_rate"].template as<std::string>());
+            record.ema_latency_ms = std::stod(row["ema_latency_ms"].template as<std::string>());
+            record.total_calls = row["total_calls"].template as<std::int64_t>();
+            snapshots.push_back(std::move(record));
+        }
+    });
+    return snapshots;
+}
+
+// ============================================================================
+// B5 (P17n): user profile PG wiring — V004 user_profiles (identity/preferences
+// JSONB) is the durable source; the user_profile:<uid> cache key is a
+// ============================================================================
+
+bool QueryDomainRepository::upsertUserProfile(const UserProfileRecord& profile) {
+    bool written = false;
+    store_.executeTransaction([&](pqxx::work& transaction) {
+        const auto result = execParams(
+            transaction,
+            "INSERT INTO user_profiles (user_id, identity, preferences, context_snapshot, updated_at) "
+            "VALUES ($1, COALESCE(NULLIF($2, '')::jsonb, '{}'::jsonb), "
+            "COALESCE(NULLIF($3, '')::jsonb, '[]'::jsonb), "
+            "COALESCE(NULLIF($4, '')::jsonb, '{}'::jsonb), NOW()) "
+            "ON CONFLICT (user_id) DO UPDATE SET "
+            "identity = EXCLUDED.identity, "
+            "preferences = EXCLUDED.preferences, "
+            "context_snapshot = EXCLUDED.context_snapshot, "
+            "updated_at = NOW() "
+            "RETURNING user_id",
+            profile.user_id, profile.identity, profile.preferences,
+            profile.context_snapshot);
+        written = !result.empty();
+    });
+    return written;
+}
+
+std::optional<UserProfileRecord> QueryDomainRepository::getUserProfile(
+    const std::string& user_id) {
+    std::optional<UserProfileRecord> profile;
+    store_.executeTransaction([&](pqxx::work& transaction) {
+        const auto result = execParams(
+            transaction,
+            "SELECT user_id, identity::text AS identity, preferences::text AS preferences, "
+            "context_snapshot::text AS context_snapshot "
+            "FROM user_profiles WHERE user_id = $1",
+            user_id);
+        if (!result.empty()) {
+            const auto& row = result.front();
+            UserProfileRecord record;
+            record.user_id = row["user_id"].template as<std::string>();
+            record.identity = row["identity"].template as<std::string>();
+            record.preferences = row["preferences"].template as<std::string>();
+            record.context_snapshot = row["context_snapshot"].template as<std::string>();
+            profile = std::move(record);
+        }
+    });
+    return profile;
+}
+
+// ============================================================================
+// projection (see memory_service.h for the key classification).
+// C1 (V015): memory-domain durable records.
+// ============================================================================
+
+bool QueryDomainRepository::upsertUserMemoryHint(const UserMemoryHintRecord& hint,
+                                                 bool append_history) {
+    bool written = false;
+    store_.executeTransaction([&](pqxx::work& transaction) {
+        // append_history (C2 方向3): a fact overwrite moves the previous
+        // value into the JSONB history array instead of destroying it.
+        const auto result = execParams(
+            transaction,
+            "INSERT INTO user_memory_hints (owner_id, mem_key, mem_value, source, updated_at) "
+            "VALUES ($1, $2, $3, $4, NOW()) "
+            "ON CONFLICT (owner_id, mem_key) DO UPDATE SET "
+            "mem_value = EXCLUDED.mem_value, "
+            "source = EXCLUDED.source, "
+            "history = CASE WHEN $5 THEN "
+            "  history || to_jsonb(user_memory_hints.mem_value) "
+            "ELSE history END, "
+            "updated_at = NOW() "
+            "RETURNING mem_key",
+            hint.owner_id, hint.key, hint.value, hint.source, append_history);
+        written = !result.empty();
+    });
+    return written;
+}
+
+bool QueryDomainRepository::insertUserMemoryHintIfAbsent(
+    const UserMemoryHintRecord& hint) {
+    bool inserted = false;
+    store_.executeTransaction([&](pqxx::work& transaction) {
+        const auto result = execParams(
+            transaction,
+            // NOT EXISTS (not an ON-CONFLICT-noop) on purpose: the contract
+            // test pins message-sequence conflicts as the sole noop-upsert
+            // idempotency path in this repository.
+            "INSERT INTO user_memory_hints (owner_id, mem_key, mem_value, source, updated_at) "
+            "SELECT $1, $2, $3, $4, NOW() "
+            "WHERE NOT EXISTS (SELECT 1 FROM user_memory_hints "
+            "WHERE owner_id = $1 AND mem_key = $2) "
+            "RETURNING mem_key",
+            hint.owner_id, hint.key, hint.value, hint.source);
+        inserted = !result.empty();
+    });
+    return inserted;
+}
+
+bool QueryDomainRepository::deleteUserMemoryHint(const std::string& owner_id,
+                                                 const std::string& key) {
+    bool deleted = false;
+    store_.executeTransaction([&](pqxx::work& transaction) {
+        const auto result = execParams(
+            transaction,
+            "DELETE FROM user_memory_hints WHERE owner_id = $1 AND mem_key = $2 "
+            "RETURNING mem_key",
+            owner_id, key);
+        deleted = !result.empty();
+    });
+    return deleted;
+}
+
+bool QueryDomainRepository::applyUserMemoryHintBatch(
+    const std::string& owner_id, const std::vector<UserMemoryHintOp>& ops) {
+    bool written = false;
+    // Single transaction: all hint mutations plus their event rows commit
+    // atomically, so the durable state is either the full batch or nothing.
+    store_.executeTransaction([&](pqxx::work& transaction) {
+        for (const auto& op : ops) {
+            if (op.kind == UserMemoryHintOp::Kind::Delete) {
+                execParams(
+                    transaction,
+                    "DELETE FROM user_memory_hints WHERE owner_id = $1 AND mem_key = $2 "
+                    "RETURNING mem_key",
+                    owner_id, op.key);
+            } else {
+                execParams(
+                    transaction,
+                    "INSERT INTO user_memory_hints (owner_id, mem_key, mem_value, source, updated_at) "
+                    "VALUES ($1, $2, $3, $4, NOW()) "
+                    "ON CONFLICT (owner_id, mem_key) DO UPDATE SET "
+                    "mem_value = EXCLUDED.mem_value, "
+                    "source = EXCLUDED.source, "
+                    "history = CASE WHEN $5 THEN "
+                    "  history || to_jsonb(user_memory_hints.mem_value) "
+                    "ELSE history END, "
+                    "updated_at = NOW() "
+                    "RETURNING mem_key",
+                    owner_id, op.key, op.value, op.source, op.append_history);
+            }
+            if (!op.event_op.empty()) {
+                execParams(
+                    transaction,
+                    "INSERT INTO user_memory_events (owner_id, mem_key, mem_value, op) "
+                    "VALUES ($1, $2, $3, $4)",
+                    owner_id, op.key, op.value, op.event_op);
+            }
+            written = true;
+        }
+    });
+    return written;
+}
+
+std::vector<UserMemoryHintRecord> QueryDomainRepository::listUserMemoryHints(
+    const std::string& owner_id) {
+    std::vector<UserMemoryHintRecord> hints;
+    store_.executeTransaction([&](pqxx::work& transaction) {
+        const auto result = execParams(
+            transaction,
+            "SELECT mem_key, mem_value, source FROM user_memory_hints "
+            "WHERE owner_id = $1 ORDER BY mem_key",
+            owner_id);
+        for (const auto& row : result) {
+            UserMemoryHintRecord record;
+            record.owner_id = owner_id;
+            record.key = row["mem_key"].template as<std::string>();
+            record.value = row["mem_value"].template as<std::string>();
+            record.source = row["source"].template as<std::string>();
+            hints.push_back(std::move(record));
+        }
+    });
+    return hints;
+}
+
+bool QueryDomainRepository::insertUserMemoryEvent(const UserMemoryEventRecord& event) {
+    bool written = false;
+    store_.executeTransaction([&](pqxx::work& transaction) {
+        const auto result = execParams(
+            transaction,
+            "INSERT INTO user_memory_events (owner_id, mem_key, mem_value, op) "
+            "VALUES ($1, $2, $3, $4) RETURNING id",
+            event.owner_id, event.key, event.value, event.op);
+        written = !result.empty();
+    });
+    return written;
+}
+
+bool QueryDomainRepository::upsertCrossAgentSummary(const std::string& context_id,
+                                                    const std::string& target_agent_id,
+                                                    const std::string& summary) {
+    bool written = false;
+    store_.executeTransaction([&](pqxx::work& transaction) {
+        const auto result = execParams(
+            transaction,
+            "INSERT INTO cross_agent_summaries (context_id, target_agent_id, summary, updated_at) "
+            "VALUES ($1, $2, $3, NOW()) "
+            "ON CONFLICT (context_id, target_agent_id) DO UPDATE SET "
+            "summary = EXCLUDED.summary, updated_at = NOW() "
+            "RETURNING context_id",
+            context_id, target_agent_id, summary);
+        written = !result.empty();
+    });
+    return written;
+}
+
+std::vector<std::pair<std::string, std::string>> QueryDomainRepository::listCrossAgentSummaries(
+    const std::string& context_id) {
+    // 7-day window preserves the historical SETEX TTL semantics of the
+    // legacy cache entries.
+    std::vector<std::pair<std::string, std::string>> summaries;
+    store_.executeTransaction([&](pqxx::work& transaction) {
+        const auto result = execParams(
+            transaction,
+            "SELECT target_agent_id, summary FROM cross_agent_summaries "
+            "WHERE context_id = $1 "
+            // Context-level rows ('') keep the historical no-TTL semantics;
+            // only the per-agent specialized entries expire after 7 days.
+            "AND (target_agent_id = '' OR updated_at > NOW() - interval '7 days') "
+            "ORDER BY target_agent_id",
+            context_id);
+        for (const auto& row : result) {
+            summaries.emplace_back(
+                row["target_agent_id"].template as<std::string>(),
+                row["summary"].template as<std::string>());
+        }
+    });
+    return summaries;
 }
 
 // ============================================================================

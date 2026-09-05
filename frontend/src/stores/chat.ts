@@ -32,7 +32,7 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
-  function sendQuestion(text: string) {
+  function sendQuestion(text: string, planOnly = false) {
     if (isStreaming.value || !text.trim()) return
 
     messages.value.push({
@@ -42,11 +42,12 @@ export const useChatStore = defineStore('chat', () => {
       timestamp: Date.now(),
     })
 
-    startStream(text)
+    startStream(text, planOnly)
   }
 
-  // Shared streaming path for fresh questions and retries.
-  function startStream(text: string) {
+  // Shared streaming path for fresh questions and retries. planOnly drives
+  // the B1/U4 two-phase mode: plan-only run → confirm → ExecutePlan.
+  function startStream(text: string, planOnly = false) {
     const agentMsg: ChatMessage = {
       id: crypto.randomUUID(),
       role: 'agent',
@@ -69,10 +70,15 @@ export const useChatStore = defineStore('chat', () => {
       (event: AIStreamEvent) => handleStreamEvent(event, reactiveMsg),
       contextId.value,
       ac.signal,
+      planOnly,
     ).finally(() => {
       if (reactiveMsg.streaming) {
         reactiveMsg.streaming = false
         reactiveMsg.content += '\n[Connection lost]'
+        // Mark the message failed so the retry bar renders and retryLast()
+        // can drop this bubble before re-running (previously the connection
+        // loss left no retry affordance and stale bubbles stacked up).
+        reactiveMsg.error = 'Connection lost'
         addActivity('error', 'Connection unexpectedly closed')
       }
       isStreaming.value = false
@@ -118,6 +124,16 @@ export const useChatStore = defineStore('chat', () => {
             msg.content = 'Analyzing request...'
           }
           addActivity('thinking', 'Planning tasks...')
+        } else if (event.content === 'awaiting_confirmation') {
+          // B1/U4 plan-only run: the plan above awaits user confirmation.
+          // The stream ends right after this marker with no terminal event,
+          // so close the streaming state HERE — otherwise the finally block
+          // misreads the EOF as a connection loss (P2-6).
+          msg.awaitingConfirmation = true
+          msg.streaming = false
+          isStreaming.value = false
+          abortController.value = null
+          addActivity('thinking', 'Plan ready — awaiting confirmation')
         } else if (event.content && event.content !== 'thinking') {
           // Status contents are intents/descriptions, not agent names —
           // agent attribution arrives via the plan / subtask events.
@@ -178,6 +194,7 @@ export const useChatStore = defineStore('chat', () => {
 
       case 'complete':
         msg.streaming = false
+        msg.awaitingConfirmation = false
         msg.processingTimeMs = event.timestamp
           ? Date.now() - msg.timestamp
           : undefined
@@ -194,6 +211,7 @@ export const useChatStore = defineStore('chat', () => {
         // optional details field is only a fallback when content is empty.
         msg.error = event.content || (event as AIStreamEvent & { details?: string }).details || 'Unknown error'
         msg.streaming = false
+        msg.awaitingConfirmation = false
         isStreaming.value = false
         abortController.value = null
         addActivity('error', `Error: ${msg.error}`)

@@ -66,6 +66,22 @@ public:
     static void recordAgentCall(const std::string& agent_id, bool success, double latency_ms);
 
     /**
+     * @brief B4 (P14d): seed the live metrics of one agent from a durable
+     * health snapshot (V014 agent_health_snapshots), so the first
+     * post-restart evaluation sees the persisted verdict instead of a
+     * cold-start buffer. Called at startup from main.cpp after loading
+     * fresh (freshness-gated) snapshots; per-call samples stay in memory.
+     * @param agent_id Agent identifier
+     * @param success_rate Snapshot success rate (0.0–1.0)
+     * @param ema_latency_ms Snapshot EMA latency (ms)
+     * @param total_calls Snapshot total call count (caps at the buffer size)
+     */
+    static void seedLiveMetricsBaseline(const std::string& agent_id,
+                                        double success_rate,
+                                        double ema_latency_ms,
+                                        std::int64_t total_calls);
+
+    /**
      * @brief Evaluate live health of a single agent.
      * @param agent_id Agent to evaluate
      * @return HealthStatus classification
@@ -92,6 +108,16 @@ public:
      */
     static void evaluateAllHealth(
         const std::function<void(const std::string&, HealthStatus)>& callback);
+
+    /**
+     * @brief B4 (P14d): detailed variant of the callback overload — the
+     * callback additionally receives success_rate / EMA latency / total
+     * writes so the scheduler can persist a durable snapshot
+     * (upsertAgentHealthSnapshot) without a second evaluation pass.
+     */
+    static void evaluateAllHealthDetailed(
+        const std::function<void(const std::string&, HealthStatus, double,
+                                 double, int)>& detailed_callback);
 
     /**
      * @brief Refresh the heartbeat timestamp for an agent (called from the

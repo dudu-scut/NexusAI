@@ -29,7 +29,8 @@ TaskPlanner::TaskPlanner(const TaskPlannerConfig& config, std::unique_ptr<LLMCli
 
 ExecutionPlan TaskPlanner::plan(
     const std::string& query,
-    const std::unordered_map<std::string, std::string>& available_skills) {
+    const std::unordered_map<std::string, std::string>& available_skills,
+    int llm_timeout_seconds) {
 
     ExecutionPlan plan;
     plan.original_query = query;
@@ -71,7 +72,7 @@ ExecutionPlan TaskPlanner::plan(
 
             std::string response = llm_client_->chat(
                 "你是一个任务规划器，严格按照 JSON 格式返回结果，不要输出其他内容。",
-                attempt_prompt);
+                attempt_prompt, llm_timeout_seconds);
             auto attempt_end = std::chrono::steady_clock::now();
 
             // Estimate-based accounting: LLMClient::chat() does not expose
@@ -110,6 +111,10 @@ ExecutionPlan TaskPlanner::plan(
             }
         }
 
+        // P13(d)/A2: expose the worst-observed drop count on the plan so the
+        // aggregator can tell the user that some requirements were dropped.
+        plan.dropped_tasks = observed_drops;
+
         // End the planning span exactly once (started above, outside the
         // retry loop); attach the worst observed dropped-task count as span
         // metadata so the silent loss becomes visible in trace inspection.
@@ -131,7 +136,12 @@ ExecutionPlan TaskPlanner::plan(
         if (trace) {
             trace->endSpan();
         }
-        // LLM call failed → fall back to single-agent mode
+        // LLM call failed → fall back to single-agent mode. Reset the plan
+        // first: `plan` may still hold attempt0's parsed tasks when the
+        // retry attempt threw — leaving them in would make the fallback plan
+        // a half-populated hybrid (is_single_agent=true AND stale tasks).
+        plan = ExecutionPlan{};
+        plan.original_query = query;
         plan.is_single_agent = true;
     }
 
@@ -164,6 +174,8 @@ std::string TaskPlanner::buildPlanningPrompt(
               "\"skill\": \"技能名\", \"depends_on\": [\"t1\"]}\n"
               "   ]}\n"
               "\n"
+              "3. 对会修改外部状态的任务（写入/发送/删除等），额外输出 \"effect\": \"write\"；"
+              "只读取的任务输出 \"effect\": \"read\" 或省略。\n"
               "depends_on 填写依赖的子任务 ID，无依赖则为空数组。\n"
               "只返回 JSON，不要其他文字。\n\n"
               "用户请求：\n\"\"\"\n" + query + "\n\"\"\"\n"
@@ -236,11 +248,20 @@ ExecutionPlan TaskPlanner::parsePlanResponse(
         return plan;
     }
 
+    std::unordered_set<std::string> seen_ids;
     for (const auto& task_json : j["tasks"]) {
         SubTask st;
         st.id = task_json.value("id", "");
         st.description = task_json.value("description", "");
         st.required_skill = task_json.value("skill", "");
+        // B3/P20-7: write-shaped task marker. Missing/unknown value keeps
+        // the conservative ReadOnly default (documented residual risk).
+        {
+            const std::string effect = task_json.value("effect", "read");
+            if (effect == "write" || effect == "side_effect") {
+                st.effect = SubTask::Effect::SideEffect;
+            }
+        }
 
         if (task_json.contains("depends_on") && task_json["depends_on"].is_array()) {
             for (const auto& dep : task_json["depends_on"]) {
@@ -252,6 +273,16 @@ ExecutionPlan TaskPlanner::parsePlanResponse(
 
         // Skip subtasks with missing critical fields
         if (st.id.empty() || st.description.empty()) {
+            ++dropped_count;
+            continue;
+        }
+
+        // Skip duplicate ids: a later task reusing an earlier id would be
+        // collapsed by the executor's task_map anyway, and the merged
+        // in-degree bookkeeping would then mis-detect a dependency cycle and
+        // fail the whole plan. Dropping the duplicate (counted as dropped)
+        // keeps the plan executable.
+        if (!seen_ids.insert(st.id).second) {
             ++dropped_count;
             continue;
         }
@@ -287,11 +318,16 @@ void TaskPlanner::resolveAgents(ExecutionPlan& plan, AgentRouter& router) {
         if (!plan.single_agent_skill.empty()) {
             skills.push_back(plan.single_agent_skill);
         }
-        auto agent = router.selectAgent(plan.original_query, skills);
-        if (agent.has_value()) {
-            plan.single_agent_id = agent->id;
-            plan.single_agent_name = agent->name;
+        // P12(a): the detailed decision carries the real embedding similarity
+        // (when the embedding tier matched); thread it onto the candidate.
+        auto decision = router.selectAgentDetailed(plan.original_query, skills);
+        if (decision.agent.has_value()) {
+            plan.single_agent_id = decision.agent->id;
+            plan.single_agent_name = decision.agent->name;
         }
+        plan.single_agent_confidence = decision.confidence;
+        plan.single_agent_confidence_source =
+            decision.source.empty() ? "ranking" : decision.source;
         return;
     }
 
@@ -301,10 +337,10 @@ void TaskPlanner::resolveAgents(ExecutionPlan& plan, AgentRouter& router) {
         if (!task.required_skill.empty()) {
             skills.push_back(task.required_skill);
         }
-        auto agent = router.selectAgent(task.description, skills);
-        if (agent.has_value()) {
-            task.preferred_agent_id = agent->id;
-            task.preferred_agent_name = agent->name;
+        auto decision = router.selectAgentDetailed(task.description, skills);
+        if (decision.agent.has_value()) {
+            task.preferred_agent_id = decision.agent->id;
+            task.preferred_agent_name = decision.agent->name;
         }
 
         // Populate Top-3 candidate agents per subtask
@@ -312,14 +348,25 @@ void TaskPlanner::resolveAgents(ExecutionPlan& plan, AgentRouter& router) {
         if (!task.required_skill.empty()) {
             auto candidates = router.findHealthyAgentsWithSkills(
                 {task.required_skill});
-            // Take up to 3 candidates with descending confidence
+            // Take up to 3 candidates with descending confidence.
+            // P12(a): candidate[0] IS the selected agent — when the routing
+            // decision came from the embedding tier its similarity is the
+            // real confidence; every other candidate keeps the rank-based
+            // placeholder, labelled via confidence_source.
             int count = 0;
             for (const auto& ca : candidates) {
                 if (count >= 3) break;
                 CandidateAgent cand;
                 cand.agent_id = ca.id;
                 cand.agent_name = ca.name;
-                cand.confidence = 1.0 - (count * 0.15);  // Simple rank-based confidence
+                if (count == 0 && decision.source == "embedding" &&
+                    decision.agent.has_value() && ca.id == decision.agent->id) {
+                    cand.confidence = decision.confidence;
+                    cand.confidence_source = "embedding";
+                } else {
+                    cand.confidence = 1.0 - (count * 0.15);  // Rank-based placeholder
+                    cand.confidence_source = "ranking";
+                }
                 task.candidate_agents.push_back(std::move(cand));
                 ++count;
             }

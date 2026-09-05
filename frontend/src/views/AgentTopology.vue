@@ -349,8 +349,9 @@ async function loadData() {
     }
 
     // 2. Fetch metrics for each agent concurrently
+    // (keyed by the server registry id "service_name-host-port")
     const metricsPromises = agentList.map(a =>
-      getAgentMetrics(a.service_name)
+      getAgentMetrics(`${a.service_name}-${a.host}-${a.port}`)
     )
     const metricsResults = await Promise.all(metricsPromises)
 

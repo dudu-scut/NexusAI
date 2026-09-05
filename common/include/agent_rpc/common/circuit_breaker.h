@@ -44,28 +44,25 @@ class CircuitBreaker {
 public:
     explicit CircuitBreaker(const CircuitBreakerConfig& config = CircuitBreakerConfig{});
     ~CircuitBreaker() = default;
-    
-    template<typename Func>
-    auto execute(Func&& func) -> decltype(func());
-    
+
     void recordSuccess();
-    
+
     void recordFailure();
-    
+
     bool isRequestAllowed();
-    
+
     // Current state, read under lock to stay consistent with stats
     CircuitState getState() const {
         std::lock_guard<std::mutex> lock(stats_mutex_);
         return state_;
     }
-    
+
     CircuitBreakerStats getStats() const;
-    
+
     void reset();
-    
+
     void updateConfig(const CircuitBreakerConfig& config);
-    
+
     const CircuitBreakerConfig& getConfig() const { return config_; }
 
 private:
@@ -74,12 +71,16 @@ private:
     void transitionToClosed();
     void updateFailureRate();
     bool shouldAttemptReset();
-    
+
     CircuitBreakerConfig config_;
     std::atomic<CircuitState> state_{CircuitState::CLOSED};
     mutable std::mutex stats_mutex_;
     CircuitBreakerStats stats_;
     std::chrono::steady_clock::time_point last_state_change_;
+    // HALF_OPEN probe admission: reserved under stats_mutex_ so concurrent
+    // callers cannot all pass the check before any of them records an
+    // outcome (the old total_requests-based check allowed a probe storm).
+    bool probe_in_flight_ = false;
 };
 
 class CircuitBreakerManager {
@@ -101,32 +102,9 @@ private:
     ~CircuitBreakerManager() = default;
     CircuitBreakerManager(const CircuitBreakerManager&) = delete;
     CircuitBreakerManager& operator=(const CircuitBreakerManager&) = delete;
-    
+
     mutable std::mutex circuit_breakers_mutex_;
     std::map<std::string, std::shared_ptr<CircuitBreaker>> circuit_breakers_;
-};
-
-// Decorator adding circuit-breaking around an arbitrary callable
-template<typename T>
-class CircuitBreakerDecorator {
-public:
-    CircuitBreakerDecorator(const std::string& service_name,
-                           const CircuitBreakerConfig& config = CircuitBreakerConfig{})
-        : circuit_breaker_(CircuitBreakerManager::getInstance().getCircuitBreaker(service_name)) {
-        if (circuit_breaker_) {
-            circuit_breaker_->updateConfig(config);
-        }
-    }
-
-    template<typename Func>
-    auto call(Func&& func) -> decltype(func()) {
-        return circuit_breaker_->execute(std::forward<Func>(func));
-    }
-
-    std::shared_ptr<CircuitBreaker> getCircuitBreaker() const { return circuit_breaker_; }
-
-private:
-    std::shared_ptr<CircuitBreaker> circuit_breaker_;
 };
 
 } // namespace common

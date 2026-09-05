@@ -105,6 +105,23 @@ public:
         const std::string& question,
         const std::vector<std::string>& required_skills = {});
 
+    // P12(a): routing decision with a truthy confidence trace. `confidence`
+    // carries the REAL embedding cosine similarity only when `source` is
+    // "embedding"; LLM/IDF/fallback tiers have no numeric confidence, so
+    // confidence is 0 and consumers must fall back to rank placeholders
+    // (labelled via confidence_source). selectAgent() forwards here and keeps
+    // its byte-stable signature for existing callers and property tests.
+    struct RouteDecision {
+        std::optional<AgentInfo> agent;
+        std::string skill;          // matched skill (embedding/LLM/IDF tier)
+        double confidence = 0.0;    // real similarity only for source=="embedding"
+        std::string source;         // "embedding" | "llm" | "idf" | "fallback" | ""
+        bool used_fallback = false;
+    };
+    RouteDecision selectAgentDetailed(
+        const std::string& question,
+        const std::vector<std::string>& required_skills = {});
+
     /**
      * @brief Callback type for agent invocation
      *
@@ -351,6 +368,17 @@ public:
     };
     std::optional<HighConfidenceSkill> resolveHighConfidenceSkill(const std::string& question);
 
+    /**
+     * @brief B6 route-then-plan: rank skills by embedding similarity to the
+     * question. Aggregates the per-agent duplicate index entries by skill
+     * name (highest similarity wins) and returns them descending.
+     * Returns an empty vector whenever the embedding tier is unavailable
+     * (default build / embedding disabled) — callers fall back to the full
+     * skill set. Cost: one query embed per call.
+     */
+    std::vector<std::pair<std::string, double>> rankSkillsBySimilarity(
+        const std::string& question, int top_k = 20, float threshold = 0.6f);
+
 private:
 
     /**
@@ -364,11 +392,15 @@ private:
      * @param out_query_vector When non-null and the embedding tier is
      *        enabled, receives the query embedding — reused by the P10(c)
      *        intent cache so caching never pays an extra embed call.
+     * @param out_similarity When non-null and a real embedding-tier hit
+     *        occurs, receives the cosine similarity of the best match.
+     *        Left untouched for cache hits / misses (no real similarity).
      * @return Skill name if high-confidence match found, empty string otherwise
      */
     std::string analyzeRequiredSkillEmbedding(
         const std::string& question,
-        std::vector<float>* out_query_vector = nullptr);
+        std::vector<float>* out_query_vector = nullptr,
+        double* out_similarity = nullptr);
 
     /**
      * @brief P10(c): store a resolved intent for the given query vector.
@@ -399,7 +431,8 @@ private:
      * Must be called WITHOUT holding agents_mutex_: quality-based strategies
      * consult the injected provider, which may hit PostgreSQL.
      */
-    AgentInfo selectByStrategy(const std::vector<AgentInfo>& candidates);
+    AgentInfo selectByStrategy(const std::vector<AgentInfo>& candidates,
+                               const std::string& lb_key = {});
     
     /**
      * @brief Select using round-robin strategy
@@ -423,7 +456,8 @@ private:
      * more likely to be selected. Uses a weighted random selection.
      */
     AgentInfo selectWeightedByQuality(const std::vector<AgentInfo>& candidates);
-    AgentInfo selectWeightedByQualityWithFallback(const std::vector<AgentInfo>& candidates);
+    AgentInfo selectWeightedByQualityWithFallback(const std::vector<AgentInfo>& candidates,
+                                                  const std::string& lb_key = {});
 
     /**
      * @brief P8: lazily read NEXUSAI_ROUTER_LB_STRATEGY and construct the
@@ -437,10 +471,17 @@ private:
     /**
      * @brief P8: decide among candidates through the load balancer tier.
      *
+     * lb_key is the deterministic selection key for the consistent_hash
+     * strategy (the caller passes the user question); with the strategy active
+     * and a non-empty key, selection goes through selectEndpointByKey so the
+     * same question deterministically maps to the same endpoint. Other
+     * strategies ignore the key.
+     *
      * Returns nullopt when the tier is unavailable or fails, in which case
      * the caller falls back to the legacy quality-weighted logic.
      */
-    std::optional<AgentInfo> selectViaLoadBalancer(const std::vector<AgentInfo>& candidates);
+    std::optional<AgentInfo> selectViaLoadBalancer(const std::vector<AgentInfo>& candidates,
+                                                   const std::string& lb_key = {});
 
     /**
      * @brief Rebuild the skill keyword index from current agents

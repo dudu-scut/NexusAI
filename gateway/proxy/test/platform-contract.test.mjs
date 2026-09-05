@@ -360,8 +360,9 @@ test('migration packaging carries libpqxx, db_migrate, and exactly baseline migr
   assert.match(dockerfile, /COPY db\/migrations \/usr\/local\/share\/nexusai\/migrations/);
   assert.match(compose, /dockerfile:\s*docker\/Dockerfile\.rpc-server/);
   const migrations = fs.readdirSync(path.join(root, 'db/migrations')).filter((name) => /^V\d+__.*\.sql$/.test(name));
-  assert.equal(migrations.length, 13);
-  for (let version = 1; version <= 13; version += 1) {
+  // V014 (agent health snapshots) + V015 (memory domain) landed in batch 8.
+  assert.equal(migrations.length, 15);
+  for (let version = 1; version <= 15; version += 1) {
     const prefix = `V${String(version).padStart(3, '0')}__`;
     assert.ok(migrations.some((name) => name.startsWith(prefix)), `missing migration ${prefix}`);
   }

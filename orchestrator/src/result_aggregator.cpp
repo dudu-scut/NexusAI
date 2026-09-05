@@ -27,6 +27,24 @@ AggregatedResult ResultAggregator::aggregate(
     AggregatedResult agg;
     agg.strategy = config_.default_strategy;
 
+    // P13(d)/A2: a plan that dropped subtasks (LLM format drift) must not
+    // silently lose those requirements — surface a warning in both the
+    // answer path and the structured warnings field.
+    if (plan.dropped_tasks > 0) {
+        agg.warnings.push_back(
+            "[系统] 有 " + std::to_string(plan.dropped_tasks) +
+            " 个子任务因规划输出不完整被丢弃，部分需求可能未被覆盖。");
+    }
+    // B3/P20-7: a write-shaped task that timed out may have applied its
+    // external effect — never present it as a plain retryable failure.
+    for (const auto& entry : results) {
+        if (entry.second.uncertain) {
+            agg.warnings.push_back(
+                "[系统] 子任务 " + entry.first +
+                " 超时且可能已执行外部写入，其最终状态未知。");
+        }
+    }
+
     // Collect sub_results in task order
     for (const auto& task : plan.tasks) {
         auto it = results.find(task.id);
@@ -37,16 +55,28 @@ AggregatedResult ResultAggregator::aggregate(
 
     // Route to strategy
     if (config_.default_strategy == "llm_synthesize" && llm_client_) {
-        agg.final_answer = aggregateLLMSynthesize(plan, results);
-        // aggregateLLMSynthesize may have fallen back to concat internally;
-        // detect this by checking if the answer matches a concat output
-        if (agg.final_answer.empty()) {
-            agg.final_answer = aggregateConcat(plan, results);
+        auto [answer, used_fallback] = aggregateLLMSynthesize(plan, results);
+        agg.final_answer = answer;
+        // Label the strategy truthfully: the internal concat fallback must
+        // not be reported as a successful llm_synthesize run.
+        if (used_fallback || agg.final_answer.empty()) {
+            if (agg.final_answer.empty()) {
+                agg.final_answer = aggregateConcat(plan, results);
+            }
             agg.strategy = "concat";
         }
     } else {
         agg.final_answer = aggregateConcat(plan, results);
         agg.strategy = "concat";
+    }
+
+    // Append the dropped-tasks notice to the answer itself so the user sees
+    // it regardless of how the frontend renders metadata.
+    for (const auto& warning : agg.warnings) {
+        if (!agg.final_answer.empty()) {
+            agg.final_answer += "\n\n";
+        }
+        agg.final_answer += warning;
     }
 
     auto end = std::chrono::steady_clock::now();
@@ -68,7 +98,7 @@ std::string ResultAggregator::aggregateConcat(
         if (it == results.end()) continue;
 
         const auto& r = it->second;
-        if (!r.success) continue;  // Skip failed subtasks
+        if (!r.success && !r.uncertain) continue;  // Skip failed subtasks
 
         if (!first) {
             out << "\n\n";
@@ -76,7 +106,12 @@ std::string ResultAggregator::aggregateConcat(
         first = false;
 
         out << "## " << task.id << ": " << task.description << "\n\n";
-        out << r.result;
+        if (r.uncertain) {
+            // B3/P20-7: make the unknown outcome explicit instead of skipping.
+            out << "[状态未知：" << r.error_message << "]\n";
+        } else {
+            out << r.result;
+        }
     }
 
     if (first) {
@@ -93,7 +128,7 @@ std::string ResultAggregator::aggregateConcat(
     return out.str();
 }
 
-std::string ResultAggregator::aggregateLLMSynthesize(
+std::pair<std::string, bool> ResultAggregator::aggregateLLMSynthesize(
     const ExecutionPlan& plan,
     const std::unordered_map<std::string, SubTaskResult>& results) {
 
@@ -104,15 +139,19 @@ std::string ResultAggregator::aggregateLLMSynthesize(
         if (it == results.end()) continue;
 
         const auto& r = it->second;
-        if (!r.success) continue;
+        if (!r.success && !r.uncertain) continue;
 
         context += "[" + task.id + " - " + task.description + "]\n";
-        context += r.result + "\n\n";
+        if (r.uncertain) {
+            context += "[状态未知：" + r.error_message + "]\n";
+        } else {
+            context += r.result + "\n\n";
+        }
     }
 
     if (context.empty()) {
         // Fall back to concat if no successful results
-        return aggregateConcat(plan, results);
+        return {aggregateConcat(plan, results), true};
     }
 
     std::string system_prompt =
@@ -125,16 +164,24 @@ std::string ResultAggregator::aggregateLLMSynthesize(
         "各子任务结果：\n" + context +
         "\n请综合以上内容，给出最终回答。";
 
+    // P13(d)/A2: tell the synthesizer about dropped subtasks so the final
+    // answer itself carries the disclaimer (fail-soft does not mean silent).
+    if (plan.dropped_tasks > 0) {
+        user_message += "\n\n注意：有 " + std::to_string(plan.dropped_tasks) +
+            " 个子任务因规划输出不完整被丢弃，请在回答末尾用一句话提示用户"
+            "部分需求可能未被覆盖。";
+    }
+
     try {
         std::string answer = llm_client_->chat(system_prompt, user_message);
         if (answer.empty()) {
             // LLM returned empty response — fall back to concat
-            return aggregateConcat(plan, results);
+            return {aggregateConcat(plan, results), true};
         }
-        return answer;
+        return {answer, false};
     } catch (const std::exception&) {
         // LLM synthesis failed — fall back to concat
-        return aggregateConcat(plan, results);
+        return {aggregateConcat(plan, results), true};
     }
 }
 

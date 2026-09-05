@@ -63,6 +63,34 @@ public:
         return &threadInstance();
     }
 
+    // RAII pairing for startSpan/endSpan: guarantees the span is closed and
+    // the delegation-depth counter restored on every exit path, including
+    // exceptions thrown between the manual start/end pair (the A2A adapter's
+    // failure paths used to leak the agent_call span, which desynchronized
+    // the caller's span stack and let depth grow per failed attempt).
+    class SpanGuard {
+    public:
+        SpanGuard(const std::string& name, const std::string& component) {
+            ctx_ = TraceContext::current();
+            if (ctx_) {
+                depth_before_ = ctx_->depth();
+                ctx_->startSpan(name, component);
+            }
+        }
+        ~SpanGuard() {
+            if (ctx_) {
+                ctx_->endSpan();
+                ctx_->setDepth(depth_before_);
+            }
+        }
+        SpanGuard(const SpanGuard&) = delete;
+        SpanGuard& operator=(const SpanGuard&) = delete;
+
+    private:
+        TraceContext* ctx_ = nullptr;
+        int depth_before_ = 0;
+    };
+
     const std::string& traceId() const { return trace_id_; }
     const std::string& userId() const { return user_id_; }
 

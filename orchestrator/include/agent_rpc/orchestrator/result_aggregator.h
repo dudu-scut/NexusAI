@@ -15,6 +15,7 @@
 #include <a2a/llm_client.hpp>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace agent_rpc {
@@ -27,6 +28,9 @@ struct AggregatedResult {
     std::vector<SubTaskResult> sub_results;   // Ordered by topology
     std::string strategy;                      // "concat" | "llm_synthesize"
     int64_t total_time_ms = 0;
+    // P13(d)/A2: non-fatal notices (dropped subtasks, uncertain write tasks)
+    // that the caller should surface to the user (metadata / status event).
+    std::vector<std::string> warnings;
 };
 
 // ── Configuration ──────────────────────────────────────────────────────────
@@ -59,7 +63,10 @@ private:
         const ExecutionPlan& plan,
         const std::unordered_map<std::string, SubTaskResult>& results) const;
 
-    std::string aggregateLLMSynthesize(
+    // Returns {answer, used_concat_fallback} so aggregate() can label
+    // AggregatedResult.strategy truthfully when the LLM path degraded to the
+    // concat output internally (empty context / empty answer / exception).
+    std::pair<std::string, bool> aggregateLLMSynthesize(
         const ExecutionPlan& plan,
         const std::unordered_map<std::string, SubTaskResult>& results);
 

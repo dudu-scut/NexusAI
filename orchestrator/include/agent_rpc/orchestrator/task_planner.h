@@ -30,9 +30,21 @@ struct CandidateAgent {
     std::string agent_id;
     std::string agent_name;
     double confidence = 0.0;               // Routing confidence (0.0–1.0)
+    // P12(a): provenance of `confidence`. "embedding" = real cosine
+    // similarity from the router's embedding tier; "ranking" = the
+    // 1.0 - 0.15*rank placeholder (LLM/IDF/fallback tiers carry no numeric
+    // confidence). Consumers must label the value accordingly.
+    std::string confidence_source = "ranking";
 };
 
 struct SubTask {
+    // B3/P20-7: does executing this task mutate external state? The
+    // planning LLM labels write-shaped tasks ("effect": "write"); a timed-out
+    // SideEffect task is reported as UNCERTAIN (may have applied) instead of
+    // plain FAILED. Default is ReadOnly — an unlabelled task keeps the
+    // historical FAILED semantics (documented residual risk: an unlabelled
+    // write task that times out is reported failed exactly as before).
+    enum class Effect { ReadOnly, SideEffect };
     std::string id;                        // "t1", "t2", ...
     std::string description;               // Prompt sent to the Agent
     std::string required_skill;            // Skill needed
@@ -40,6 +52,7 @@ struct SubTask {
     std::string preferred_agent_id;        // Pre-resolved agent (set by resolveAgents)
     std::string preferred_agent_name;      // Agent name for logging
     std::vector<CandidateAgent> candidate_agents; // Top-3 candidates
+    Effect effect = Effect::ReadOnly;      // write-shaped task marker (B3)
 };
 
 struct ExecutionPlan {
@@ -49,6 +62,15 @@ struct ExecutionPlan {
     std::string single_agent_skill;        // Skill for the single-agent path
     std::string single_agent_id;           // Pre-resolved agent ID for single-agent path
     std::string single_agent_name;         // Agent name for single-agent path
+    // P12(a): real routing confidence for the single-agent decision
+    // (meaningful only when single_agent_confidence_source == "embedding").
+    double single_agent_confidence = 0.0;
+    std::string single_agent_confidence_source = "ranking";
+    // P13(d)/A2: number of subtasks dropped during plan parsing (missing
+    // id/description), worst-observed across the retry attempts. Populated
+    // by plan(); consumed by the aggregator so the final answer can tell
+    // the user that some requirements were not covered.
+    int dropped_tasks = 0;
 };
 
 // ── Configuration ──────────────────────────────────────────────────────────
@@ -78,7 +100,8 @@ public:
      * @return ExecutionPlan with is_single_agent flag and optional subtask DAG
      */
     ExecutionPlan plan(const std::string& query,
-                       const std::unordered_map<std::string, std::string>& available_skills);
+                       const std::unordered_map<std::string, std::string>& available_skills,
+                       int llm_timeout_seconds = 20);
 
     /**
      * Pre-resolve agents for each subtask in the plan using AgentRouter.

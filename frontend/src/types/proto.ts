@@ -39,6 +39,9 @@ export interface SystemContext {
   user_memory: string
   conversation_history: string
   cross_agent_summary: string
+  // C2 direction 4: hard facts the user stated (hints), separated from the
+  // platform-inferred profile text in user_memory (proto field 5)
+  user_facts?: string
 }
 
 export interface AIQueryRequest {
@@ -53,6 +56,9 @@ export interface AIQueryRequest {
   system_context?: SystemContext
   // Sandbox execution flag (proto field 10)
   sandbox?: boolean
+  // B1/U4 two-phase execution: stop after planning, finalize as "planned",
+  // confirm via a follow-up ExecutePlan call (proto field 11)
+  plan_only?: boolean
 }
 
 export interface AIQueryResponse {
@@ -385,6 +391,10 @@ export interface ChatMessage {
   traceInfo?: TraceInfo
   feedbackGiven?: 'like' | 'dislike' | null
   timestamp: number
+  // B1/U4 two-phase: set when a plan-only stream ends with
+  // awaiting_confirmation — ChatView renders a confirm/abandon pair that
+  // drives the follow-up ExecutePlan call.
+  awaitingConfirmation?: boolean
 }
 
 export interface AgentDisplayInfo {

@@ -118,8 +118,9 @@ async function loadDashboardData() {
 
     // Concurrently fetch metrics for all agents
     // getAgentMetrics returns { data: AgentMetrics | null; error?: string }
+    // Metrics are keyed by the server registry id "service_name-host-port".
     const metricsResults = await Promise.all(
-      agents.map(a => getAgentMetrics(a.service_name)),
+      agents.map(a => getAgentMetrics(`${a.service_name}-${a.host}-${a.port}`)),
     )
 
     // Extract the AgentMetrics from each result wrapper

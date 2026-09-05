@@ -27,6 +27,7 @@
 #include "agent_rpc/db/migration_runner.h"
 #include "agent_rpc/registry/service_registry.h"
 #include <curl/curl.h>
+#include <deque>
 #include <filesystem>
 #include <iostream>
 #include <signal.h>
@@ -65,9 +66,15 @@ struct QueuedSpan {
 };
 
 std::mutex g_span_queue_mutex;
-std::queue<QueuedSpan> g_span_queue;
+// deque (not queue): the flush task re-queues an undelivered batch at the
+// FRONT so span order within a trace is preserved across Redis outages.
+std::deque<QueuedSpan> g_span_queue;
 
-static constexpr size_t kSpanBatchMax = 500;  // max spans per flush
+static constexpr size_t kSpanBatchMax = 500;   // max spans per flush
+// Spans are transient telemetry (P23): when Redis is down for a long time
+// the queue must not grow without bound — drop the OLDEST spans past the
+// cap instead of buffering forever.
+static constexpr size_t kSpanQueueMax = 10000;
 
 void pushSpanToQueue(const Span& span, const std::string& trace_id,
                      const std::string& user_id) {
@@ -81,7 +88,10 @@ void pushSpanToQueue(const Span& span, const std::string& trace_id,
     qs.status      = span.status;
     qs.metadata_json = span.metadata_json;
     std::lock_guard<std::mutex> lock(g_span_queue_mutex);
-    g_span_queue.push(std::move(qs));
+    g_span_queue.push_back(std::move(qs));
+    while (g_span_queue.size() > kSpanQueueMax) {
+        g_span_queue.pop_front();
+    }
 }
 
 std::filesystem::path resolveMigrationDirectory() {
@@ -296,6 +306,31 @@ int main(int argc, char* argv[]) {
     
     LOG_INFO("RPC Server 已启动: " + config.server_address);
 
+    // B4 (P14d) startup recovery: load fresh durable health snapshots
+    // (V014 agent_health_snapshots) into the registry's live metrics so the
+    // first post-restart evaluation continues from the persisted verdict
+    // instead of a cold start. Freshness gate: snapshots older than 10
+    // minutes are skipped — reviving a stale verdict could exclude a now
+    // healthy agent; per-call samples themselves stay in memory only.
+    if (auto* health_repo = server.getQueryDomainRepository()) {
+        try {
+            constexpr std::int64_t kSnapshotMaxAgeSeconds = 600;
+            const auto snapshots =
+                health_repo->listAgentHealthSnapshots(kSnapshotMaxAgeSeconds);
+            for (const auto& snapshot : snapshots) {
+                agent_rpc::registry::ServiceRegistry::seedLiveMetricsBaseline(
+                    snapshot.agent_id, snapshot.success_rate,
+                    snapshot.ema_latency_ms, snapshot.total_calls);
+            }
+            LOG_INFO("Health baseline seeded from " +
+                     std::to_string(snapshots.size()) + " durable snapshot(s)");
+        } catch (const std::exception& error) {
+            // PG unavailable at startup: cold-start behavior (samples < 20
+            // are never evaluated) keeps this safe.
+            LOG_WARN(std::string("Health snapshot seeding skipped: ") + error.what());
+        }
+    }
+
     // Start BackgroundScheduler for periodic tasks
     agent_rpc::common::BackgroundScheduler::instance().start(2);
 
@@ -354,20 +389,32 @@ int main(int argc, char* argv[]) {
             }
 
             // Combine heartbeat-timeout and metric-based signals into one
-            // verdict per agent: UNHEALTHY latches — either a dead
-            // heartbeat or UNHEALTHY metrics excludes the agent from
-            // routing; it only recovers when both signals are healthy
-            // again. DEGRADED is observability-only (logged by the
-            // dashboard, not excluded — the router flag is boolean).
-            std::unordered_map<std::string, bool> unhealthy_by_agent;
-            auto accumulate = [&unhealthy_by_agent](const std::string& id,
-                                                    bool unhealthy) {
-                auto it = unhealthy_by_agent.find(id);
-                if (it == unhealthy_by_agent.end()) {
-                    unhealthy_by_agent.emplace(id, unhealthy);
-                } else {
-                    it->second = it->second || unhealthy;
-                }
+            // verdict per agent: UNHEALTHY excludes the agent from routing.
+            // DEGRADED is observability-only (logged by the dashboard, not
+            // excluded — the router flag is boolean).
+            //
+            // Recovery semantics (R17): a metric-driven UNHEALTHY verdict has
+            // no natural recovery when the router already excludes the agent
+            // (no new samples can arrive to rehabilitate the frozen ring
+            // buffer). After kProbationCycles consecutive metrics-only
+            // UNHEALTHY verdicts (~60s), the agent is re-admitted
+            // (markAgentHealthy) as a half-open probe: fresh traffic either
+            // rehabilitates it or the next verdicts re-latch it. A dead
+            // heartbeat is NOT probated — it self-heals only when the agent
+            // actually calls home again.
+            constexpr int kProbationCycles = 2;
+            struct Verdict {
+                bool heartbeat_timeout = false;
+                bool metrics_unhealthy = false;
+            };
+            static std::mutex probation_mutex;
+            static std::unordered_map<std::string, int> metrics_unhealthy_streak;
+            std::unordered_map<std::string, Verdict> verdicts;
+            auto accumulate = [&verdicts](const std::string& id, bool heartbeat,
+                                          bool metrics) {
+                auto& v = verdicts[id];
+                v.heartbeat_timeout = v.heartbeat_timeout || heartbeat;
+                v.metrics_unhealthy = v.metrics_unhealthy || metrics;
             };
 
             // Heartbeat timeout guard (90s): agents that stop calling home
@@ -375,23 +422,80 @@ int main(int argc, char* argv[]) {
             agent_rpc::registry::ServiceRegistry::evaluateHeartbeatTimeouts(
                 std::chrono::seconds(90),
                 [&accumulate](const std::string& agent_id, bool timed_out) {
-                    accumulate(agent_id, timed_out);
+                    accumulate(agent_id, timed_out, false);
                 });
 
             // Metric-based evaluation: write results back to the router so
             // the is_healthy flag drives the 11 routing exclusion checks.
-            agent_rpc::registry::ServiceRegistry::evaluateAllHealth(
-                [&accumulate](const std::string& agent_id,
-                              agent_rpc::registry::HealthStatus status) {
-                    accumulate(agent_id,
+            // B4 (P14d): the detailed callback also persists each verdict as
+            // a durable snapshot (restart recovery). PG faults degrade to a
+            // warning — the in-memory routing decision is unaffected.
+            agent_rpc::registry::ServiceRegistry::evaluateAllHealthDetailed(
+                [&accumulate, &server](const std::string& agent_id,
+                                       agent_rpc::registry::HealthStatus status,
+                                       double success_rate, double ema_latency_ms,
+                                       int total_writes) {
+                    accumulate(agent_id, false,
                                status == agent_rpc::registry::HealthStatus::UNHEALTHY);
+                    auto* repo = server.getQueryDomainRepository();
+                    if (!repo) {
+                        return;
+                    }
+                    try {
+                        agent_rpc::common::AgentHealthSnapshotRecord snapshot;
+                        snapshot.agent_id = agent_id;
+                        snapshot.health_status =
+                            status == agent_rpc::registry::HealthStatus::HEALTHY ? "HEALTHY" :
+                            status == agent_rpc::registry::HealthStatus::DEGRADED ? "DEGRADED" :
+                            status == agent_rpc::registry::HealthStatus::UNHEALTHY ? "UNHEALTHY" :
+                            "UNKNOWN";
+                        snapshot.success_rate = success_rate;
+                        snapshot.ema_latency_ms = ema_latency_ms;
+                        snapshot.total_calls = total_writes;
+                        repo->upsertAgentHealthSnapshot(snapshot);
+                    } catch (const std::exception& snapshot_error) {
+                        LOG_WARN("Health snapshot persist failed for " + agent_id +
+                                 ": " + snapshot_error.what());
+                    }
                 });
 
-            for (const auto& [agent_id, unhealthy] : unhealthy_by_agent) {
-                if (unhealthy) {
-                    router->markAgentUnhealthy(agent_id);
-                } else {
+            for (const auto& [agent_id, verdict] : verdicts) {
+                const bool unhealthy =
+                    verdict.heartbeat_timeout || verdict.metrics_unhealthy;
+                if (!unhealthy) {
+                    {
+                        std::lock_guard<std::mutex> lock(probation_mutex);
+                        metrics_unhealthy_streak.erase(agent_id);
+                    }
                     router->markAgentHealthy(agent_id);
+                    continue;
+                }
+                if (verdict.heartbeat_timeout) {
+                    {
+                        std::lock_guard<std::mutex> lock(probation_mutex);
+                        metrics_unhealthy_streak.erase(agent_id);
+                    }
+                    router->markAgentUnhealthy(agent_id);
+                    continue;
+                }
+                // Metrics-only UNHEALTHY: probation counter decides.
+                int streak = 0;
+                {
+                    std::lock_guard<std::mutex> lock(probation_mutex);
+                    streak = ++metrics_unhealthy_streak[agent_id];
+                }
+                if (streak >= kProbationCycles) {
+                    {
+                        std::lock_guard<std::mutex> lock(probation_mutex);
+                        metrics_unhealthy_streak[agent_id] = 0;
+                    }
+                    router->markAgentHealthy(agent_id);
+                    LOG_INFO("Agent " + agent_id +
+                             " re-admitted to routing after probation (UNHEALTHY x" +
+                             std::to_string(kProbationCycles) +
+                             "); fresh samples will decide the next verdict");
+                } else {
+                    router->markAgentUnhealthy(agent_id);
                 }
             }
         },
@@ -413,13 +517,13 @@ int main(int argc, char* argv[]) {
     agent_rpc::common::BackgroundScheduler::instance().scheduleAtFixedRate(
         "span_batch_flush",
         [&server]() {
-            std::queue<QueuedSpan> batch;
+            std::deque<QueuedSpan> batch;
             {
                 std::lock_guard<std::mutex> lock(g_span_queue_mutex);
                 size_t count = std::min(g_span_queue.size(), kSpanBatchMax);
                 for (size_t i = 0; i < count; ++i) {
-                    batch.push(std::move(g_span_queue.front()));
-                    g_span_queue.pop();
+                    batch.push_back(std::move(g_span_queue.front()));
+                    g_span_queue.pop_front();
                 }
             }
 
@@ -427,35 +531,54 @@ int main(int argc, char* argv[]) {
 
             auto* redis = server.getRedisClient();
             if (!redis || !redis->isConnected()) {
-                // Redis unavailable — put spans back (best-effort)
+                // Redis unavailable — put the batch back at the FRONT so the
+                // per-trace span order survives the outage, then re-apply the
+                // hard cap (transient telemetry: drop oldest, never grow
+                // unbounded).
                 size_t requeued = batch.size();
-                std::lock_guard<std::mutex> lock(g_span_queue_mutex);
-                while (!batch.empty()) {
-                    g_span_queue.push(std::move(batch.front()));
-                    batch.pop();
+                {
+                    std::lock_guard<std::mutex> lock(g_span_queue_mutex);
+                    while (!batch.empty()) {
+                        g_span_queue.push_front(std::move(batch.back()));
+                        batch.pop_back();
+                    }
+                    while (g_span_queue.size() > kSpanQueueMax) {
+                        g_span_queue.pop_front();
+                    }
                 }
                 LOG_WARN("Span batch flush: Redis unavailable, re-queued " +
                          std::to_string(requeued) + " spans");
                 return;
             }
 
-            // Group spans by trace_id and RPUSH each batch as a JSON string
+            // Group spans by trace_id and RPUSH each batch as a JSON string.
+            // nlohmann::json handles the escaping; metadata_json (when the
+            // span carries one) is embedded so Redis mirrors the PG payload.
             size_t flushed = 0;
             while (!batch.empty()) {
-                auto& qs = batch.front();
-                std::string json = "{\"trace_id\":\"" + qs.trace_id +
-                    "\",\"span_id\":\"" + qs.span_id +
-                    "\",\"name\":\"" + qs.name +
-                    "\",\"component\":\"" + qs.component +
-                    "\",\"duration_ms\":" + std::to_string(qs.duration_ms) +
-                    ",\"status\":\"" + qs.status + "\"}";
+                const auto& qs = batch.front();
+                nlohmann::json span_json;
+                span_json["trace_id"] = qs.trace_id;
+                span_json["span_id"] = qs.span_id;
+                span_json["name"] = qs.name;
+                span_json["component"] = qs.component;
+                span_json["duration_ms"] = qs.duration_ms;
+                span_json["status"] = qs.status;
+                if (!qs.metadata_json.empty()) {
+                    try {
+                        span_json["metadata"] = nlohmann::json::parse(qs.metadata_json);
+                    } catch (const nlohmann::json::exception&) {
+                        // Malformed metadata: keep the raw string for inspection.
+                        span_json["metadata_raw"] = qs.metadata_json;
+                    }
+                }
 
                 std::string key = "trace:spans:" + qs.trace_id;
-                redis->rpush(key, json);
+                redis->rpush(key, span_json.dump());
                 // Set 24h TTL on the trace key (refreshed on each push)
                 redis->expire(key, 86400);
                 ++flushed;
-                batch.pop();
+                batch.pop_front();
             }
 
             LOG_DEBUG("Span batch flush: wrote " + std::to_string(flushed) + " spans to Redis");

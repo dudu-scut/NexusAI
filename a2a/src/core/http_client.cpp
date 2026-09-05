@@ -377,11 +377,25 @@ void HttpClient::post_stream(const std::string& url,
     // streaming calls; the low-speed timeout acts as a liveness check
     // (disconnect after 60s of no data).
     curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT, impl_->timeout_ > 0 ? impl_->timeout_ : 300L);
+    // LOW_SPEED_* belongs to libcurl's progress-meter logic: with the default
+    // NOPROGRESS=1 the 60s liveness check silently never fires. Enable the
+    // meter unconditionally; the abort XFERINFO hook (when registered) rides
+    // on the same callback slot below.
+    curl_easy_setopt(curl.get(), CURLOPT_NOPROGRESS, 0L);
     curl_easy_setopt(curl.get(), CURLOPT_LOW_SPEED_LIMIT, 1L);  // Minimum speed: 1 byte/s
     curl_easy_setopt(curl.get(), CURLOPT_LOW_SPEED_TIME, 60L);  // Timeout if below minimum speed for 60s
+    // P21 L2: pin validated host→IP mappings for this transfer (parity with
+    // post(): silently ignoring them here would reopen the DNS-rebinding
+    // window for streaming calls).
+    CurlSList resolve_list;
+    for (const auto& entry : impl_->resolve_entries_) {
+        resolve_list.append(entry.c_str());
+    }
+    if (resolve_list.get()) {
+        curl_easy_setopt(curl.get(), CURLOPT_RESOLVE, resolve_list.get());
+    }
     // P20: in-flight abort channel (DAG subtask cancellation).
     if (impl_->abort_flag_) {
-        curl_easy_setopt(curl.get(), CURLOPT_NOPROGRESS, 0L);
         curl_easy_setopt(curl.get(), CURLOPT_XFERINFOFUNCTION, abort_check_callback);
         curl_easy_setopt(curl.get(), CURLOPT_XFERINFODATA, impl_->abort_flag_);
     }

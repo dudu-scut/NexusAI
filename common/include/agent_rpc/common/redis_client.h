@@ -61,6 +61,13 @@ public:
                 const std::string& value);
 
     // ========================================================================
+    // Set operations
+    // ========================================================================
+
+    /** Add a member to a set (C2 direction 3: preference-conflict candidates). */
+    bool sadd(const std::string& key, const std::string& member);
+
+    // ========================================================================
     // List operations
     // ========================================================================
 

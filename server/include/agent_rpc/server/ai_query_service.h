@@ -182,6 +182,13 @@ private:
         std::string model;
         std::int64_t estimated_tokens = 0;
         std::atomic<bool> finalized{false};
+        // Idempotent-replay signal: beginDurableRows found the query_log row
+        // already in a terminal state (same request_id retried after completion).
+        // The caller short-circuits execution and returns the persisted answer;
+        // finalize stays a no-op so the original terminal state is preserved.
+        bool replay_terminal = false;
+        std::string replay_status;
+        std::string replay_response;
     };
 
     // Steps 2-3: ensure conversation, create running query_log/trace rows.
@@ -196,7 +203,8 @@ private:
     void buildSystemContextFromPg(const std::string& owner_id,
                                   const std::string& conversation_id,
                                   agent_communication::SystemContext* system_context,
-                                  bool sandbox_request = false);
+                                  bool sandbox_request = false,
+                                  const std::string& query_text = {});
     // Step 6: terminal persistence, executed at most once per run.
     void finalizeDurableQuery(DurableQueryRun& run, const std::string& status,
                               const std::string& response_text,

@@ -394,3 +394,13 @@ RAG-MCP 的 Prometheus 风格指标为**未来规划（未实现）**——当�
 ## 示例代码
 
 完整示例请参考 `examples/rag_mcp_example.cpp`。
+
+## 批次八扩展（2026-09-04）
+
+RAG-MCP 的向量索引基建在批次八被三处复用/扩展：
+
+1. **意图缓存**（`NEXUSAI_INTENT_CACHE=1`）：AgentRouter 在 LLM 意图分类命中后把 query 向量写入 `SemanticCacheIndex`，后续相似查询（余弦 ≥ 0.92）直接复用意图、跳过 LLM 分类。
+2. **route-then-plan 技能剪枝**（`NEXUSAI_PLAN_SKILL_PRUNE=1`）：`AgentRouter::rankSkillsBySimilarity` 对技能索引做 top-K 相似检索（按技能名聚合取最高分，规避同技能多 Agent 的重复条目），规划 prompt 只携带子集（上限 50 条）；子集为空或 embedding 不可用时回退全量清单。
+3. **记忆向量召回**（`NEXUSAI_MEMORY_VECTOR_RECALL=1`）：`HintDedupIndex`（P18 去重闸）扩展为召回索引（`rememberHint` 保存 key→value 映射、`searchSimilar` 返回结构化 hints），主查询组装时按相关性 Top-K 注入长期记忆，其余折叠为注记；embedding 不可用时回退全量注入。
+
+三者均为默认关闭的开关项，降级语义一致：底层能力不可用时等价于该特性不存在。

@@ -1,9 +1,11 @@
 #include "agent_rpc/server/auth_interceptor.h"
 #include "agent_rpc/server/auth_service.h"
 #include "agent_rpc/common/redis_client.h"
+#include "agent_rpc/common/trace_context.h"
 
 #include <cstddef>
 #include <nlohmann/json.hpp>
+#include <algorithm>
 #include <chrono>
 
 namespace agent_rpc {
@@ -86,6 +88,30 @@ void AuthInterceptor::Intercept(
             if (trace_it != metadata->end() && trace_it->second.size() != 0 &&
                 isValidTraceId(trace_it->second)) {
                 tls_auth_.trace_id = std::string(trace_it->second.data(), trace_it->second.size());
+            }
+            // Cross-process delegation depth (R41): the a2a_adapter sends
+            // depth+1 on every delegated call, but nothing consumed the
+            // header — the MAX_DEPTH guard only ever counted intra-process
+            // adapter calls. Seed this process's TLS counter from the header
+            // so the 5-layer limit spans process boundaries.
+            auto depth_it = metadata->find("x-delegation-depth");
+            if (depth_it != metadata->end() && depth_it->second.size() != 0) {
+                int inbound_depth = 0;
+                try {
+                    inbound_depth = std::stoi(std::string(
+                        depth_it->second.data(), depth_it->second.size()));
+                } catch (const std::exception&) {
+                    inbound_depth = 0;
+                }
+                // Clamp to the router's MAX_DEPTH band: a forged header
+                // must neither bypass the limit (small value resetting the
+                // counter) nor wedge every later call (huge value).
+                inbound_depth = std::min(inbound_depth, 5);
+                if (inbound_depth > 0) {
+                    if (auto* trace_ctx = agent_rpc::common::TraceContext::current()) {
+                        trace_ctx->setDepth(inbound_depth);
+                    }
+                }
             }
         }
 

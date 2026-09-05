@@ -374,6 +374,19 @@ std::string LoadBalancerManager::getCurrentStrategyName() const {
     return load_balancer_ ? load_balancer_->getStrategyName() : "None";
 }
 
+std::optional<ServiceEndpoint> LoadBalancerManager::selectEndpointByKey(
+    const std::string& key, const std::vector<ServiceEndpoint>& endpoints) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (current_strategy_ != LoadBalanceStrategy::CONSISTENT_HASH) {
+        return std::nullopt;
+    }
+    auto* consistent_hash = dynamic_cast<ConsistentHashLoadBalancer*>(load_balancer_.get());
+    if (!consistent_hash) {
+        return std::nullopt;
+    }
+    return consistent_hash->selectEndpointByKey(key, endpoints);
+}
+
 ServiceEndpoint LoadBalancerManager::selectEndpoint(const std::vector<ServiceEndpoint>& endpoints) {
     std::lock_guard<std::mutex> lock(mutex_);
     return load_balancer_->selectEndpoint(endpoints);

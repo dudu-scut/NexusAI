@@ -827,7 +827,25 @@ public:
 
     std::string chat(const std::string& /*system_prompt*/,
                      const std::string& user_message) override {
+        return chatWithRecording(user_message, LLMClient::kDefaultChatTimeoutSeconds);
+    }
+
+    // A3/P20-8: the planner now calls the deadline-aware overload — record
+    // the timeout alongside the prompt so tests can assert the contraction.
+    std::string chat(const std::string& system_prompt,
+                     const std::string& user_message,
+                     int timeout_seconds) override {
+        return chatWithRecording(user_message, timeout_seconds);
+    }
+
+    int callCount() const { return static_cast<int>(calls_.size()); }
+    const std::string& promptAt(int i) const { return calls_.at(i); }
+    int timeoutAt(int i) const { return timeouts_.at(i); }
+
+private:
+    std::string chatWithRecording(const std::string& user_message, int timeout_seconds) {
         calls_.push_back(user_message);
+        timeouts_.push_back(timeout_seconds);
         if (responses_.empty()) {
             return "";  // no scripted reply — keep the fake safe for
                          // parse-only tests that never reach chat()
@@ -836,12 +854,9 @@ public:
         return responses_[idx < responses_.size() ? idx : responses_.size() - 1];
     }
 
-    int callCount() const { return static_cast<int>(calls_.size()); }
-    const std::string& promptAt(int i) const { return calls_.at(i); }
-
-private:
     std::vector<std::string> responses_;
     std::vector<std::string> calls_;
+    std::vector<int> timeouts_;
 };
 
 } // anonymous namespace
@@ -912,6 +927,56 @@ TEST(TaskPlannerDropTest, RetriesExactlyOnceWhenTasksDropped) {
     ASSERT_EQ(plan.tasks.size(), 2u);     // retry result accepted
     EXPECT_NE(fake_ptr->promptAt(1).find("缺少 description 字段"),
               std::string::npos);
+}
+
+TEST(TaskPlannerDropTest, DuplicateTaskIdIsDroppedNotCycled) {
+    // P13/R13: a duplicate id must be dropped (counted) instead of reaching
+    // the executor, where the shared task_map previously faked a dependency
+    // cycle and failed the whole plan.
+    TaskPlannerConfig cfg;
+    TaskPlanner planner(cfg, std::make_unique<ScriptedLLMClient>(std::vector<std::string>{}));
+    const std::string response = R"({"single": false, "tasks": [
+        {"id": "t1", "description": "翻译文本", "skill": "translation"},
+        {"id": "t1", "description": "重复 id", "skill": "math"}
+    ]})";
+    auto plan = planner.parsePlanResponse(response, "测试查询");
+    ASSERT_FALSE(plan.is_single_agent);
+    ASSERT_EQ(plan.tasks.size(), 1u);
+    EXPECT_EQ(plan.tasks[0].id, "t1");
+}
+
+TEST(TaskPlannerDropTest, PlanCarriesDroppedTaskCount) {
+    // P13(d)/A2: the worst-observed drop count lands on the plan so the
+    // aggregator can disclose the uncovered requirement to the user.
+    const std::string bad = R"({"single": false, "tasks": [
+        {"id": "t1", "skill": "math"},
+        {"id": "t2", "skill": "math"}
+    ]})";
+    TaskPlannerConfig cfg;
+    auto fake = std::make_unique<ScriptedLLMClient>(std::vector<std::string>{bad, bad});
+    TaskPlanner planner(cfg, std::move(fake));
+
+    std::unordered_map<std::string, std::string> skills = {{"math", "数学"}};
+    auto plan = planner.plan("计算", skills);
+    EXPECT_EQ(plan.dropped_tasks, 2);
+}
+
+TEST(TaskPlannerDropTest, PlanningTimeoutPassedThroughToLLM) {
+    // A3/P20-8: the per-call timeout is threaded into the LLM call so the
+    // planning phase honors the remaining request budget.
+    const std::string ok = R"({"single": false, "tasks": [
+        {"id": "t1", "description": "计算", "skill": "math"}
+    ]})";
+    TaskPlannerConfig cfg;
+    auto fake = std::make_unique<ScriptedLLMClient>(std::vector<std::string>{ok});
+    auto* fake_ptr = fake.get();
+    TaskPlanner planner(cfg, std::move(fake));
+
+    std::unordered_map<std::string, std::string> skills = {{"math", "数学"}};
+    auto plan = planner.plan("计算", skills, 7);
+    EXPECT_EQ(fake_ptr->callCount(), 1);
+    EXPECT_EQ(fake_ptr->timeoutAt(0), 7);
+    ASSERT_FALSE(plan.is_single_agent);
 }
 
 TEST(TaskPlannerDropTest, RetryOnceThenAcceptFailSoft) {

@@ -110,6 +110,23 @@ struct QueryHelpers {
                                    const std::string& context_id,
                                    int message_count);
 
+    /**
+     * B7 (P11): vector recall over the long-term memory hints. Returns the
+     * top-k hints (key, value, cosine similarity) most relevant to
+     * query_text, using the same lazily-initialized embedding index the
+     * P18 dedup gate builds. Only meaningful in MCP builds with the
+     * embedding service configured — every other build returns an empty
+     * vector and callers inject the full hint set (legacy behavior).
+     */
+    struct RelevantHint {
+        std::string key;
+        std::string value;
+        double similarity = 0.0;
+    };
+    static std::vector<RelevantHint> recallRelevantHints(const std::string& query_text,
+                                                         int top_k = 5,
+                                                         float threshold = 0.6f);
+
     static std::string buildMemoryContext(const agent_communication::AIQueryRequest* request);
 
 private:

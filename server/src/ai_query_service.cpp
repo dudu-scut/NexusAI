@@ -70,8 +70,11 @@ bool AIQueryServiceImpl::initialize(
 
     // Initialize MemoryService (Redis-backed cache only; PostgreSQL is the
     // source of truth for conversation context).
+    // C1: wire the durable memory domain — Tier-2 hints and cross-agent
+    // summaries become PG records (V015); Redis keys degrade to projections.
     memory_service_ = std::make_unique<common::MemoryService>(
-        std::shared_ptr<common::RedisClient>(redis, [](common::RedisClient*){}));
+        std::shared_ptr<common::RedisClient>(redis, [](common::RedisClient*){}),
+        &domain);
 
     // Initialize A2A adapter
     if (!a2a_adapter_->initialize(a2a_config)) {
@@ -236,10 +239,29 @@ bool AIQueryServiceImpl::beginDurableRows(DurableQueryRun& run, const std::strin
     log.execution_plan = plan_json;
     log.model = run.model;
     log.status = "running";
-    if (!domain_repo_->createQueryLog(log) &&
-        !domain_repo_->getQueryLogById(run.owner_id, run.request_id).has_value()) {
-        LOG_ERROR("Failed to create query log for request " + run.request_id);
-        return false;
+    if (!domain_repo_->createQueryLog(log)) {
+        auto existing = domain_repo_->getQueryLogById(run.owner_id, run.request_id);
+        if (!existing.has_value()) {
+            LOG_ERROR("Failed to create query log for request " + run.request_id);
+            return false;
+        }
+        // Same request_id retried after a terminal state: the pipeline must
+        // NOT re-execute the query (double LLM cost) nor overwrite the
+        // recorded terminal state. Signal the caller to short-circuit with
+        // the persisted answer; finalize stays a no-op for this run.
+        static const char* kTerminalStates[] = {"completed", "failed", "cancelled",
+                                                "rejected", "planned"};
+        for (const char* terminal : kTerminalStates) {
+            if (existing->status == terminal) {
+                run.replay_terminal = true;
+                run.replay_status = existing->status;
+                run.replay_response = existing->response_text;
+                run.finalized.store(true);
+                LOG_INFO("Durable replay short-circuit for request " + run.request_id +
+                         " (status " + existing->status + ")");
+                return true;
+            }
+        }
     }
 
     nlohmann::json trace_start;
@@ -255,6 +277,22 @@ bool AIQueryServiceImpl::beginDurableRows(DurableQueryRun& run, const std::strin
     if (!domain_repo_->createTrace(trace) &&
         !domain_repo_->getTraceById(run.owner_id, run.trace_row_id).has_value()) {
         LOG_ERROR("Failed to create trace for request " + run.request_id);
+        // Partial step-3 failure: the query_log row already exists — persist
+        // a terminal "failed" state best-effort instead of leaving it running
+        // forever (the caller returns INTERNAL without running finalize).
+        try {
+            common::QueryLogRecord failed_log;
+            failed_log.id = run.request_id;
+            failed_log.owner_id = run.owner_id;
+            failed_log.response_text = "Failed to persist query start";
+            failed_log.model = run.model;
+            failed_log.status = "failed";
+            domain_repo_->updateQueryLog(failed_log);
+        } catch (const std::exception& nested) {
+            LOG_ERROR(std::string("best-effort failed terminal write also failed: ") +
+                      nested.what());
+        }
+        run.finalized.store(true);
         return false;
     }
     return true;
@@ -321,7 +359,7 @@ static void runCacheOnly(Fn&& operation, const std::string& what);
 void AIQueryServiceImpl::buildSystemContextFromPg(
     const std::string& owner_id, const std::string& conversation_id,
     agent_communication::SystemContext* system_context,
-    bool sandbox_request) {
+    bool sandbox_request, const std::string& query_text) {
     if (!system_context) {
         return;
     }
@@ -367,15 +405,37 @@ void AIQueryServiceImpl::buildSystemContextFromPg(
     }
     runCacheOnly([&] {
         // Tier-2 long-term memory: merge with a non-empty PG memory_summary
-        // instead of overwriting it.
-        const std::string recalled = memory_service_->getUserMemory(owner_id);
-        if (!recalled.empty()) {
-            std::string merged = system_context->user_memory();
-            if (!merged.empty()) {
-                merged += "\n";
+        // instead of overwriting it. A5/C2-4: hints travel in the dedicated
+        // user_facts field so the LLM can distinguish "what the user said"
+        // (hard facts) from the "[User Profile]" platform inference merged
+        // into user_memory below.
+        //
+        // B7 (P11): vector recall — when enabled and the hint set is large
+        // enough for Top-K to beat full injection, only the hints most
+        // similar to the query are injected; the rest folds into a note.
+        // Any failure degrades to full injection (legacy behavior).
+        std::string recalled = memory_service_->getUserMemory(owner_id);
+        const bool vector_recall =
+            common::envOrDefault("NEXUSAI_MEMORY_VECTOR_RECALL", "0") == "1" &&
+            !query_text.empty();
+        if (vector_recall) {
+            const auto relevant =
+                helpers_.recallRelevantHints(query_text, 5, 0.6f);
+            if (!relevant.empty() &&
+                recalled.find('\n') != std::string::npos) {
+                std::string selected;
+                for (const auto& hint : relevant) {
+                    selected += hint.key + ": " + hint.value + "\n";
+                }
+                selected += "[另有部分低相关记忆未注入]";
+                recalled = selected;
             }
-            merged += recalled;
-            system_context->set_user_memory(merged);
+        }
+        if (!recalled.empty()) {
+            // C2 direction 4: user-stated facts travel in the dedicated
+            // user_facts field, separated from the platform-inferred
+            // "[User Profile]" text merged into user_memory above.
+            system_context->set_user_facts(recalled);
         }
         // Tier-3 cross-agent summary recall.
         const std::string summary =
@@ -387,9 +447,49 @@ void AIQueryServiceImpl::buildSystemContextFromPg(
         // it via summarize(), and merge with a "[User Profile] " prefix into
         // user_memory (same merge pattern as the hints above). An empty or
         // corrupt profile degrades silently with no prefix.
+        //
+        // B5 (P17n): PG (V004 user_profiles) is the primary source; the
+        // Redis key is a transitional fallback that gets backfilled into PG
+        // on read (cache-aside rebuild) until the write path has fully
+        // retired it.
         std::string profile_raw;
-        if (redis_client_->get("user_profile:" + owner_id, profile_raw) &&
+        bool have_profile = false;
+        if (domain_repo_) {
+            try {
+                auto pg_profile = domain_repo_->getUserProfile(owner_id);
+                if (pg_profile.has_value() && !pg_profile->identity.empty()) {
+                    profile_raw = "{\"identity\":" + pg_profile->identity +
+                                  ",\"preferences\":" + pg_profile->preferences + "}";
+                    have_profile = true;
+                }
+            } catch (const std::exception& pg_error) {
+                LOG_WARN("PG profile read failed, falling back to Redis: " +
+                         std::string(pg_error.what()));
+            }
+        }
+        if (!have_profile &&
+            redis_client_->get("user_profile:" + owner_id, profile_raw) &&
             !profile_raw.empty()) {
+            have_profile = true;
+            // Transitional backfill: Redis hit + PG miss → rebuild PG.
+            if (domain_repo_) {
+                try {
+                    const auto rebuild = nlohmann::json::parse(profile_raw);
+                    common::UserProfileRecord backfill;
+                    backfill.user_id = owner_id;
+                    backfill.identity =
+                        rebuild.value("identity", nlohmann::json::object()).dump();
+                    backfill.preferences =
+                        rebuild.value("preferences", nlohmann::json::array()).dump();
+                    if (domain_repo_->upsertUserProfile(backfill)) {
+                        LOG_INFO("Profile backfilled into PG for " + owner_id);
+                    }
+                } catch (const std::exception&) {
+                    // Backfill is best-effort; the profile still serves.
+                }
+            }
+        }
+        if (have_profile) {
             try {
                 const auto profile_json = nlohmann::json::parse(profile_raw);
                 const std::string identity =
@@ -424,7 +524,7 @@ void AIQueryServiceImpl::finalizeDurableQuery(DurableQueryRun& run, const std::s
     if (!domain_repo_) {
         return;
     }
-
+    try {
     // Conversation messages are appended at most once per request_id. The
     // message ids are deterministic ("msg-user-" / "msg-assistant-" +
     // request_id) and the repository deduplicates on them, so every run that
@@ -543,6 +643,19 @@ void AIQueryServiceImpl::finalizeDurableQuery(DurableQueryRun& run, const std::s
             },
             "memory segment extraction");
     }
+    } catch (const std::exception& finalize_error) {
+        // A PG fault mid-finalize (between the message/log/trace/ledger
+        // writes) must not strand the row in "running" with the CAS guard
+        // already consumed — that state is unreachable for abortDurableRun.
+        // Release the guard and rethrow: the outer crash guard re-enters
+        // finalize with the "failed" terminal, and the idempotent sub-writes
+        // (deterministic message ids, usage-<request_id> ledger key) make the
+        // retry safe.
+        run.finalized.store(false);
+        LOG_ERROR("finalize persistence failed for request " + run.request_id +
+                  ": " + finalize_error.what());
+        throw;
+    }
 }
 
 void AIQueryServiceImpl::maybeScheduleProfileExtraction(
@@ -575,7 +688,14 @@ void AIQueryServiceImpl::maybeScheduleProfileExtraction(
     if (!redis_client_->hsetnx("profile:queued", run.owner_id, "1")) {
         return;
     }
-    redis_client_->rpush("profile:pending", run.owner_id);
+    if (!redis_client_->rpush("profile:pending", run.owner_id)) {
+        // Queue push failed: release the dedup guard, otherwise the owner is
+        // starved forever (hsetnx never succeeds again → never re-enqueued).
+        redis_client_->hdel("profile:queued", run.owner_id);
+        LOG_WARN("profile:pending push failed for owner " + run.owner_id +
+                 "; dedup guard released");
+        return;
+    }
     LOG_INFO("Profile extraction queued for owner " + run.owner_id);
 }
 
@@ -726,13 +846,52 @@ grpc::Status AIQueryServiceImpl::Query(
     run.question = request->question();
     run.model = common::envOrDefault("LLM_MODEL", "deepseek-v4-flash");
 
-    const std::string route = orchestrator_enabled_ ? "multi-agent" : "single-agent-a2a";
+    const std::string route = request->plan_only()
+        ? "plan-only"
+        : (orchestrator_enabled_ ? "multi-agent" : "single-agent-a2a");
     nlohmann::json plan_json;
     plan_json["mode"] = "sync";
     plan_json["request_id"] = request_id;
     if (!beginDurableRows(run, route, plan_json.dump())) {
         return grpc::Status(grpc::StatusCode::INTERNAL,
                            "Failed to persist query start");
+    }
+
+    // Idempotent replay: the same request_id already reached a terminal state
+    // in a previous run. Return the persisted answer without re-executing
+    // (double LLM cost) and without touching the recorded terminal state.
+    // Non-completed terminals surface their original semantics so a client
+    // retrying a failed/rejected request sees the same outcome, not a
+    // successful-looking empty answer.
+    if (run.replay_terminal) {
+        LOG_INFO("Query replay short-circuit for request " + request_id +
+                 " (status " + run.replay_status + ")");
+        response->set_request_id(request_id);
+        response->set_task_id(request_id);
+        response->set_answer(run.replay_response);
+        if (run.replay_status == "completed") {
+            return grpc::Status::OK;
+        }
+        if (run.replay_status == "planned") {
+            // Plan-only run already delivered its plan; execution continues
+            // via a follow-up ExecutePlan call, not by re-running this query.
+            return grpc::Status(
+                grpc::StatusCode::FAILED_PRECONDITION,
+                "Plan already generated for this request_id; execute it via ExecutePlan");
+        }
+        if (run.replay_status == "cancelled") {
+            return grpc::Status(grpc::StatusCode::CANCELLED, "Request already cancelled");
+        }
+        if (run.replay_status == "rejected") {
+            return grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED,
+                                run.replay_response.empty()
+                                    ? "Request already rejected (budget)"
+                                    : run.replay_response);
+        }
+        return grpc::Status(grpc::StatusCode::INTERNAL,
+                            run.replay_response.empty()
+                                ? "Request already failed"
+                                : run.replay_response);
     }
 
     // Step 4: PostgreSQL budget reservation (rejected rows persisted inside).
@@ -748,9 +907,9 @@ grpc::Status AIQueryServiceImpl::Query(
     enriched_req.set_context_id(context_id);
     buildSystemContextFromPg(owner_id, context_id,
                              enriched_req.mutable_system_context(),
-                             request->sandbox());
+                             request->sandbox(), request->question());
 
-    common::TraceContext::init(owner_id, context_id);
+    common::TraceContext::init(owner_id, context_id, run.trace_row_id);
 
     if (context->IsCancelled()) {
         finalizeDurableQuery(run, "cancelled", "", "Request cancelled");
@@ -774,6 +933,13 @@ grpc::Status AIQueryServiceImpl::Query(
         error_message = execution_status.error_message();
         response->set_request_id(request_id);
         response->set_task_id(request_id);
+        // B1: plan-only run — the handler delivered the plan JSON in the
+        // answer; finalize as "planned" (terminal, zero execution).
+        if (success && request->plan_only()) {
+            finalizeDurableQuery(run, "planned", "", "");
+            helpers_.updateTaskStatus(request_id, "planned");
+            return grpc::Status::OK;
+        }
     } else {
         if (circuit_breaker_ && !circuit_breaker_->isRequestAllowed()) {
             LOG_WARN("A2A backend circuit breaker open, rejecting query: " + request_id);
@@ -959,13 +1125,46 @@ grpc::Status AIQueryServiceImpl::QueryStream(
     run.question = request->question();
     run.model = common::envOrDefault("LLM_MODEL", "deepseek-v4-flash");
 
-    const std::string route = orchestrator_enabled_ ? "multi-agent" : "single-agent-a2a";
+    const std::string route = request->plan_only()
+        ? "plan-only"
+        : (orchestrator_enabled_ ? "multi-agent" : "single-agent-a2a");
     nlohmann::json plan_json;
     plan_json["mode"] = "stream";
     plan_json["request_id"] = request_id;
     if (!beginDurableRows(run, route, plan_json.dump())) {
         return grpc::Status(grpc::StatusCode::INTERNAL,
                            "Failed to persist query start");
+    }
+
+    // Idempotent replay (same contract as the sync path): the request already
+    // reached a terminal state — re-deliver the persisted outcome as a single
+    // terminal event and stop. No re-execution, no terminal overwrite.
+    if (run.replay_terminal) {
+        LOG_INFO("QueryStream replay short-circuit for request " + request_id +
+                 " (status " + run.replay_status + ")");
+        agent_communication::AIStreamEvent replay_event;
+        replay_event.set_context_id(context_id);
+        if (run.replay_status == "completed") {
+            replay_event.set_event_type("complete");
+            replay_event.set_content(run.replay_response);
+            writer->Write(replay_event);
+            return grpc::Status::OK;
+        }
+        replay_event.set_event_type("error");
+        replay_event.set_content(run.replay_status == "cancelled"
+            ? "Request already cancelled"
+            : (run.replay_status == "planned"
+                ? "Plan already generated for this request_id; execute it via ExecutePlan"
+                : (run.replay_response.empty()
+                    ? "Request already ended with status " + run.replay_status
+                    : run.replay_response)));
+        writer->Write(replay_event);
+        return grpc::Status(
+            run.replay_status == "cancelled" ? grpc::StatusCode::CANCELLED
+            : run.replay_status == "planned" ? grpc::StatusCode::FAILED_PRECONDITION
+            : run.replay_status == "rejected" ? grpc::StatusCode::RESOURCE_EXHAUSTED
+            : grpc::StatusCode::INTERNAL,
+            "Request already finalized with status " + run.replay_status);
     }
 
     // Step 4: budget reservation (rejected terminal persisted inside).
@@ -981,9 +1180,9 @@ grpc::Status AIQueryServiceImpl::QueryStream(
     enriched_req.set_context_id(context_id);
     buildSystemContextFromPg(owner_id, context_id,
                              enriched_req.mutable_system_context(),
-                             request->sandbox());
+                             request->sandbox(), request->question());
 
-    common::TraceContext::init(owner_id, context_id);
+    common::TraceContext::init(owner_id, context_id, run.trace_row_id);
     helpers_.updateTaskStatus(request_id, "working");
 
     // This service is the single emitter of terminal stream events. Lower
@@ -1023,8 +1222,24 @@ grpc::Status AIQueryServiceImpl::QueryStream(
         QueryHelpers::recordMetrics("QueryStream", duration.count(), status.ok());
 
         if (status.ok()) {
+            // B1: plan-only run — the handler delivered the plan event plus
+            // the awaiting_confirmation marker; finalize as "planned"
+            // (terminal, zero execution).
+            if (request->plan_only()) {
+                finalizeDurableQuery(run, "planned", "", "");
+                helpers_.updateTaskStatus(request_id, "planned");
+                return grpc::Status::OK;
+            }
+            // Final cancellation re-check: the client may have disconnected
+            // between the last event write and this point — persist
+            // "cancelled" instead of a completed (and billed) run.
+            if (context->IsCancelled()) {
+                finalizeDurableQuery(run, "cancelled", answer, "Request cancelled");
+                helpers_.updateTaskStatus(request_id, "cancelled");
+                return grpc::Status(grpc::StatusCode::CANCELLED, "Request cancelled");
+            }
             // Streaming-path memory wiring: the handler hands back the real
-            // acting agent, so the agent-switch pipeline (last_agent write +
+            // acting agent, so the agent-switch pipeline (last_agent +
             // async cross-agent summary) runs here exactly as on the sync
             // Query path. Memory hints have no streaming channel
             // (AIStreamEvent carries none), so updateUserMemoryFromHints is
@@ -1056,6 +1271,10 @@ grpc::Status AIQueryServiceImpl::QueryStream(
     // Circuit breaker check
     if (circuit_breaker_ && !circuit_breaker_->isRequestAllowed()) {
         LOG_WARN("A2A backend circuit breaker open, rejecting streaming query: " + request_id);
+        // In-band error: the stream is still healthy here — deliver a
+        // structured error event so the client is not left waiting on EOF
+        // (parity with the lower_error paths below).
+        emitTerminal("error", "A2A backend temporarily unavailable (circuit breaker open)");
         finalizeDurableQuery(run, "failed", "", "Circuit breaker open");
         helpers_.updateTaskStatus(request_id, "failed", "", "", "Circuit breaker open");
         return grpc::Status(grpc::StatusCode::UNAVAILABLE, "A2A backend circuit breaker open");

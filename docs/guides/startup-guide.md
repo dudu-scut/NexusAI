@@ -20,7 +20,7 @@
 | gRPC + Protobuf | 1.51.1+ | `sudo apt install libgrpc++-dev protobuf-compiler-grpc` |
 | Redis | 7.0+ | `sudo apt install redis-server` |
 | PostgreSQL 16 + libpq | 16+ | `sudo apt install postgresql libpq-dev`（Docker 方式见第五节） |
-| libpqxx | 8.0.1（pin） | `./scripts/bootstrap-wsl.sh` 自动安装 |
+| libpqxx | 8.0.1（pin） | `./scripts/bootstrap-wsl.sh` 自动安装（`scripts/` 为本地辅助脚本不入库；手动安装见下方命令） |
 | hiredis | - | `sudo apt install libhiredis-dev` |
 | nlohmann-json | 3.x | 项目自带（`a2a/third_party/json.hpp`） |
 | Node.js | 18+ | Windows 安装或 `nvm` |
@@ -55,6 +55,18 @@ LLM_API_URL=https://api.deepseek.com
 | `LLM_API_URL` | 否 | API 端点 |
 
 > ⚠️ 不配置 `LLM_API_KEY` 会导致 Orchestrator 的路由 Tier 2（LLM 意图分类）和 DAG 任务分解不可用，但服务本身可以启动，基础查询走 Tier 1 Embedding 路由。
+
+**批次八新增开关（默认关，按需开启）：**
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `NEXUSAI_INTENT_CACHE` | 关 | 相似查询复用 LLM 意图分类结果（需 MCP 构建 + Embedding 层） |
+| `NEXUSAI_PLAN_SKILL_PRUNE` | 关 | 规划前用向量相似度剪枝技能清单（route-then-plan） |
+| `NEXUSAI_MEMORY_VECTOR_RECALL` | 关 | 大规模 hints 下按相关性 Top-K 注入（其余折叠） |
+| `NEXUSAI_MEMORY_DEDUP_EMBEDDING` | 关 | hints 写入前 embedding 余弦去重（P18 末闸） |
+| `NEXUSAI_SSRF_STRICT` | 关 | SSRF 严格模式：内网 IP 黑名单 + 端口白名单 |
+
+另有既定开关：`NEXUSAI_EMBEDDING_ROUTER`（P7 Embedding 路由层）、`NEXUSAI_ROUTER_LB_STRATEGY`（P8 负载均衡）、`NEXUSAI_SINGLE_INTENT_FAST_PATH`（P10 快速路径）、`NEXUSAI_MEMORY_HINTS_RECALL` / `NEXUSAI_CROSS_AGENT_SUMMARY`（记忆读回，默认开）、`NEXUSAI_TRACE_PARENT_PROPAGATION`（trace 传播，默认开）。
 
 ---
 

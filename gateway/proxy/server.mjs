@@ -108,6 +108,19 @@ const GRPC_HTTP_STATUS = {
   [grpc.status.ALREADY_EXISTS]: 409,
   [grpc.status.RESOURCE_EXHAUSTED]: 429,
   [grpc.status.UNAUTHENTICATED]: 401,
+  // Frequenty returned by the backend: argument validation, preconditions,
+  // availability/deadline, unimplemented RPCs. Mapping them to 500 used to
+  // hide "the caller sent garbage" / "backend overloaded" behind a generic
+  // server-error code and broke the frontend's differentiated handling.
+  [grpc.status.INVALID_ARGUMENT]: 400,
+  [grpc.status.OUT_OF_RANGE]: 400,
+  [grpc.status.FAILED_PRECONDITION]: 412,
+  [grpc.status.UNIMPLEMENTED]: 501,
+  [grpc.status.UNAVAILABLE]: 503,
+  [grpc.status.DATA_LOSS]: 500,
+  [grpc.status.INTERNAL]: 500,
+  [grpc.status.UNKNOWN]: 500,
+  [grpc.status.DEADLINE_EXCEEDED]: 504,
 };
 // NOTE: the mapping table above is the single source of truth — the
 // error-mapping contract test's static guard asserts on these computed
@@ -246,6 +259,16 @@ function streamCall(serviceName, methodName, body, metadata, res) {
 
   stream.on('error', (err) => {
     if (ended) return;
+    // If an in-band terminal event (complete/error) was already relayed, the
+    // client has seen the authoritative terminal — a trailing gRPC status
+    // error (e.g. INTERNAL after the server emitted its 'error' event) must
+    // not inject a SECOND error frame, which used to overwrite the sanitized
+    // business error on the frontend and duplicate the activity entry.
+    if (completeSeen) {
+      ended = true;
+      res.end();
+      return;
+    }
     ended = true;
     const codeLabel = err.code != null ? err.code : 'N/A';
     console.error(`[proxy] Stream error (${serviceName}.${methodName}):`, err.message, `(code: ${codeLabel})`);

@@ -58,6 +58,13 @@ services:
       LLM_API_URL: ${LLM_API_URL:-https://api.deepseek.com/v1/chat/completions}
       EMBEDDING_API_URL: ${EMBEDDING_API_URL:-}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-deepseek-v4-pro}
+      # Four-layer token budget (estimated tokens). Pass through from .env so
+      # container deployments honor the same knobs as local runs; without
+      # these lines, editing .env had no effect inside the container.
+      NEXUSAI_BUDGET_GLOBAL_TOKENS: ${NEXUSAI_BUDGET_GLOBAL_TOKENS:-0}
+      NEXUSAI_BUDGET_USER_DAILY_TOKENS: ${NEXUSAI_BUDGET_USER_DAILY_TOKENS:-200000}
+      NEXUSAI_BUDGET_USER_MONTHLY_TOKENS: ${NEXUSAI_BUDGET_USER_MONTHLY_TOKENS:-4000000}
+      NEXUSAI_BUDGET_SESSION_TOKENS: ${NEXUSAI_BUDGET_SESSION_TOKENS:-100000}
       RPC_SERVER_PORT: "50051"
     depends_on:
       postgres:

@@ -253,7 +253,16 @@ void ProfileSummarizer::processPending(QueryDomainRepository* domain_repo) {
             CURL* curl = curl_easy_init();
             if (!curl) {
                 LOG_ERROR("ProfileSummarizer: curl_easy_init() failed");
-                redis.rpush("profile:pending", user_id);  // retry on the next run
+                // Re-queue for the next run. Whatever the requeue outcome, the
+                // dedup guard must be released BEFORE breaking out — break
+                // skips the end-of-iteration hdel, and a held guard with no
+                // queue entry would starve this user's profile forever.
+                const bool requeued = redis.rpush("profile:pending", user_id);
+                if (!requeued) {
+                    LOG_ERROR("ProfileSummarizer: requeue push failed for user " +
+                              user_id + "; releasing dedup guard anyway");
+                }
+                redis.hdel("profile:queued", user_id);
                 break;
             }
 
@@ -328,6 +337,32 @@ void ProfileSummarizer::processPending(QueryDomainRepository* domain_repo) {
             if (schema_ok) {
                 redis.set("user_profile:" + user_id, profile_text);
                 LOG_INFO("ProfileSummarizer: Extracted profile for user " + user_id);
+                // B5 (P17n): PG is the durable source (V004 user_profiles);
+                // a successful upsert retires the Redis projection ("PG
+                // success → DEL Redis") per the storage-layering contract.
+                // Redis keeps serving as the transitional fallback until the
+                // read path confirms PG coverage.
+                if (domain_repo) {
+                    try {
+                        const auto parsed_profile = json::parse(profile_text);
+                        common::UserProfileRecord profile_record;
+                        profile_record.user_id = user_id;
+                        profile_record.identity =
+                            parsed_profile.value("identity", json::object()).dump();
+                        profile_record.preferences =
+                            parsed_profile.value("preferences", json::array()).dump();
+                        if (domain_repo->upsertUserProfile(profile_record)) {
+                            redis.del("user_profile:" + user_id);
+                            LOG_INFO("ProfileSummarizer: profile persisted to PG for user " +
+                                     user_id);
+                        }
+                    } catch (const std::exception& pg_error) {
+                        // Keep the Redis copy — PG is unavailable, the
+                        // read-side fallback still serves this profile.
+                        LOG_WARN("ProfileSummarizer: PG profile persist failed for user " +
+                                 user_id + ": " + pg_error.what());
+                    }
+                }
             } else {
                 // P17(o): a failed schema validation must NOT poison the
                 // reader — keep the raw text under an inspection-only key.

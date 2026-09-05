@@ -15,7 +15,10 @@ Durable Query Pipeline（持久化查询管线）是 NexusAI 在 7-PR 大优化�
 | 确定性幂等主键 | 消息/用量/trace 主键全部由 request_id 确定性派生，重试零重复 |
 | PostgreSQL 事实源 | 查询、消息、trace、成本、预算全部持久化 PG；Redis 仅缓存 |
 | 预算原子预留 | PG 事务内 advisory lock + counter upsert，拒绝先落 rejected |
-| 恰好一次终态 | finalize 用原子 CAS 保证每次运行只持久化一次终态 |
+| 恰好一次终态 | finalize 用原子 CAS 保证每次运行只持久化一次终态；内部 PG 故障会释放 CAS 并重入落 failed，不会把行卡在 running |
+| 终态不可回退 | 终态行的 UPDATE 带状态守卫（WHERE status NOT IN 终态集合），迟到的写入无法改写已持久化终态 |
+| 重放短路 | 命中既有终态行的同 request_id 请求直接返回落库结果，不重跑 LLM；planned 请求重放返回 FAILED_PRECONDITION 引导走 ExecutePlan |
+| 两阶段计划执行 | `plan_only` 查询规划后交付 DAG 并落 `planned` 终态（规划照常计费），确认后经独立幂等的 ExecutePlan 执行 |
 
 ## 背景：为什么需要 Durable Pipeline
 
@@ -119,6 +122,14 @@ Durable Pipeline 的解决思路是：**把身份锚定在认证上下文、把�
 1. **重试安全**：客户端超时重试、管线内部重试都只会触发主键冲突上报，不会产生第二条记录；被预算拒绝后重试成功的请求也只会被计费一次。
 2. **可对账**：给定 request_id 就能在 PG 中拼出完整证据链（query_log + 两条消息 + usage + trace）。
 
+### 重放短路（批次八）
+
+幂等主键保证"不重复写"，批次八进一步保证"不重复跑"：`beginDurableRows` 发现 query_log 行已处于终态（completed / failed / cancelled / rejected / planned）时，本次调用直接短路——同步路径返回落库的 answer 与对应状态码，流式路径补发一条终态事件后返回。预算也只在首次真实执行时预留。语义约定：
+
+- 重放 completed 返回 OK + 已落库回答；
+- 重放 failed / rejected 返回与原终态一致的错误语义；
+- 重放 planned 返回 `FAILED_PRECONDITION`，提示该计划的执行应走 `ExecutePlan` 确认通道，而不是重跑本查询。
+
 ## Token 预算：PG 原子预留
 
 ### 四级配额
@@ -203,17 +214,28 @@ curl -i -X POST http://localhost:8081/agent_communication.AIQueryService/Query \
 | `ALREADY_EXISTS` | 409 | 幂等键冲突语义 |
 | `RESOURCE_EXHAUSTED` | 429 | 预算超额 |
 | `CANCELLED` | 499 | 客户端断开（abort 传播到管线） |
+| `INVALID_ARGUMENT` | 400 | 参数校验失败（如 ExecutePlan 空 DAG / 环依赖） |
+| `FAILED_PRECONDITION` | 412 | 委派深度超限、planned 重放等前置条件不满足 |
+| `UNIMPLEMENTED` | 501 | RPC 未实现（如 RealTimeCommunication） |
+| `UNAVAILABLE` | 503 | 后端过载 / 断路器打开 |
+| `DEADLINE_EXCEEDED` | 504 | 请求预算耗尽 |
 
 客户端断开连接时，网关通过 `res.on('close')` 触发流的 `cancel()`，abort 沿管线传播，finalize CAS 保证断连场景下落库的仍是恰好一次的终态。
 
 ## 注意事项
 
 1. **不要在请求体里传 user_id**：它会被无条件忽略，依赖它做任何业务判断都会出错。
-2. **request_id 必须由调用方保证唯一**：幂等主键全部派生自它；复用旧 request_id 会被视为重复请求。
+2. **request_id 必须由调用方保证唯一**：幂等主键全部派生自它。复用已终结请求的 request_id 会触发重放短路（返回落库结果，不重新执行）；需要重新执行请换新的 request_id。
 3. **估算 token 不等于实际消耗**：当前口径是 `64 + question.size() / 4` 的估算值，预算规划请按估算口径留余量。
 4. **rejected 是终态事实**：预算拒绝不会"消失"，排查费用问题时可直接在 PG 中审计 rejected 记录。
-5. **迁移只追加**：管线依赖的表结构来自 `db/migrations`（V001–V013，只追加不修改），rpc-server 启动时自动迁移，迁移失败即中止启动。
+5. **迁移只追加**：管线依赖的表结构来自 `db/migrations`（V001–V015，只追加不修改），rpc-server 启动时自动迁移，迁移失败即中止启动。
 6. **沙箱流量共享预算**：sandbox 请求不豁免任何配额层级，压测时注意合并计算。
+
+### 两阶段计划执行（plan-only，批次八）
+
+`AIQueryRequest.plan_only = true` 时，查询在规划完成后即停止：流式路径经既有 `plan` 事件交付完整 DAG 并补发 `awaiting_confirmation` 标记，随后以 `planned` 终态落库（规划 LLM 照常计预算，route 标注为 `plan-only`）；同步路径把 plan JSON 放入 answer 返回。前端展示"确认执行 / 放弃"，确认后把 DAG 组装为 `ExecutePlanRequest` 走独立的持久化执行通道（聚合回答落库为 assistant 消息回填会话）。
+
+设计要点：**两阶段语义由两个各自幂等的持久化请求组合实现**，服务端没有"挂起等待确认"的状态机——不需要为挂起设计取消传播、超时自动审批或崩溃恢复。代价是重复确认会以新 request_id 各自独立执行（用户驱动的多次执行，各计各的预算）。
 
 ## 相关文档
 

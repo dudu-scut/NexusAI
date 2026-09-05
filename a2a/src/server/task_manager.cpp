@@ -130,13 +130,29 @@ AgentTask TaskManager::cancel_task(const std::string& task_id) {
 void TaskManager::update_status(const std::string& task_id,
                                TaskState status,
                                const AgentMessage* message) {
+    // Terminal states are final: once a task reached a terminal state (e.g.
+    // Canceled via tasks/cancel), NO later status write is accepted — this
+    // includes the terminal→terminal path (a late worker completion writing
+    // Completed over Canceled, "cancel-then-resurrect"). Late messages are
+    // still recorded to history, but the state transition is dropped.
+    auto current_opt = impl_->task_store_->get_task(task_id);
+    if (!current_opt.has_value()) {
+        throw A2AException("Task not found: " + task_id, ErrorCode::TaskNotFound);
+    }
+    if (current_opt->is_terminal()) {
+        if (message) {
+            impl_->task_store_->add_history_message(task_id, *message);
+        }
+        return;
+    }
+
     std::string msg_text;
     if (message) {
         impl_->task_store_->add_history_message(task_id, *message);
     }
-    
+
     impl_->task_store_->update_status(task_id, status, msg_text);
-    
+
     // Get updated task and call callback
     auto task_opt = impl_->task_store_->get_task(task_id);
     if (task_opt.has_value() && impl_->on_task_updated_) {

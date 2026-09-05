@@ -148,6 +148,7 @@ export function queryStream(
   onEvent: (event: AIStreamEvent) => void,
   contextId?: string,
   signal?: AbortSignal,
+  planOnly?: boolean,
 ): Promise<void> {
   const req: AIQueryRequest = {
     request_id: crypto.randomUUID(),
@@ -156,6 +157,9 @@ export function queryStream(
     history_length: 5,
     timeout_seconds: 120,
     metadata: {},
+    // B1/U4 two-phase: stop after planning; execution is driven by a
+    // follow-up ExecutePlan call after user confirmation.
+    ...(planOnly ? { plan_only: true } : {}),
   }
 
   const url = `${BASE_URL}${AI_QUERY}/QueryStream`
@@ -219,10 +223,20 @@ export function queryStream(
             ? trimmed.slice(6)
             : trimmed
           try {
-            const event = JSON.parse(jsonStr) as AIStreamEvent
+            const event = JSON.parse(jsonStr) as AIStreamEvent & { code_name?: string }
+            // SSE delivery has no HTTP status channel: the proxy turns an
+            // UNAUTHENTICATED stream failure into an in-band error event.
+            // Recognize it here so an expired token triggers the same logout
+            // flow as the unary resp.status===401 branch instead of leaving
+            // the user in a "fake logged-in" state.
+            if (event.event_type === 'error' && event.code_name === 'UNAUTHENTICATED') {
+              _onUnauthorized?.()
+            }
             onEvent(event)
           } catch {
-            // non-JSON line, skip
+            // Non-JSON line: surface it (a producer format change used to
+            // degrade into "no events until connection lost" silently).
+            console.warn('[grpc-client] unparseable stream line skipped:', trimmed.slice(0, 80))
           }
         }
       }

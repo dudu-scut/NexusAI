@@ -16,6 +16,7 @@
 #include <nlohmann/json.hpp>
 #include <chrono>
 #include <optional>
+#include <sstream>
 #include <thread>
 
 namespace agent_rpc {
@@ -83,24 +84,26 @@ bool A2AAdapter::processQuery(
         // Convert RPC request to A2A format
         a2a::MessageSendParams params = request_adapter_->convertToA2A(request);
 
-        // Check circuit breaker before making the call
-        if (!cb->isRequestAllowed()) {
-            auto* status = response->mutable_status();
-            status->set_code(static_cast<int>(grpc::StatusCode::UNAVAILABLE));
-            status->set_message("Circuit breaker is OPEN — orchestrator is unavailable");
-            return false;
-        }
+        // NOTE: no pre-loop isRequestAllowed() here on purpose — admission
+        // (including the OPEN → HALF_OPEN probe reservation) happens inside
+        // the retry loop below. A pre-loop check would consume the single
+        // HALF_OPEN probe permit and the loop's attempt-0 re-check would then
+        // be denied, leaving the probe never sent and the breaker unable to
+        // ever close (P0-1).
 
         // Send via a per-request client (gRPC handlers run concurrently, so
         // per-call headers/timeouts must not live on shared state).
         a2a::A2AClient client(config_.orchestrator_url);
         client.set_timeout(request_timeout_seconds_.load());
 
+        // RAII span guard: closes agent_call and restores the delegation
+        // depth on every exit path (previously the failure paths leaked the
+        // span and left depth incremented per failed attempt).
+        agent_rpc::common::TraceContext::SpanGuard span_guard("agent_call", "a2a_adapter");
+
         // Inject trace headers into A2A HTTP call
         auto* trace = agent_rpc::common::TraceContext::current();
         if (trace) {
-            trace->startSpan("agent_call", "a2a_adapter");
-
             // Delegation depth limit check
             constexpr int MAX_DEPTH = 5;
             // Use depth() counter as primary. Safety net: count agent_call spans
@@ -120,7 +123,6 @@ bool A2AAdapter::processQuery(
                 status->set_code(static_cast<int>(grpc::StatusCode::FAILED_PRECONDITION));
                 status->set_message("Delegation depth exceeded (max " +
                                      std::to_string(MAX_DEPTH) + ")");
-                trace->endSpan();
                 return false;
             }
             trace->incrementDepth();
@@ -146,11 +148,24 @@ bool A2AAdapter::processQuery(
         std::optional<a2a::A2AResponse> a2a_response;
 
         for (int attempt = 0; attempt < max_retries && !a2a_response; ++attempt) {
+            // Re-check the breaker on EVERY attempt: an OPEN transition while
+            // retries are pending must stop the loop instead of hammering a
+            // backend that just tripped. Per-attempt accounting also keeps
+            // the breaker statistics from being diluted by retries.
+            if (!cb->isRequestAllowed()) {
+                auto* status = response->mutable_status();
+                status->set_code(static_cast<int>(grpc::StatusCode::UNAVAILABLE));
+                status->set_message("Circuit breaker is OPEN — orchestrator is unavailable");
+                return false;
+            }
             try {
                 a2a_response = client.send_message(params);
             } catch (const a2a::A2AException& e) {
                 // Transport failures thrown by the HTTP layer are transient;
-                // JSON-RPC/protocol errors are not — do not retry.
+                // JSON-RPC/protocol errors are not — do not retry. Protocol
+                // errors are recorded ONCE by the outer catch (P2-4: a
+                // record here + a record in the outer catch would double-
+                // count one failure and trip the breaker early).
                 const std::string what = e.what();
                 const bool transport = what.rfind("CURL error:", 0) == 0 ||
                                        what.rfind("HTTP request failed:", 0) == 0;
@@ -158,6 +173,7 @@ bool A2AAdapter::processQuery(
                     LOG_ERROR("A2A protocol error calling orchestrator: " + what);
                     throw;
                 }
+                cb->recordFailure();
                 last_error = what;
                 if (attempt < max_retries - 1) {
                     LOG_WARN("A2A call attempt " + std::to_string(attempt + 1) + "/" +
@@ -169,19 +185,19 @@ bool A2AAdapter::processQuery(
         }
 
         if (!a2a_response) {
-            // All retries exhausted
+            // All retries exhausted. Per-attempt failures were already
+            // recorded to the breaker in the loop — surface UNAVAILABLE
+            // directly instead of rethrowing (a rethrow would add one more
+            // failure record in the outer catch and skew the statistics).
             LOG_ERROR("A2A call failed after " + std::to_string(max_retries) +
                       " attempt(s): " + last_error);
-            throw std::runtime_error(
-                last_error.empty() ? "A2A transport failure" : last_error);
+            auto* status = response->mutable_status();
+            status->set_code(static_cast<int>(grpc::StatusCode::UNAVAILABLE));
+            status->set_message(last_error.empty() ? "A2A transport failure" : last_error);
+            return false;
         }
 
         response_adapter_->convertFromA2A(*a2a_response, request.request_id(), "", response);
-
-        // Finalize trace state (only after successful conversion)
-        if (trace) {
-            trace->endSpan();
-        }
 
         // Record success
         cb->recordSuccess();
@@ -289,13 +305,15 @@ void A2AAdapter::processQueryStreaming(
         // Use streaming API
         // Note: http_client splits on double newlines, so each callback
         // receives a complete SSE event
+        // RAII span guard: closes agent_call_streaming and restores the
+        // delegation depth on every exit path.
+        agent_rpc::common::TraceContext::SpanGuard span_guard("agent_call_streaming",
+                                                              "a2a_adapter");
         // Inject trace headers into A2A HTTP streaming call
         auto* trace = agent_rpc::common::TraceContext::current();
         std::string trace_id;
         int depth = 0;
         if (trace) {
-            trace->startSpan("agent_call_streaming", "a2a_adapter");
-
             // Delegation depth limit check for streaming
             constexpr int MAX_DEPTH = 5;
             depth = trace->depth();
@@ -305,7 +323,6 @@ void A2AAdapter::processQueryStreaming(
                     "Delegation depth exceeded (max " + std::to_string(MAX_DEPTH) + ")",
                     request.context_id(), "error", &depth_event);
                 callback(depth_event);
-                trace->endSpan();
                 return;
             }
             trace->incrementDepth();
@@ -326,27 +343,41 @@ void A2AAdapter::processQueryStreaming(
 
         client.send_message_streaming(params,
             [this, &callback, &context_id, trace_id](const std::string& event_line) {
-                // Skip empty lines
+                // Skip empty blocks
                 if (event_line.empty() || event_line == "\n" || event_line == "\r\n") {
                     return;
                 }
-                
-                // Parse SSE format: "data: {...}\n" or "data: {...}"
-                std::string event_data = event_line;
-                
-                // Strip trailing newlines
-                while (!event_data.empty() && 
-                       (event_data.back() == '\n' || event_data.back() == '\r')) {
-                    event_data.pop_back();
+
+                // SSE block parsing per the event-stream grammar: a block may
+                // span several lines; aggregate every "data:" line (with or
+                // without the space) joined by '\n', and ignore "event:"/
+                // "id:"/"retry:"/comment lines instead of dropping the whole
+                // block (named-event producers previously vanished silently).
+                std::string event_data;
+                {
+                    std::string line;
+                    std::istringstream block_stream(event_line);
+                    while (std::getline(block_stream, line)) {
+                        if (!line.empty() && line.back() == '\r') {
+                            line.pop_back();
+                        }
+                        if (line.empty() || line[0] == ':') {
+                            continue;
+                        }
+                        if (line.rfind("data:", 0) == 0) {
+                            std::string payload = line.substr(5);
+                            if (!payload.empty() && payload[0] == ' ') {
+                                payload.erase(0, 1);
+                            }
+                            if (!event_data.empty()) {
+                                event_data += "\n";
+                            }
+                            event_data += payload;
+                        }
+                        // "event:" / "id:" / "retry:" lines carry no payload
+                        // for this adapter — intentionally ignored.
+                    }
                 }
-                
-                // Extract the content after "data: "
-                const std::string data_prefix = "data: ";
-                if (event_data.find(data_prefix) == 0) {
-                    event_data = event_data.substr(data_prefix.length());
-                }
-                
-                // Skip empty data
                 if (event_data.empty()) {
                     return;
                 }
@@ -457,10 +488,7 @@ void A2AAdapter::processQueryStreaming(
                 }
             });
 
-        // End streaming trace span
-        if (trace) {
-            trace->endSpan();
-        }
+        // The RAII span guard closed the streaming span on every exit path.
 
         // Record streaming success to circuit breaker
         streaming_cb->recordSuccess();
@@ -558,7 +586,10 @@ bool A2AAdapter::processQueryDirect(
         }
 
         a2a::A2AClient client(agent_url);
-        client.set_timeout(config_.request_timeout_seconds);
+        // Deadline propagation: read the shrunken atomic instead of the
+        // static config value, so gRPC-deadline-contracted requests on the
+        // direct path honor the same budget as the orchestrator path.
+        client.set_timeout(request_timeout_seconds_.load());
 
         // P21 L2 (strict mode): resolve the host, reject blacklisted
         // addresses, and pin the validated IPs to the connection
@@ -577,7 +608,16 @@ bool A2AAdapter::processQueryDirect(
                 }
                 return false;
             }
-            const bool https = agent_url.compare(0, 8, "https://") == 0;
+            // Case-insensitive scheme check — must match the L1 validator's
+            // case handling, otherwise "HTTPS://..." pins port 80 and curl
+            // silently ignores the mismatched RESOLVE entry.
+            const bool https = agent_url.size() >= 8 &&
+                (agent_url[0] == 'h' || agent_url[0] == 'H') &&
+                (agent_url[1] == 't' || agent_url[1] == 'T') &&
+                (agent_url[2] == 't' || agent_url[2] == 'T') &&
+                (agent_url[3] == 'p' || agent_url[3] == 'P') &&
+                (agent_url[4] == 's' || agent_url[4] == 'S') &&
+                agent_url.compare(5, 3, "://") == 0;
             const std::string pin_port =
                 port_str.empty() ? (https ? "443" : "80") : port_str;
             std::vector<std::string> resolve_entries;
@@ -588,11 +628,13 @@ bool A2AAdapter::processQueryDirect(
             client.set_resolve_entries(resolve_entries);
         }
 
+        // RAII span guard: closes agent_call_direct and restores the
+        // delegation depth on every exit path.
+        agent_rpc::common::TraceContext::SpanGuard span_guard("agent_call_direct",
+                                                              "a2a_adapter");
         // Inject trace headers into direct A2A HTTP call
         auto* trace = agent_rpc::common::TraceContext::current();
         if (trace) {
-            trace->startSpan("agent_call_direct", "a2a_adapter");
-
             // Delegation depth limit check for direct calls
             constexpr int MAX_DEPTH = 5;
             int depth = trace->depth();
@@ -603,7 +645,6 @@ bool A2AAdapter::processQueryDirect(
                     status->set_message("Delegation depth exceeded (max " +
                                          std::to_string(MAX_DEPTH) + ")");
                 }
-                trace->endSpan();
                 return false;
             }
             trace->incrementDepth();
@@ -615,11 +656,6 @@ bool A2AAdapter::processQueryDirect(
         // Autonomy-level header removed (see processQuery).
 
         a2a::A2AResponse a2a_response = client.send_message(params);
-
-        // End trace span
-        if (trace) {
-            trace->endSpan();
-        }
 
         response_adapter_->convertFromA2A(a2a_response, request.request_id(), "", response);
 
@@ -714,12 +750,14 @@ void A2AAdapter::processQueryStreamingDirect(
         a2a::A2AClient client(agent_url);
         client.set_timeout(request_timeout_seconds_.load());
 
+        // RAII span guard: closes agent_call_streaming_direct and restores the
+        // delegation depth on every exit path.
+        agent_rpc::common::TraceContext::SpanGuard span_guard("agent_call_streaming_direct",
+                                                              "a2a_adapter");
         // Inject trace headers into direct A2A HTTP streaming call
         auto* trace = agent_rpc::common::TraceContext::current();
         std::string trace_id;
         if (trace) {
-            trace->startSpan("agent_call_streaming_direct", "a2a_adapter");
-
             // Delegation depth limit check for streaming direct
             constexpr int MAX_DEPTH = 5;
             int depth = trace->depth();
@@ -729,7 +767,6 @@ void A2AAdapter::processQueryStreamingDirect(
                     "Delegation depth exceeded (max " + std::to_string(MAX_DEPTH) + ")",
                     request.context_id(), "error", &depth_event);
                 callback(depth_event);
-                trace->endSpan();
                 return;
             }
             trace->incrementDepth();
@@ -747,15 +784,31 @@ void A2AAdapter::processQueryStreamingDirect(
                     return;
                 }
 
-                std::string event_data = event_line;
-                while (!event_data.empty() &&
-                       (event_data.back() == '\n' || event_data.back() == '\r')) {
-                    event_data.pop_back();
-                }
-
-                const std::string data_prefix = "data: ";
-                if (event_data.find(data_prefix) == 0) {
-                    event_data = event_data.substr(data_prefix.length());
+                std::string event_data;
+                {
+                    // Same SSE block grammar as processQueryStreaming:
+                    // aggregate every "data:" line (space optional), ignore
+                    // "event:"/"id:"/"retry:"/comment lines.
+                    std::string line;
+                    std::istringstream block_stream(event_line);
+                    while (std::getline(block_stream, line)) {
+                        if (!line.empty() && line.back() == '\r') {
+                            line.pop_back();
+                        }
+                        if (line.empty() || line[0] == ':') {
+                            continue;
+                        }
+                        if (line.rfind("data:", 0) == 0) {
+                            std::string payload = line.substr(5);
+                            if (!payload.empty() && payload[0] == ' ') {
+                                payload.erase(0, 1);
+                            }
+                            if (!event_data.empty()) {
+                                event_data += "\n";
+                            }
+                            event_data += payload;
+                        }
+                    }
                 }
 
                 if (event_data.empty()) return;
@@ -859,10 +912,7 @@ void A2AAdapter::processQueryStreamingDirect(
                 }
             });
 
-        // End direct streaming trace span
-        if (trace) {
-            trace->endSpan();
-        }
+        // The RAII span guard closed the streaming-direct span on every exit path.
 
         // Record streaming direct success to circuit breaker
         streaming_direct_cb->recordSuccess();

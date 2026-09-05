@@ -2,6 +2,7 @@
 
 #include "types.h"
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 #include <map>
@@ -190,6 +191,12 @@ public:
     std::string getCurrentStrategyName() const;
 
     ServiceEndpoint selectEndpoint(const std::vector<ServiceEndpoint>& endpoints);
+
+    // Deterministic key-based selection (R16): meaningful only for the
+    // consistent-hash strategy — returns nullopt for any other active
+    // strategy so the caller can fall back to selectEndpoint().
+    std::optional<ServiceEndpoint> selectEndpointByKey(
+        const std::string& key, const std::vector<ServiceEndpoint>& endpoints);
 
     void updateEndpoints(const std::vector<ServiceEndpoint>& endpoints);
 

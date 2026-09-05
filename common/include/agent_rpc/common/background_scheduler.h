@@ -1,5 +1,6 @@
 #pragma once
 
+#include "agent_rpc/common/logger.h"
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -142,8 +143,16 @@ private:
                 }
                 try {
                     task->fn();
+                } catch (const std::exception& error) {
+                    // Log and swallow — a periodic task fault (e.g. a PG blip
+                    // inside health_evaluation) must not kill the worker
+                    // thread, but it must also not vanish silently: operators
+                    // rely on these logs to notice a task failing forever.
+                    LOG_ERROR(std::string("BackgroundScheduler task '") +
+                              (task->name.empty() ? "?" : task->name) +
+                              "' failed: " + error.what());
                 } catch (...) {
-                    // Log and swallow — don't crash the worker thread
+                    LOG_ERROR("BackgroundScheduler task failed with unknown error");
                 }
                 task->running.store(false);
             }

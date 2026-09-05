@@ -5,6 +5,8 @@
 
 #include <string>
 
+namespace agent_rpc { namespace common { class QueryDomainRepository; } }
+
 namespace agent_rpc {
 namespace common {
 
@@ -19,8 +21,18 @@ namespace common {
  */
 class MemoryService {
 public:
-    explicit MemoryService(std::shared_ptr<RedisClient> redis);
+    // C1 (V015): when a durable repository is wired, the Tier-2 hints and
+    // cross-agent summaries live in PostgreSQL (V015) and the Redis keys
+    // degrade to projections — writes go "PG success → DEL key", reads go
+    // "PG miss → Redis → backfill". Without a repo the legacy Redis-only
+    // behavior is kept verbatim (tests, repo-less deployments).
+    explicit MemoryService(std::shared_ptr<RedisClient> redis,
+                           QueryDomainRepository* domain_repo = nullptr);
     ~MemoryService() = default;
+
+    void setDomainRepository(QueryDomainRepository* domain_repo) {
+        domain_repo_ = domain_repo;
+    }
 
     struct Message {
         std::string role;     // "user" | "agent"
@@ -102,15 +114,28 @@ private:
 
     // Redis key helpers — all components sanitized to prevent injection.
     //
-    // P23 键分类约定（存储分层治理，2026-09-03）：
-    //   - [事实源]（PG 无表、暂居 Redis，待 V014 迁移）——
+    // P23 键分类约定（存储分层治理，2026-09-03 批次七建档；2026-09-04 批次八复核补全）：
+    //   - [事实源]（PG 无表、暂居 Redis，待 V014/V015 迁移）——
     //       nexusai:memory:<uid>（Tier-2 长期记忆 hints）
-    //       nexusai:summary:*（Tier-3 跨 Agent 摘要，7 天 TTL）
+    //       nexusai:summary:<ctx>（context 级跨 Agent 摘要，无 TTL 覆盖写；
+    //         注：仅 agent 级 nexusai:summary:<ctx>:<agent> 为 SETEX 7 天）
     //       user_profile:<uid>（用户画像）
+    //       user_profile_raw:<uid>（schema 校验失败的画像原文，检查用，
+    //         profile_summarizer 写、无读者）
     //   - [cache-only]（PG 为事实源的投影，丢失可重建）——
     //       nexusai:conv:*（Tier-1 会话镜像，主查询读 PG）
+    //       trace:spans:<trace_id>（span 批量冗余，PG 兜底读取，
+    //         main.cpp 写 / observability 读，TTL 24h）
+    //       agent_metrics:<aid>（feedback_aggregator 写 / GetAgentMetrics 读）
     //   - [transient]（无业务后果的瞬态/协调键）——
-    //       nexusai:last_agent:*、限流计数、分布式短锁、预算实时计数面
+    //       nexusai:last_agent:*、限流计数、分布式短锁、预算实时计数面、
+    //       profile:pending（画像提取队列）/ profile:queued（HSETNX 去重守卫）、
+    //       nexusai:memory:conflict:<uid>:<key>（C2 方向3 偏好冲突候选集，
+    //         7 天 TTL，画像重算时消歧）、
+    //       agent:liveness:<aid>（TTL = 3×心跳间隔）、activity_feed:*、
+    //       cost:<uid>:<date>（CostTracker 估算面，无读者，PG 台账为权威）
+    //   - [死键记录]（无生产写入方或无读者，代码中保留但已确认无链路）——
+    //       nexusai:user_convs:<uid>（无写入方，profile_summarizer 读取恒空）
     //   约定：不再新增事实源键；新增键必须按上述三类标注归类。
     static std::string convKey(const std::string& ctx, const std::string& agent) {
         return "nexusai:conv:" + sanitizeKeyComponent(ctx) + ":" + sanitizeKeyComponent(agent);
@@ -136,6 +161,11 @@ private:
     static constexpr int kCrossAgentSummaryTtlSeconds = 7 * 24 * 3600;
 
     std::shared_ptr<RedisClient> redis_;  // shared ownership prevents use-after-free
+    QueryDomainRepository* domain_repo_ = nullptr;  // C1: durable memory domain
+
+    // C2 方向3 helpers: fact/preference key classification.
+    static bool isFactKey(const std::string& key);
+    static bool isPreferenceKey(const std::string& key);
 
     static std::string formatHistory(const std::vector<std::string>& raw_messages,
                                       int max_messages);

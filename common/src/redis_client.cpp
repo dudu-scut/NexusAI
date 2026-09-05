@@ -255,6 +255,29 @@ bool RedisClient::hsetnx(const std::string& key, const std::string& field,
 }
 
 // ============================================================================
+// Set operations
+// ============================================================================
+
+bool RedisClient::sadd(const std::string& key, const std::string& member) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!ensureConnected()) return false;
+
+    auto* reply = static_cast<redisReply*>(
+        redisCommand(ctx_, "SADD %s %b",
+                     key.c_str(), member.data(), member.size()));
+    if (!reply) return false;
+    // A WRONGTYPE reply (key shadowed by another structure) must not look
+    // like a silent success — log it so the conflict detection loss is
+    // visible.
+    if (reply->type != REDIS_REPLY_INTEGER) {
+        LOG_WARN("SADD failed for key " + key + " (unexpected reply type)");
+    }
+    bool ok = (reply->type == REDIS_REPLY_INTEGER);
+    freeReplyObject(reply);
+    return ok;
+}
+
+// ============================================================================
 // List operations
 // ============================================================================
 

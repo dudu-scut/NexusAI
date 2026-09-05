@@ -48,6 +48,8 @@ const protoMessages = {
   ...parseProtoMessages('user_experience.proto'),
   ...parseProtoMessages('agent_lifecycle.proto'),
   ...parseProtoMessages('common.proto'),
+  // agent discovery link (plan editor dropdown / register flows)
+  ...parseProtoMessages('agent_service.proto'),
 };
 
 // Minor defensive assertion: if the regex parser silently degrades
@@ -123,7 +125,19 @@ const CORE_MESSAGES = [
   'AIQueryRequest',
   'AIQueryResponse',
   'AIStreamEvent',
+  'SystemContext',
+  'AgentPreference',
   'Artifact',
+  // execute-plan link (U4 rerun / plan editor)
+  'DAGNode',
+  'DAGStructure',
+  'ExecutePlanRequest',
+  'ExecutePlanResponse',
+  // agent discovery + metrics (plan editor dropdown / monitor views)
+  'ServiceInfo',
+  'AgentMetrics',
+  'GetAgentsRequest',
+  'GetAgentsResponse',
   // auth + role
   'LoginResponse',
   'RegisterResponse',
@@ -214,6 +228,13 @@ test('AIQueryRequest carries the sandbox flag', () => {
   const ts = parseTsInterface('AIQueryRequest');
   assert.ok(ts.sandbox, 'AIQueryRequest.sandbox must exist');
   assert.match(ts.sandbox, /boolean/);
+});
+
+test('AIQueryRequest carries the plan_only flag (B1 two-phase)', () => {
+  // Field-level drift guard for the U4 two-phase execution switch.
+  const ts = parseTsInterface('AIQueryRequest');
+  assert.ok(ts.plan_only, 'AIQueryRequest.plan_only must exist');
+  assert.match(ts.plan_only, /boolean/);
 });
 
 test('AIStreamEvent exposes trace_summary/activity_json/intervention_required', () => {

@@ -48,3 +48,9 @@ pid.txt
 
 # 面试材料不入库
 docs/interview/
+
+# 本地辅助脚本与工具产物(不入库)
+scripts/
+.qoder/
+.superpowers/
+Testing/

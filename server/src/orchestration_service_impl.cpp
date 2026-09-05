@@ -19,9 +19,17 @@
 #include "agent_rpc/common/profile_summarizer.h"
 #include "agent_rpc/orchestrator/export_service.h"
 #include "agent_rpc/orchestrator/replay_service.h"
+#include "agent_rpc/orchestrator/result_aggregator.h"
+#include "agent_rpc/a2a_adapter/url_validation.h"
+#include "agent_rpc/registry/service_registry.h"
 
 #include <a2a/client/a2a_client.hpp>
 #include <nlohmann/json.hpp>
+
+#include <queue>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "orchestration.grpc.pb.h"
 #include "orchestration.pb.h"
@@ -72,6 +80,73 @@ grpc::Status OrchestrationServiceImpl::executePlan(
         status->set_message("DAG must contain at least one node");
         return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
                            "DAG must contain at least one node");
+    }
+
+    // A4: validate the user-submitted DAG up front instead of discovering
+    // problems mid-execution. Duplicate ids and dangling dependencies used
+    // to surface only as an executor-side "Circular dependency detected"
+    // (or a wedged topological sort) — reject them with a precise error.
+    {
+        std::unordered_set<std::string> known_ids;
+        std::string dup_error;
+        for (const auto& node : dag.nodes()) {
+            if (node.id().empty()) {
+                dup_error = "DAG node id must not be empty";
+                break;
+            }
+            if (!known_ids.insert(node.id()).second) {
+                dup_error = "DAG contains duplicate node id: " + node.id();
+                break;
+            }
+        }
+        if (dup_error.empty()) {
+            for (const auto& node : dag.nodes()) {
+                for (const auto& dep : node.dependencies()) {
+                    if (known_ids.find(dep) == known_ids.end()) {
+                        dup_error = "DAG node " + node.id() +
+                                    " depends on unknown node id: " + dep;
+                        break;
+                    }
+                }
+                if (!dup_error.empty()) break;
+            }
+        }
+        if (dup_error.empty()) {
+            // Kahn cycle pre-check (execution-time check stays as defense).
+            std::unordered_map<std::string, int> in_degree;
+            std::unordered_map<std::string, std::vector<std::string>> dependents;
+            for (const auto& node : dag.nodes()) {
+                in_degree[node.id()] += 0;
+                for (const auto& dep : node.dependencies()) {
+                    dependents[dep].push_back(node.id());
+                    in_degree[node.id()]++;
+                }
+            }
+            std::queue<std::string> ready;
+            for (const auto& [id, deg] : in_degree) {
+                if (deg == 0) ready.push(id);
+            }
+            size_t emitted = 0;
+            while (!ready.empty()) {
+                const std::string id = ready.front();
+                ready.pop();
+                ++emitted;
+                auto dit = dependents.find(id);
+                if (dit == dependents.end()) continue;
+                for (const auto& nxt : dit->second) {
+                    if (--in_degree[nxt] == 0) ready.push(nxt);
+                }
+            }
+            if (emitted < in_degree.size()) {
+                dup_error = "DAG contains a dependency cycle";
+            }
+        }
+        if (!dup_error.empty()) {
+            auto* status = response->mutable_status();
+            status->set_code(-1);
+            status->set_message(dup_error);
+            return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, dup_error);
+        }
     }
 
     // P15 P0(a): the owner comes from the thread-local auth context, never
@@ -228,6 +303,9 @@ grpc::Status OrchestrationServiceImpl::executePlan(
             if (!sys_ctx.user_memory().empty()) {
                 memory_ctx = "[User Context]\n" + sys_ctx.user_memory() + "\n";
             }
+            if (!sys_ctx.user_facts().empty()) {
+                memory_ctx += "[User Facts]\n" + sys_ctx.user_facts() + "\n";
+            }
             if (!sys_ctx.cross_agent_summary().empty()) {
                 memory_ctx += "[Prior Context]\n" + sys_ctx.cross_agent_summary() + "\n";
             }
@@ -240,6 +318,29 @@ grpc::Status OrchestrationServiceImpl::executePlan(
         std::string enriched_prompt = prompt;
         if (!memory_ctx.empty()) {
             enriched_prompt = memory_ctx + "\n" + prompt;
+        }
+
+        // P21 L1: ExecutePlan used to be the one delegation path that skipped
+        // URL validation entirely — apply the same real-parse checks as the
+        // direct paths and the DAG buildCallAgent path.
+        std::string url_err;
+        if (!agent_rpc::a2a_adapter::validateAgentUrl(agent_url, url_err)) {
+            throw std::runtime_error("Agent URL rejected: " + url_err);
+        }
+        // P21 L2/L3 (strict mode): validate-only flavor — resolve the host and
+        // reject blacklisted IPs / non-whitelisted ports. (No CURLOPT_RESOLVE
+        // pin here: this path constructs a bare A2AClient; the pin lands with
+        // the shared call-agent helper consolidation.)
+        if (agent_rpc::a2a_adapter::ssrfStrictModeEnabled()) {
+            std::string host;
+            std::string port_str;
+            if (agent_rpc::a2a_adapter::splitAgentUrlHostPort(agent_url, host, port_str)) {
+                std::vector<std::string> ips;
+                std::string host_err;
+                if (!agent_rpc::a2a_adapter::validateResolvedHost(host, ips, host_err)) {
+                    throw std::runtime_error("Agent host rejected: " + host_err);
+                }
+            }
         }
 
         a2a::A2AClient client(agent_url);
@@ -264,7 +365,31 @@ grpc::Status OrchestrationServiceImpl::executePlan(
     };
 
     try {
-        auto results = task_executor_->execute(plan, call_agent);
+        // Client-disconnect propagation + executed-only health accounting.
+        auto cancelled_probe = [context]() { return context->IsCancelled(); };
+        auto results = task_executor_->execute(plan, call_agent, nullptr, nullptr,
+                                               cancelled_probe);
+        for (const auto& [tid, result] : results) {
+            (void)tid;
+            if (!result.executed) {
+                continue;  // fabricated failure — no health signal
+            }
+            // executeSubtask fills agent_id with the actually executed agent;
+            // records with an empty id carry no health signal and are skipped.
+            if (!result.agent_id.empty()) {
+                agent_rpc::registry::ServiceRegistry::recordAgentCall(
+                    result.agent_id, result.success,
+                    static_cast<double>(result.duration_ms));
+            }
+        }
+
+        // B2: aggregate the per-subtask answers into a real final response
+        // (concat strategy, zero LLM cost). The previous placeholder
+        // "DAG executed (N subtasks)" buried every subtask answer in the
+        // trace payload only.
+        orchestrator::ResultAggregator concat_aggregator(
+            orchestrator::AggregatorConfig{});  // default strategy: concat
+        auto aggregated = concat_aggregator.aggregate(plan, results);
 
         // P15 P2(g): terminal finalize (durable mode) — same shape as the
         // Query pipeline; the execution result summary lands in the trace
@@ -288,10 +413,20 @@ grpc::Status OrchestrationServiceImpl::executePlan(
             log.id = request_id;
             log.owner_id = user_id;
             log.conversation_id = context_id;
-            log.response_text = "DAG executed (" +
-                                std::to_string(plan.tasks.size()) + " subtasks)";
+            log.response_text = aggregated.final_answer.empty()
+                ? "DAG executed (" + std::to_string(plan.tasks.size()) + " subtasks)"
+                : aggregated.final_answer;
             log.status = "completed";
             domain_repo_->updateQueryLog(log);
+
+            // B2: the DAG's final answer joins the conversation history as a
+            // regular assistant message (same durable idempotency scheme as
+            // the Query pipeline), so Chat history shows plan-driven answers
+            // identically to normal Q&A. The nexusai:conv:* projection keys
+            // have no production writer (P1), so no invalidation is needed.
+            domain_repo_->appendMessageAutoSequence(
+                "msg-assistant-" + request_id, user_id, context_id, "assistant",
+                log.response_text);
 
             common::TraceRecord trace_row;
             trace_row.id = "trace-" + request_id;

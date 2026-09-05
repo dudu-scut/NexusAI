@@ -5,7 +5,7 @@ This file provides guidance to AI coding agents (ZCode / Lingma / Claude Code) w
 ## 环境约束（最重要）
 
 - **C++ 后端的编译、测试、服务启动必须在 WSL2 Ubuntu 内运行**，且仓库须检出到 Linux 文件系统（不能在 `/mnt/c` 下）。前端和网关代理在 Windows 原生运行。
-- 首次构建前先运行 `./scripts/bootstrap-wsl.sh`。它会在 Ubuntu 26.04 上用 SHA-256 校验的 user-prefix 安装 pin 版 libpqxx 8.0.1（Ubuntu 24.04 用系统包）；`run.sh build` 会自动发现该前缀，无需手动 export。
+- 首次构建前先运行 `./scripts/bootstrap-wsl.sh`。它会在 Ubuntu 26.04 上用 SHA-256 校验的 user-prefix 安装 pin 版 libpqxx 8.0.1（Ubuntu 24.04 用系统包）；`run.sh build` 会自动发现该前缀，无需手动 export。**注意：`scripts/` 目录已从 git 移除（2026-09-04，属本地辅助脚本不入库），仅存在于本机工作区——本文档中的 `scripts/*.sh` 命令在本机可用，新 clone 需自行重建这些辅助脚本。**
 - 普通的一次 CMake 配置不会下载任何依赖。
 - Shell 为 PowerShell 时不支持 `&&`，用 `;` 分隔。
 
@@ -32,7 +32,7 @@ cd frontend && npm ci && npm run dev    # Vite :5173，代理到 Node proxy :808
 cd frontend && npm run typecheck        # lint 即 typecheck（vue-tsc）
 cd frontend && npm run build
 
-# 网关契约测试（98 例，Windows 原生）
+# 网关契约测试（116 例，Windows 原生）
 cd gateway/proxy && npm test
 
 # E2E
@@ -55,7 +55,7 @@ Docker 一键栈（仓库根目录）：`docker compose up --build` 启动 Postg
 - 新测试用例必须追加到既有测试文件（如 `test_redis_services.cpp`），**严禁修改 `tests/CMakeLists.txt`**。
 - 需要 Redis 在 `localhost:6379` 运行的测试：auth / memory / agent-communication 相关。PG 相关用例连真实数据库，缺环境变量时按约定 SKIP 而不是伪造通过。PG/Redis 可用 `docker compose up -d postgres redis` 启动（`docker-compose.override.yml` 发布 5432/6379 宿主端口供 WSL ctest 使用）；全量门禁用 `scripts/run_full_gate.sh`。
 - 前端类型 `frontend/src/types/proto.ts` 与 `proto/` 字段级对齐，改动 proto 后必须同步，网关契约测试里有防漂移断言。
-- `db/migrations/VNNN__name.sql` 是权威 schema（只追加）；RPC 服务端启动时自行执行迁移（`NEXUSAI_MIGRATIONS_DIR`），没有独立 migrate 服务；`sql/` 是旧参考 schema，永不执行。
+- `db/migrations/VNNN__name.sql` 是权威 schema（只追加）；RPC 服务端启动时自行执行迁移（`NEXUSAI_MIGRATIONS_DIR`），没有独立 migrate 服务；旧 `sql/` 参考 schema 已从仓库移除（2026-09-04，内容被 V001+ 迁移完全取代）。
 
 ## 架构总览
 
@@ -76,7 +76,7 @@ client/         → 交互式 gRPC CLI + Agent 注册 SDK
 gateway/proxy/  → Node JSON↔gRPC 转码代理（唯一的浏览器网关）：错误码映射（401/403/404/429/499/409）、
                   SSE in-band error、浏览器断开传播为 stream.cancel()
 frontend/       → Vue 3 + TS + Pinia SPA，10 个视图（Chat/Topology/Dashboard/Monitor/Admin/Sandbox/Compare/Share/Templates/Login）
-db/             → PostgreSQL 迁移 V001–V013（PostgreSQL 是唯一持久事实源，Redis 仅缓存/心跳/限流/短锁）
+db/             → PostgreSQL 迁移 V001–V015（PostgreSQL 是唯一持久事实源，含记忆域/画像/健康快照；Redis 仅投影/缓存/心跳/限流/短锁）
 ```
 
 ## 关键抽象

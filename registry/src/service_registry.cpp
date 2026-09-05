@@ -54,6 +54,41 @@ void ServiceRegistry::recordAgentCall(const std::string& agent_id,
     m.last_heartbeat = std::chrono::steady_clock::now();
 }
 
+void ServiceRegistry::seedLiveMetricsBaseline(const std::string& agent_id,
+                                              double success_rate,
+                                              double ema_latency_ms,
+                                              std::int64_t total_calls) {
+    if (agent_id.empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(live_metrics_mutex_);
+    auto& m = live_metrics_[agent_id];
+
+    // B4 startup recovery: reconstruct a synthetic ring buffer that mirrors
+    // the snapshot's success rate, so the first post-restart evaluation sees
+    // the durable verdict instead of an empty (cold-start) buffer. Slots are
+    // filled proportionally; buffer_idx=0 signals the fully-written state.
+    const int valid = static_cast<int>(
+        std::min<std::int64_t>(total_calls, static_cast<std::int64_t>(kSuccessBufferSize)));
+    const int successes = static_cast<int>(std::lround(success_rate * valid));
+    for (int i = 0; i < valid; ++i) {
+        m.recent_results[i] = i < successes;
+    }
+    for (size_t i = static_cast<size_t>(valid); i < kSuccessBufferSize; ++i) {
+        m.recent_results[i] = false;
+    }
+    // buffer_idx must mirror "valid slots written": evaluateHealth counts
+    // valid_count = (total_writes >= 100) ? 100 : buffer_idx, so a seeded
+    // 50-call snapshot needs buffer_idx=50 (0 would make it read exactly one
+    // slot and misjudge the rate). The % keeps the fully-written case at 0.
+    m.buffer_idx = valid % static_cast<int>(kSuccessBufferSize);
+    m.total_writes = static_cast<int>(std::max<std::int64_t>(0, total_calls));
+    if (ema_latency_ms > 0.0) {
+        m.ema_latency_ms = ema_latency_ms;
+    }
+    m.last_heartbeat = std::chrono::steady_clock::now();
+}
+
 HealthStatus ServiceRegistry::evaluateHealth(const std::string& agent_id) {
     std::lock_guard<std::mutex> lock(live_metrics_mutex_);
     auto it = live_metrics_.find(agent_id);
@@ -63,21 +98,12 @@ HealthStatus ServiceRegistry::evaluateHealth(const std::string& agent_id) {
 
     const auto& m = it->second;
 
-    // Count successes in circular buffer
-    int total = 0;
-    int successes = 0;
-    for (size_t i = 0; i < kSuccessBufferSize; ++i) {
-        total += m.recent_results[i] ? 1 : 0; // bool→int implicitly, but we count entries
-        // Actually we need to count all entries, not just true ones.
-        // But we can't distinguish uninitialized=false from failure=false.
-        // Instead count the number of entries written so far.
+    // Cold-start protection (same contract as evaluateAllHealth): agents
+    // with too few samples must not be judged UNHEALTHY off a handful of
+    // calls — report UNKNOWN until the sample floor is reached.
+    if (m.total_writes < kMinHealthSamples) {
+        return HealthStatus::UNKNOWN;
     }
-    // A cleaner approach: count from buffer_idx backwards for entries that were written.
-    // For simplicity, count only non-zero entries up to buffer_idx.
-    // Actually, let's use a simpler method: for all 100 slots, if the slot was written to,
-    // it's either true or false. Since we can't tell uninitialized from false,
-    // we use a different metric: success rate across written entries using buffer_idx.
-    // But buffer_idx wraps around. So we look at the full 100 - all are valid after 100 calls.
 
     // Use total_writes to determine actual valid entries after wrap-around
     int valid_count = (m.total_writes >= 100) ? 100 : m.buffer_idx;
@@ -103,6 +129,21 @@ void ServiceRegistry::evaluateAllHealth() {
 
 void ServiceRegistry::evaluateAllHealth(
     const std::function<void(const std::string&, HealthStatus)>& callback) {
+    // Thin forwarder onto the detailed variant (B4): same loop, callback
+    // discards the snapshot fields the durable persistence needs.
+    evaluateAllHealthDetailed(
+        [callback](const std::string& agent_id, HealthStatus status,
+                   double /*success_rate*/, double /*ema_latency_ms*/,
+                   int /*total_writes*/) {
+            if (callback) {
+                callback(agent_id, status);
+            }
+        });
+}
+
+void ServiceRegistry::evaluateAllHealthDetailed(
+    const std::function<void(const std::string&, HealthStatus, double, double,
+                             int)>& callback) {
     // Snapshot (agent_id, status, dashboard fields) under the metrics lock,
     // then invoke the callback AFTER releasing the lock. The callback is
     // expected to take router locks (agents_mutex_) — holding live_metrics_
@@ -114,6 +155,7 @@ void ServiceRegistry::evaluateAllHealth(
         double success_rate;
         double ema_latency_ms;
         int active_requests;
+        int total_writes;
     };
     std::vector<Snapshot> snapshots;
     {
@@ -136,7 +178,8 @@ void ServiceRegistry::evaluateAllHealth(
                 classifyHealth(success_rate, m.ema_latency_ms),
                 success_rate,
                 m.ema_latency_ms,
-                m.active_requests.load()});
+                m.active_requests.load(),
+                m.total_writes});
         }
     }
 
@@ -148,7 +191,8 @@ void ServiceRegistry::evaluateAllHealth(
                  " ema_latency=" + std::to_string(s.ema_latency_ms) + "ms" +
                  " active_requests=" + std::to_string(s.active_requests));
         if (callback) {
-            callback(s.agent_id, s.status);
+            callback(s.agent_id, s.status, s.success_rate, s.ema_latency_ms,
+                     s.total_writes);
         }
     }
 }

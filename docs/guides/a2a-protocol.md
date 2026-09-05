@@ -134,6 +134,9 @@ struct TaskStatus {
 | COMPLETED | (终态) |
 | FAILED | (终态) |
 | CANCELED | (终态) |
+| REJECTED | (终态) |
+
+> **终态守卫（批次八）**：任务一旦进入任一终态，`TaskManager::update_status` 拒绝一切后续状态写入（包括迟到的 worker 写 Completed 覆盖 Canceled 的"取消后复活"路径）；迟到的消息仍会追加进历史，但状态迁移被丢弃。
 
 ## API 方法
 
