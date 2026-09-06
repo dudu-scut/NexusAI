@@ -1,8 +1,6 @@
 # CLAUDE.md
 
 This file provides guidance to Claude Code when working with this repository.
-
-> 详尽的项目介绍、架构设计、技术亮点和求职竞争力分析见 [docs/NexusAI-project-introduction.md](docs/NexusAI-project-introduction.md)。
 ## PR1 platform baseline
 
 - Work in WSL2 Ubuntu (or native Linux) on the Linux filesystem; build deps via manual apt install or the local (untracked) `scripts/bootstrap-wsl.sh` helper before the first build.
