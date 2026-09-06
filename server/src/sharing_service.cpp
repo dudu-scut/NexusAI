@@ -150,9 +150,9 @@ grpc::Status SharingServiceImpl::ShareSession(
     if (request->context_id().empty()) {
         return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "context_id is required");
     }
-    if (request->expiry_days() < 0) {
+    if (request->expiry_days() < 0 || request->expiry_days() > 3650) {
         return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
-                            "expiry_days must be >= 0 (0 = no expiry)");
+                            "expiry_days must be in [0, 3650] (0 = no expiry)");
     }
     // Sharing requires owning the conversation; foreign ids look NOT_FOUND.
     if (!domain_repository_->getConversationById(owner_id, request->context_id())
@@ -161,14 +161,18 @@ grpc::Status SharingServiceImpl::ShareSession(
                             "Conversation not found: " + request->context_id());
     }
 
-    // 48 bytes drawn directly from the OS entropy source (bearer token).
-    const std::string raw_token = randomHex(48);
-    const std::string token_hash = sha256Hex(raw_token);
-    const std::string share_id = "share-" + randomHex(12);
     const std::string expires_at =
         request->expiry_days() > 0 ? isoUtcAfterDays(request->expiry_days()) : "";
 
+    // Declared outside the guard (the response echoes them) but generated
+    // inside it — a failing entropy source must not escape the handler.
+    std::string raw_token;
+    std::string token_hash;
+    std::string share_id;
     try {
+        raw_token = randomHex(48);
+        token_hash = sha256Hex(raw_token);
+        share_id = "share-" + randomHex(12);
         bool inserted = false;
         store_->executeTransaction([&](pqxx::work& transaction) {
             const auto result = transaction.exec_params(
@@ -402,8 +406,9 @@ grpc::Status SharingServiceImpl::SaveTemplate(
                             "Template definition must contain a non-empty 'initial_message'");
     }
 
-    const std::string template_id = "tpl-" + randomHex(12);
+    std::string template_id;
     try {
+        template_id = "tpl-" + randomHex(12);
         bool inserted = false;
         store_->executeTransaction([&](pqxx::work& transaction) {
             const auto result = transaction.exec_params(
@@ -568,10 +573,11 @@ grpc::Status SharingServiceImpl::UseTemplate(
     }
     const std::string initial_message = definition["initial_message"].get<std::string>();
 
-    // Create a REAL conversation for the current owner through the same
-    // repository path the durable Query pipeline uses.
-    const std::string context_id = "tpl-ctx-" + randomHex(12);
+    std::string context_id;
     try {
+        // Create a REAL conversation for the current owner through the same
+        // repository path the durable Query pipeline uses.
+        context_id = "tpl-ctx-" + randomHex(12);
         if (!domain_repository_->ensureConversation(owner_id, context_id, name)) {
             return grpc::Status(grpc::StatusCode::INTERNAL,
                                 "Failed to create conversation from template");

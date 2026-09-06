@@ -204,11 +204,12 @@ bool RpcClient::connectViaRegistry(const std::string& registry_address,
                 return;
             }
 
-            {
-                std::lock_guard<std::mutex> lock(connection_mutex_);
-                server_endpoints_ = endpoints;
-                discovered_service_name_ = service_name;
-            }
+            // The load balancer is swapped under connection_mutex_ (connect
+            // paths); the registry watch thread must touch it under the same
+            // lock or it can call into a destroyed instance.
+            std::lock_guard<std::mutex> lock(connection_mutex_);
+            server_endpoints_ = endpoints;
+            discovered_service_name_ = service_name;
 
             if (load_balancer_) {
                 load_balancer_->updateEndpoints(endpoints);
@@ -615,6 +616,9 @@ void RpcClient::setupChannel() {
 
 
 bool RpcClient::reconnect() {
+    // Heartbeat and user threads can hit a transport failure concurrently;
+    // serialize recovery so only one thread rebuilds the channel.
+    std::lock_guard<std::mutex> reconnect_lock(reconnect_mutex_);
     if (connection_retry_count_ >= MAX_RETRY_COUNT) {
         LOG_ERROR("Max reconnection attempts reached");
         return false;

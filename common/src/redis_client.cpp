@@ -362,7 +362,8 @@ bool RedisClient::incrby(const std::string& key, int64_t increment,
     if (!ensureConnected()) return false;
 
     auto* reply = static_cast<redisReply*>(
-        redisCommand(ctx_, "INCRBY %s %ld", key.c_str(), increment));
+        redisCommand(ctx_, "INCRBY %s %lld", key.c_str(),
+                     static_cast<long long>(increment)));
     if (!reply) return false;
 
     if (reply->type == REDIS_REPLY_INTEGER) {

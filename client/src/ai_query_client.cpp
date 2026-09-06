@@ -33,6 +33,7 @@ bool AIQueryClient::connect(const std::string& server_address) {
         disconnect();
     }
     
+    std::lock_guard<std::mutex> lock(stub_mutex_);
     server_address_ = server_address;
     
     try {
@@ -51,7 +52,8 @@ bool AIQueryClient::connect(const std::string& server_address) {
             return false;
         }
         
-        stub_ = agent_communication::AIQueryService::NewStub(channel_);
+        stub_ = std::shared_ptr<agent_communication::AIQueryService::Stub>(
+            agent_communication::AIQueryService::NewStub(channel_));
         
         if (!stub_) {
             LOG_ERROR("Failed to create AIQueryService stub");
@@ -69,10 +71,7 @@ bool AIQueryClient::connect(const std::string& server_address) {
 }
 
 void AIQueryClient::disconnect() {
-    if (!connected_) {
-        return;
-    }
-    
+    std::lock_guard<std::mutex> lock(stub_mutex_);
     stub_.reset();
     channel_.reset();
     connected_ = false;
@@ -99,12 +98,18 @@ agent_communication::AIQueryResponse AIQueryClient::query(
     
     agent_communication::AIQueryResponse response;
     
-    if (!connected_) {
-        LOG_ERROR("AIQueryClient not connected");
-        auto* status = response.mutable_status();
-        status->set_code(-1);
-        status->set_message("Client not connected");
-        return response;
+    // Snapshot the stub: a concurrent reconnect may replace it mid-call.
+    std::shared_ptr<agent_communication::AIQueryService::Stub> stub;
+    {
+        std::lock_guard<std::mutex> lock(stub_mutex_);
+        if (!connected_) {
+            LOG_ERROR("AIQueryClient not connected");
+            auto* status = response.mutable_status();
+            status->set_code(-1);
+            status->set_message("Client not connected");
+            return response;
+        }
+        stub = stub_;
     }
     
     auto start_time = std::chrono::steady_clock::now();
@@ -119,7 +124,7 @@ agent_communication::AIQueryResponse AIQueryClient::query(
     
     LOG_INFO("Sending AI query: " + request.request_id());
     
-    grpc::Status status = stub_->Query(&context, request, &response);
+    grpc::Status status = stub->Query(&context, request, &response);
     
     auto end_time = std::chrono::steady_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -175,9 +180,15 @@ bool AIQueryClient::queryStream(
     const agent_communication::AIQueryRequest& request,
     StreamEventCallback callback) {
     
-    if (!connected_) {
-        LOG_ERROR("AIQueryClient not connected");
-        return false;
+    // Snapshot the stub (see query()).
+    std::shared_ptr<agent_communication::AIQueryService::Stub> stub;
+    {
+        std::lock_guard<std::mutex> lock(stub_mutex_);
+        if (!connected_) {
+            LOG_ERROR("AIQueryClient not connected");
+            return false;
+        }
+        stub = stub_;
     }
     
     if (!callback) {
@@ -198,7 +209,7 @@ bool AIQueryClient::queryStream(
     LOG_INFO("Starting streaming AI query: " + request.request_id());
     
     std::unique_ptr<grpc::ClientReader<agent_communication::AIStreamEvent>> reader(
-        stub_->QueryStream(&context, request));
+        stub->QueryStream(&context, request));
     
     if (!reader) {
         LOG_ERROR("Failed to create stream reader");

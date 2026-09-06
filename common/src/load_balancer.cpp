@@ -59,7 +59,10 @@ ServiceEndpoint RandomLoadBalancer::selectEndpoint(const std::vector<ServiceEndp
     std::lock_guard<std::mutex> lock(endpoints_mutex_);
     std::vector<ServiceEndpoint> healthy;
     for (const auto& ep : endpoints) {
-        if (ep.is_healthy) healthy.push_back(ep);
+        std::string id = ep.host + ":" + std::to_string(ep.port);
+        auto health_it = endpoint_health_.find(id);
+        bool is_healthy = (health_it != endpoint_health_.end()) ? health_it->second : ep.is_healthy;
+        if (is_healthy) healthy.push_back(ep);
     }
     if (healthy.empty()) throw std::runtime_error("No healthy endpoints available");
     std::uniform_int_distribution<> dis(0, healthy.size() - 1);
@@ -69,10 +72,15 @@ ServiceEndpoint RandomLoadBalancer::selectEndpoint(const std::vector<ServiceEndp
 void RandomLoadBalancer::updateEndpoints(const std::vector<ServiceEndpoint>& endpoints) {
     std::lock_guard<std::mutex> lock(endpoints_mutex_);
     healthy_endpoints_ = endpoints;
+    endpoint_health_.clear();
+    for (const auto& ep : endpoints) {
+        endpoint_health_[ep.host + ":" + std::to_string(ep.port)] = ep.is_healthy;
+    }
 }
 
 void RandomLoadBalancer::markEndpointStatus(const std::string& endpoint_id, bool healthy) {
     std::lock_guard<std::mutex> lock(endpoints_mutex_);
+    endpoint_health_[endpoint_id] = healthy;
     for (auto& ep : healthy_endpoints_) {
         if (ep.host + ":" + std::to_string(ep.port) == endpoint_id) {
             ep.is_healthy = healthy;
@@ -89,8 +97,13 @@ ServiceEndpoint LeastConnectionsLoadBalancer::selectEndpoint(const std::vector<S
     std::string best_id;
     int min_conn = INT_MAX;
     for (const auto& ep : endpoints) {
-        if (!ep.is_healthy) continue;
         std::string id = ep.host + ":" + std::to_string(ep.port);
+        // A markEndpointStatus(false) must hold even when the caller passes
+        // a stale healthy bit — the internal record wins when present.
+        auto known = endpoints_.find(id);
+        bool is_healthy = (known != endpoints_.end()) ? known->second.is_healthy
+                                                      : ep.is_healthy;
+        if (!is_healthy) continue;
         int conn = connection_counts_[id];
         if (conn < min_conn) {
             min_conn = conn;
@@ -279,6 +292,9 @@ ServiceEndpoint LeastResponseTimeLoadBalancer::selectEndpoint(const std::vector<
         if (!ep.is_healthy) continue;
         std::string id = ep.host + ":" + std::to_string(ep.port);
         auto it = endpoint_stats_.find(id);
+        if (it != endpoint_stats_.end() && !it->second.endpoint.is_healthy) {
+            continue;  // marked unhealthy via markEndpointStatus
+        }
         if (it == endpoint_stats_.end()) {
             // Prefer unknown endpoints (exploration), fallback to fastest known
             if (best_unknown_id.empty()) best_unknown_id = id;
@@ -316,8 +332,8 @@ void LeastResponseTimeLoadBalancer::updateEndpoints(const std::vector<ServiceEnd
 
 void LeastResponseTimeLoadBalancer::markEndpointStatus(const std::string& endpoint_id, bool healthy) {
     std::lock_guard<std::mutex> lock(stats_mutex_);
-    auto it = endpoint_stats_.find(endpoint_id);
-    if (it != endpoint_stats_.end()) it->second.endpoint.is_healthy = healthy;
+    // Create the entry if missing so the mark survives until updateEndpoints.
+    endpoint_stats_[endpoint_id].endpoint.is_healthy = healthy;
 }
 
 void LeastResponseTimeLoadBalancer::updateResponseTime(const std::string& endpoint_id,

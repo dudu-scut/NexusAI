@@ -19,7 +19,7 @@ This file provides guidance to Claude Code when working with this repository.
 ```bash
 # 一键操作（WSL 内或通过 wsl -d Ubuntu -- bash -c "..."）
 ./run.sh build          # 编译 (cmake + make)
-./run.sh test           # 运行全部 36 套测试
+./run.sh test           # 运行全部 37 套测试
 ./run.sh start-all      # 一键启动全部后端 (Redis + Mock Agent + Proxy + Orchestrator + gRPC)
 ./run.sh stop           # 停止全部服务
 ./run.sh verify         # E2E 验证 (全部 8 批 32 个场景)
@@ -32,7 +32,7 @@ cd frontend && npm ci && npm run dev   # Vite :5173 → Node proxy :8081 → gRP
 cd build && ctest --output-on-failure
 ./build/tests/test_agent_router_properties  # 路由属性测试
 ./build/tests/test_a2a_integration          # A2A 协议集成测试
-# ...（共 36 套，cd build && ctest -N 可列出）
+# ...（共 37 套，迁移集成测试需 PG，无 PG 时条件跳过；cd build && ctest -N 可列出）
 ```
 
 **环境：** C++ 编译/测试/服务启动在 Linux 原生或 Windows 下的 WSL2 (Ubuntu) 中运行。前端与网关代理在宿主机终端运行；Docker Compose 栈可在任意支持 Docker 的环境启动。

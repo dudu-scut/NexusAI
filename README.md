@@ -84,7 +84,7 @@ Node.js 网关将 gRPC 状态码映射为稳定的 HTTP 语义码：UNAUTHENTICA
 
 ### 认证与安全
 
-密码采用 OpenSSL scrypt（EVP_PBE_scrypt，32 字节随机盐）哈希存储；会话令牌为 32 字节 CSPRNG 随机数，服务端仅存 SHA-256 摘要，会话事实源在 PostgreSQL `auth_sessions`（登出/封禁即时撤销），拦截器层附带短 TTL 读缓存（撤销延迟有上限）。gRPC 拦截器对全部接口鉴权，白名单内的公开 RPC 免认证。匹配 `NEXUSAI_ADMIN_USERNAME` 的用户在注册时获得 ADMIN 角色，作为 RegisterAgent / UnregisterAgent 等管理面 RPC 的强制门槛。
+密码采用 OpenSSL scrypt（EVP_PBE_scrypt，32 字节随机盐）哈希存储；会话令牌为 32 字节 CSPRNG 随机数，服务端仅存 SHA-256 摘要，会话事实源在 PostgreSQL `auth_sessions`，拦截器层附带短 TTL 读缓存（300s，撤销延迟以此为上界）；仓储层提供 `revokeSession` 撤销原语，独立的 Logout RPC 尚未接线（泄漏 token 的自助吊销暂以等 TTL 过期兜底）。gRPC 拦截器对全部接口鉴权，白名单内的公开 RPC 免认证。匹配 `NEXUSAI_ADMIN_USERNAME` 的用户在注册时获得 ADMIN 角色，作为 RegisterAgent / UnregisterAgent 等管理面 RPC 的强制门槛。
 
 ## 架构概览
 
@@ -192,7 +192,7 @@ cp .env.example .env         # 填入 LLM_API_KEY 等实际值
 
 ```bash
 ./run.sh build               # CMake + make 编译
-./run.sh test                # 运行全部 36 套测试
+./run.sh test                # 运行全部 37 套测试
 ```
 
 **4. 启动后端（Linux / WSL2 内）**
@@ -301,7 +301,7 @@ agent-communication-and-tool-selection-framework/
 │       └── types/proto.ts           #   与 proto/ 字段级对齐的类型定义
 │
 ├── gateway/proxy/                   # Node.js JSON-gRPC 网关代理 + 契约测试
-├── tests/                           # C++ 测试（36 套，GTest + RapidCheck）
+├── tests/                           # C++ 测试（37 套，GTest + RapidCheck；其中迁移集成测试需 PG，无 PG 时条件跳过）
 │   └── e2e/                         #   发布 E2E 脚本
 ├── examples/                        # Agent 接入示例（Python）
 ├── docs/                            # 项目文档
@@ -343,7 +343,7 @@ agent-communication-and-tool-selection-framework/
 
 ## 测试与验证
 
-### C++ 测试（Linux / WSL2 内，36 套）
+### C++ 测试（Linux / WSL2 内，37 套，PG 可用时）
 
 GTest 集成测试与 RapidCheck 属性测试相结合，覆盖 durable 查询管线、查询域仓储契约、预算仓储契约、工作流控制契约、Agent 运行时仓储契约、路由属性、熔断器、任务状态机等。涉及 PostgreSQL 的用例连接真实数据库执行，缺失环境变量时按约定 SKIP 而非伪造通过。
 

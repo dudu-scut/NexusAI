@@ -96,8 +96,7 @@ bool A2AAdapter::processQuery(
         // per-call headers/timeouts must not live on shared state).
         a2a::A2AClient client(config_.orchestrator_url);
         client.set_timeout(request_timeout_seconds_.load());
-        // P24: install the caller-registered abort flag so a client
-        // disconnect can interrupt the blocking transfer.
+        // P24: abort flag → client disconnect interrupts the transfer.
         if (abort_flag) {
             client.set_abort_flag(abort_flag.get());
         }
@@ -183,8 +182,7 @@ bool A2AAdapter::processQuery(
                 // record here + a record in the outer catch would double-
                 // count one failure and trip the breaker early).
                 const std::string what = e.what();
-                // P24: the abort flag raised mid-transfer — cancellation,
-                // not a transient transport failure.
+                // P24: abort raised mid-transfer — cancellation, not transport.
                 if (abort_flag && abort_flag->load(std::memory_order_relaxed)) {
                     auto* status = response->mutable_status();
                     status->set_code(static_cast<int>(grpc::StatusCode::CANCELLED));
@@ -361,8 +359,7 @@ void A2AAdapter::processQueryStreaming(
         // header/timeout state.
         a2a::A2AClient client(config_.orchestrator_url);
         client.set_timeout(request_timeout_seconds_.load());
-        // P24: install the caller-registered abort flag so a client
-        // disconnect can interrupt the SSE transfer.
+        // P24: abort flag → client disconnect interrupts the SSE transfer.
         if (abort_flag) {
             client.set_abort_flag(abort_flag.get());
         }
@@ -530,8 +527,7 @@ void A2AAdapter::processQueryStreaming(
         callback(complete_event);
 
     } catch (const std::exception& e) {
-        // P24: a disconnect-driven abort is cancellation — do not record a
-        // failure that would open the breaker on a healthy backend.
+        // P24: disconnect abort is cancellation — no breaker recording.
         const bool aborted =
             abort_flag && abort_flag->load(std::memory_order_relaxed);
 
@@ -628,8 +624,7 @@ bool A2AAdapter::processQueryDirect(
         // static config value, so gRPC-deadline-contracted requests on the
         // direct path honor the same budget as the orchestrator path.
         client.set_timeout(request_timeout_seconds_.load());
-        // P24: install the caller-registered abort flag so a client
-        // disconnect can interrupt the blocking transfer.
+        // P24: abort flag → client disconnect interrupts the transfer.
         if (abort_flag) {
             client.set_abort_flag(abort_flag.get());
         }
@@ -712,8 +707,7 @@ bool A2AAdapter::processQueryDirect(
         return true;
 
     } catch (const a2a::A2AException& e) {
-        // P24: our own disconnect abort is cancellation, not an agent
-        // failure — skip the breaker and surface CANCELLED.
+        // P24: disconnect abort is cancellation — skip the breaker.
         if (abort_flag && abort_flag->load(std::memory_order_relaxed)) {
             auto* status = response->mutable_status();
             status->set_code(static_cast<int>(grpc::StatusCode::CANCELLED));
@@ -734,7 +728,7 @@ bool A2AAdapter::processQueryDirect(
         status->set_message(error_msg);
         return false;
     } catch (const std::exception& e) {
-        // P24: same cancellation carve-out for transport-level aborts.
+        // P24: cancellation carve-out (transport abort).
         if (abort_flag && abort_flag->load(std::memory_order_relaxed)) {
             auto* status = response->mutable_status();
             status->set_code(static_cast<int>(grpc::StatusCode::CANCELLED));
@@ -808,8 +802,7 @@ void A2AAdapter::processQueryStreamingDirect(
 
         a2a::A2AClient client(agent_url);
         client.set_timeout(request_timeout_seconds_.load());
-        // P24: install the caller-registered abort flag so a client
-        // disconnect can interrupt the SSE transfer.
+        // P24: abort flag → client disconnect interrupts the SSE transfer.
         if (abort_flag) {
             client.set_abort_flag(abort_flag.get());
         }
@@ -987,7 +980,7 @@ void A2AAdapter::processQueryStreamingDirect(
         callback(complete_event);
 
     } catch (const std::exception& e) {
-        // P24: same cancellation carve-out for the direct streaming path.
+        // P24: cancellation carve-out (streaming direct).
         const bool aborted =
             abort_flag && abort_flag->load(std::memory_order_relaxed);
 

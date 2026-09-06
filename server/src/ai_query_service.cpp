@@ -253,8 +253,11 @@ bool AIQueryServiceImpl::beginDurableRows(DurableQueryRun& run, const std::strin
         // NOT re-execute the query (double LLM cost) nor overwrite the
         // recorded terminal state. Signal the caller to short-circuit with
         // the persisted answer; finalize stays a no-op for this run.
-        static const char* kTerminalStates[] = {"completed", "failed", "cancelled",
-                                                "rejected", "planned"};
+        // "rejected" is not a replay terminal — a budget rejection stays
+        // retryable with the same request_id once the budget resets (N3);
+        // billing idempotency is owned by the usage-<request_id> ledger key.
+        static const char* kTerminalStates[] = {"completed", "failed",
+                                                "cancelled", "planned"};
         for (const char* terminal : kTerminalStates) {
             if (existing->status == terminal) {
                 run.replay_terminal = true;
@@ -586,14 +589,10 @@ void AIQueryServiceImpl::finalizeDurableQuery(DurableQueryRun& run, const std::s
         LOG_WARN("finalize: trace update missed for request " + run.request_id);
     }
 
-    // Token ledger: one estimate-only entry per request_id, never per retry.
-    // The entry id is the deduplication key: the repository reports the
-    // conflict instead of throwing, so retries may call this unconditionally.
-    // Note: "rejected" is itself a terminal replay state, so the "rejected
-    // first, retried successfully" path never reaches this code — a retry
-    // after budget rejection must use a new request_id (see the replay
-    // short-circuit in beginDurableRows). There is no provider settlement
-    // yet (estimated=true).
+    // Token ledger: one estimate-only entry per request_id, never per retry
+    // — the repository reports the duplicate instead of throwing. A
+    // budget-rejected attempt writes no row, so the N3 retry path bills
+    // exactly once here. No provider settlement yet (estimated=true).
     common::TokenUsageLedgerRecord usage;
     usage.id = "usage-" + run.request_id;
     usage.owner_id = run.owner_id;
@@ -808,7 +807,7 @@ void AIQueryServiceImpl::writeAgentSwitchMemory(
 
 namespace {
 
-// P24 review: process-local dedup for concurrent same-request_id pipelines.
+// P24: process-local dedup for concurrent same-request_id pipelines.
 // A client retry while the first attempt is still executing must not run the
 // query twice (double LLM cost, competing terminal writes). Crash recovery
 // stays intact: the entry is removed when the RPC handler unwinds, so a
@@ -887,7 +886,7 @@ grpc::Status AIQueryServiceImpl::Query(
         context_id = "ctx-" + request_id;
     }
 
-    // P24 review: reject a concurrent same-request_id duplicate before any
+    // P24: reject a concurrent same-request_id duplicate before any
     // durable row is touched.
     auto inflight_guard = InflightRequestGuard::tryAcquire(request_id);
     if (!inflight_guard) {
@@ -938,12 +937,6 @@ grpc::Status AIQueryServiceImpl::Query(
         }
         if (run.replay_status == "cancelled") {
             return grpc::Status(grpc::StatusCode::CANCELLED, "Request already cancelled");
-        }
-        if (run.replay_status == "rejected") {
-            return grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED,
-                                run.replay_response.empty()
-                                    ? "Request already rejected (budget)"
-                                    : run.replay_response);
         }
         return grpc::Status(grpc::StatusCode::INTERNAL,
                             run.replay_response.empty()
@@ -1039,10 +1032,8 @@ grpc::Status AIQueryServiceImpl::Query(
         error_message = response->status().message();
     }
 
-    // Client disconnected mid-execution: persist cancelled instead of
-    // finalizing a completed (and billed) run — same contract as the
-    // streaming path. P24 C2: also mark the request-level cancellation
-    // token so any straggler call of this request self-aborts.
+    // Client disconnected mid-execution: persist cancelled instead of a
+    // completed (and billed) run, and mark the request-level token.
     if (context->IsCancelled()) {
         InFlightAbortRegistry::instance().cancelInFlightByRequest(request_id);
         finalizeDurableQuery(run, "cancelled", "", "Request cancelled");
@@ -1183,7 +1174,7 @@ grpc::Status AIQueryServiceImpl::QueryStream(
         context_id = "ctx-" + request_id;
     }
 
-    // P24 review: same in-flight dedup as the sync Query path.
+    // P24: same in-flight dedup as the sync Query path.
     auto inflight_guard = InflightRequestGuard::tryAcquire(request_id);
     if (!inflight_guard) {
         return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
@@ -1235,7 +1226,6 @@ grpc::Status AIQueryServiceImpl::QueryStream(
         return grpc::Status(
             run.replay_status == "cancelled" ? grpc::StatusCode::CANCELLED
             : run.replay_status == "planned" ? grpc::StatusCode::FAILED_PRECONDITION
-            : run.replay_status == "rejected" ? grpc::StatusCode::RESOURCE_EXHAUSTED
             : grpc::StatusCode::INTERNAL,
             "Request already finalized with status " + run.replay_status);
     }

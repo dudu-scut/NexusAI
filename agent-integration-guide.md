@@ -32,6 +32,7 @@
 ### 认证要求（重要变化）
 
 `RegisterAgent` 与 `UnregisterAgent` 是 **ADMIN-only** 能力：服务端通过 `AuthInterceptor::requireAdmin()` 拦截，调用方必须携带角色为 `ADMIN` 的登录令牌，否则返回 `UNAUTHENTICATED`（未登录）或 `PERMISSION_DENIED`（角色不足）。ADMIN 身份由服务端环境变量 `NEXUSAI_ADMIN_USERNAME` 指定——注册用户名与之匹配时，`agent_communication.auth.UserService/Register` 会颁发 `ADMIN` 角色。
+> ⚠️ **部署安全注记**：该机制存在"首注抢占"窗口——若运维已配置变量但尚未注册管理账号，攻击者抢先以该用户名注册即获得 ADMIN。部署时必须在服务对外可用**之前**完成管理账号注册，且变量一旦固化不可更换（角色在注册时固化，后补配置不会升级既有账号）。
 
 因此接入流程先要经过认证服务：
 

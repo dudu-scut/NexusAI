@@ -124,10 +124,10 @@ Durable Pipeline 的解决思路是：**把身份锚定在认证上下文、把�
 
 ### 重放短路（批次八）
 
-幂等主键保证"不重复写"，批次八进一步保证"不重复跑"：`beginDurableRows` 发现 query_log 行已处于终态（completed / failed / cancelled / rejected / planned）时，本次调用直接短路——同步路径返回落库的 answer 与对应状态码，流式路径补发一条终态事件后返回。预算也只在首次真实执行时预留。语义约定：
+幂等主键保证"不重复写"，批次八进一步保证"不重复跑"：`beginDurableRows` 发现 query_log 行已处于终态（completed / failed / cancelled / planned）时，本次调用直接短路——同步路径返回落库的 answer 与对应状态码，流式路径补发一条终态事件后返回。预算也只在首次真实执行时预留。语义约定：
 
 - 重放 completed 返回 OK + 已落库回答；
-- 重放 failed / rejected 返回与原终态一致的错误语义；
+- 重放 failed 返回与原终态一致的错误语义；**rejected 不在重放集合**——预算重置后可用同 request_id 重试（N3 契约，usage-<request_id> 台账幂等键保证重试只计一次费；PG/Redis 侧 updateQueryLog/updateTrace 的终态守卫同样豁免 rejected，允许 rejected 行被重试改写为终态）；
 - 重放 planned 返回 `FAILED_PRECONDITION`，提示该计划的执行应走 `ExecutePlan` 确认通道，而不是重跑本查询。
 
 ## Token 预算：PG 原子预留

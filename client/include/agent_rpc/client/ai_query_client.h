@@ -116,8 +116,9 @@ public:
 private:
     std::string generateRequestId();
     
+    std::mutex stub_mutex_;  // guards channel_/stub_ against reconnect races
     std::shared_ptr<grpc::Channel> channel_;
-    std::unique_ptr<agent_communication::AIQueryService::Stub> stub_;
+    std::shared_ptr<agent_communication::AIQueryService::Stub> stub_;
     std::string server_address_;
     std::atomic<bool> connected_{false};
     std::atomic<uint64_t> request_counter_{0};

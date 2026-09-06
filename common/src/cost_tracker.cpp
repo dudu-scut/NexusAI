@@ -102,9 +102,12 @@ void CostTracker::updateRedisBudget(const std::string& user_id, double cost_usd)
     }
 
     std::string key = "cost:" + safe_user_id + ":" + date_key.str();
-    int64_t new_total;
-    redis_->incrby(key, micro, new_total);
-    redis_->expire(key, 90000);
+    int64_t new_total = 0;
+    // The Redis key is an observability projection (budget enforcement is
+    // PG-side); a fault here must at least be visible.
+    if (!redis_->incrby(key, micro, new_total) || !redis_->expire(key, 90000)) {
+        LOG_WARN("cost projection update failed for " + key);
+    }
 }
 
 }  // namespace common

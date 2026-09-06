@@ -107,6 +107,7 @@ void AgentCommunicationServiceImpl::cleanupOfflineAgents() {
             LOG_WARN("Agent offline, removing: " + it->first);
             removeFromIndexes(it->first);
             agent_message_queues_.erase(it->first);
+            agent_queue_owners_.erase(it->first);
             common::Metrics::getInstance().recordDisconnection(it->first);
             // Also remove from the router to prevent routing to dead agents
             if (router_) {
@@ -143,7 +144,13 @@ grpc::Status AgentCommunicationServiceImpl::SendMessage(
     std::lock_guard<std::mutex> lock(agents_mutex_);
     auto it = agent_message_queues_.find(target);
     if (it != agent_message_queues_.end()) {
-        it->second.push(request->message());
+        // Stamp the authenticated sender so the receiving side can attribute
+        // messages (the Message proto has no dedicated sender field; headers
+        // keep the proto contract untouched).
+        agent_communication::Message stamped = request->message();
+        (*stamped.mutable_headers())["x-sender-owner"] =
+            AuthInterceptor::currentUserId();
+        it->second.push(std::move(stamped));
         auto* status = response->mutable_status();
         status->set_code(0);
         status->set_message("OK");
@@ -181,6 +188,19 @@ grpc::Status AgentCommunicationServiceImpl::ReceiveMessage(
         status->set_code(1);
         status->set_message("Agent not found: " + agent_id);
         return grpc::Status::OK;
+    }
+
+    // Tenant isolation: the inbox belongs to the agent's registrant — a
+    // caller that is not the queue owner may not drain another tenant's
+    // messages.
+    const std::string caller = AuthInterceptor::currentUserId();
+    auto owner_it = agent_queue_owners_.find(agent_id);
+    if (owner_it == agent_queue_owners_.end() || owner_it->second != caller) {
+        auto* status = response->mutable_status();
+        status->set_code(7);  // PERMISSION_DENIED
+        status->set_message("Only the agent's registrant may read its inbox");
+        return grpc::Status(grpc::StatusCode::PERMISSION_DENIED,
+                            "Only the agent's registrant may read its inbox");
     }
 
     agent_communication::Message msg;
@@ -341,6 +361,7 @@ grpc::Status AgentCommunicationServiceImpl::RegisterAgent(
         std::lock_guard<std::mutex> lock(agents_mutex_);
         agents_[agent_id] = endpoint;
         agent_message_queues_.try_emplace(agent_id);
+        agent_queue_owners_[agent_id] = AuthInterceptor::currentUserId();
         agent_liveness_ttl_[agent_id] = liveness_ttl;
         addToIndexes(agent_id, endpoint);
     }
@@ -444,6 +465,7 @@ grpc::Status AgentCommunicationServiceImpl::UnregisterAgent(
         removeFromIndexes(agent_id);
         agents_.erase(agent_id);
         agent_message_queues_.erase(agent_id);
+        agent_queue_owners_.erase(agent_id);
         agent_liveness_ttl_.erase(agent_id);
     }
 
@@ -486,6 +508,21 @@ grpc::Status AgentCommunicationServiceImpl::Heartbeat(
                             "Valid authentication token required");
     }
 
+    // Only agents registered through this process may be refreshed: a bare
+    // heartbeat for an unknown id must not mint a durable "healthy" row
+    // (registration is the ADMIN-gated path).
+    const bool known_here = [this, &request]() {
+        std::lock_guard<std::mutex> lock(agents_mutex_);
+        return agent_liveness_ttl_.find(request->agent_id()) !=
+               agent_liveness_ttl_.end();
+    }();
+    if (!known_here) {
+        auto* status = response->mutable_status();
+        status->set_code(1);
+        status->set_message("Agent not registered: " + request->agent_id());
+        return grpc::Status::OK;
+    }
+
     updateAgentHeartbeat(request->agent_id());
 
     // Refresh the durable registry fact and the liveness cache. The
@@ -501,8 +538,7 @@ grpc::Status AgentCommunicationServiceImpl::Heartbeat(
     }
     if (redis_) {
         // Align the liveness TTL with the interval negotiated at registration
-        // time (max(3*interval, 300s)); fall back to the 5-minute default when
-        // the agent never registered through this process.
+        // time (max(3*interval, 300s)).
         int ttl = kDefaultLivenessTtlSeconds;
         {
             std::lock_guard<std::mutex> lock(agents_mutex_);
@@ -555,6 +591,12 @@ grpc::Status AgentCommunicationServiceImpl::ListenMessages(
             auto it = agent_message_queues_.find(agent_id);
             if (it == agent_message_queues_.end()) {
                 return grpc::Status(grpc::StatusCode::NOT_FOUND, "Agent not found");
+            }
+            auto owner_it = agent_queue_owners_.find(agent_id);
+            if (owner_it == agent_queue_owners_.end() ||
+                owner_it->second != AuthInterceptor::currentUserId()) {
+                return grpc::Status(grpc::StatusCode::PERMISSION_DENIED,
+                                    "Only the agent's registrant may read its inbox");
             }
             // Use non-blocking pop to avoid holding the global lock during wait
             got_message = it->second.try_pop(msg, std::chrono::milliseconds(0));

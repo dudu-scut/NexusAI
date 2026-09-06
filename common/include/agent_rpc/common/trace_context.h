@@ -108,7 +108,12 @@ public:
 
     void endSpan() {
         if (span_stack_.empty()) return;
-        const std::string& span_id = span_stack_.back();
+        // Pop FIRST (by value): the exporter below may re-enter init/
+        // startSpan or throw — neither may desynchronize the span stack
+        // (endSpan runs inside SpanGuard's destructor, which must not
+        // unwind an exception either).
+        const std::string span_id = span_stack_.back();
+        span_stack_.pop_back();
         for (auto it = spans_.rbegin(); it != spans_.rend(); ++it) {
             if (it->span_id == span_id) {
                 it->end_time = std::chrono::steady_clock::now();
@@ -122,12 +127,16 @@ public:
                     exporter_copy = spanExporter();
                 }
                 if (exporter_copy) {
-                    exporter_copy(*it, trace_id_, user_id_);
+                    try {
+                        exporter_copy(*it, trace_id_, user_id_);
+                    } catch (...) {
+                        // Telemetry is best-effort; never let it escape
+                        // (SpanGuard's destructor would terminate).
+                    }
                 }
                 break;
             }
         }
-        span_stack_.pop_back();
     }
 
     int currentDepth() const { return static_cast<int>(span_stack_.size()); }

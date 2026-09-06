@@ -48,6 +48,18 @@ public:
         
         // Check HTTP status
         if (!http_response.is_success()) {
+            // 4xx (except 429) is a protocol/configuration error: the
+            // adapter must neither retry it nor feed it to the circuit
+            // breaker as a backend transport failure.
+            if (http_response.status_code >= 400 &&
+                http_response.status_code < 500 &&
+                http_response.status_code != 429) {
+                throw A2AException(
+                    "HTTP protocol error: " +
+                        std::to_string(http_response.status_code),
+                    ErrorCode::InvalidRequest
+                );
+            }
             throw A2AException(
                 "HTTP request failed: " + std::to_string(http_response.status_code),
                 ErrorCode::InternalError

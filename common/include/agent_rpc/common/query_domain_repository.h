@@ -298,6 +298,13 @@ public:
     // updated_at); every other record field is ignored.
     bool updateTrace(const TraceRecord& trace);
 
+    // Post-terminal payload merge for the exact-replay linkage: merges
+    // keys into trace_payload without touching status (deliberately outside
+    // the updateTrace terminal guard).
+    bool updateTracePayload(const std::string& owner_id,
+                            const std::string& trace_id,
+                            const std::string& payload);
+
     // Appends one estimate-only ledger entry per id. A duplicate id (same
     // request retried) returns false instead of throwing, so finalize paths
     // can call it unconditionally; other PostgreSQL failures propagate.

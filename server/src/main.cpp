@@ -559,6 +559,9 @@ int main(int argc, char* argv[]) {
                 const auto& qs = batch.front();
                 nlohmann::json span_json;
                 span_json["trace_id"] = qs.trace_id;
+                // owner_id lets the GetTraceDetail Redis fallback enforce
+                // ownership (the key is trace_id-scoped only).
+                span_json["owner_id"] = qs.user_id;
                 span_json["span_id"] = qs.span_id;
                 span_json["name"] = qs.name;
                 span_json["component"] = qs.component;

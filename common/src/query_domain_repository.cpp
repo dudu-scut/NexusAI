@@ -454,7 +454,7 @@ bool QueryDomainRepository::updateQueryLog(const QueryLogRecord& query_log) {
             "UPDATE query_logs SET response_text = $3, model = $4, status = $5, "
             "updated_at = NOW() WHERE owner_id = $1 AND id = $2 "
             "AND (status IS NULL OR status NOT IN "
-            "('completed', 'failed', 'cancelled', 'rejected', 'planned')) "
+            "('completed', 'failed', 'cancelled', 'planned')) "
             "RETURNING id",
             query_log.owner_id, query_log.id, query_log.response_text, query_log.model,
             query_log.status);
@@ -515,9 +515,31 @@ bool QueryDomainRepository::updateTrace(const TraceRecord& trace) {
             "status = $4, updated_at = NOW() "
             "WHERE owner_id = $1 AND id = $2 "
             "AND (status IS NULL OR status NOT IN "
-            "('completed', 'failed', 'cancelled', 'rejected', 'planned')) "
+            "('completed', 'failed', 'cancelled', 'planned')) "
             "RETURNING id",
             trace.owner_id, trace.id, trace.trace_payload, trace.status);
+        updated = !result.empty();
+    });
+    return updated;
+}
+
+bool QueryDomainRepository::updateTracePayload(const std::string& owner_id,
+                                               const std::string& trace_id,
+                                               const std::string& payload) {
+    bool updated = false;
+    store_.executeTransaction([&](pqxx::work& transaction) {
+        // Post-terminal payload merge for the exact-replay linkage: the
+        // status column is untouched and the ||-merge cannot wipe existing
+        // keys, so a finalized trace only ever gains linkage fields.
+        const auto result = execParams(
+            transaction,
+            "UPDATE traces SET "
+            "trace_payload = trace_payload || "
+            "COALESCE(NULLIF($3, '')::jsonb, '{}'::jsonb), "
+            "updated_at = NOW() "
+            "WHERE owner_id = $1 AND id = $2 "
+            "RETURNING id",
+            owner_id, trace_id, payload);
         updated = !result.empty();
     });
     return updated;

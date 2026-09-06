@@ -125,6 +125,9 @@ private:
     mutable std::mutex agents_mutex_;
     std::map<std::string, common::ServiceEndpoint> agents_;
     std::map<std::string, common::MessageQueue<agent_communication::Message>> agent_message_queues_;
+    // Registrant owner per queue: the agent's inbox belongs to whoever
+    // registered it — reads are owner-scoped (tenant isolation).
+    std::map<std::string, std::string> agent_queue_owners_;
     // Redis liveness TTL negotiated at registration time (3x heartbeat interval,
     // never below 5 minutes); Heartbeat reuses it so both paths stay aligned.
     std::unordered_map<std::string, int> agent_liveness_ttl_;

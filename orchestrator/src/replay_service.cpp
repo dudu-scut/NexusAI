@@ -157,9 +157,9 @@ grpc::Status handleReplayRequestImpl(
     }
     payload["replayed_from_trace"] = trace_id;
     payload["replayed_from_request"] = query_log->id;
-    common::TraceRecord linked = *new_trace;
-    linked.trace_payload = payload.dump();
-    if (!repository->updateTrace(linked)) {
+    // The new trace has already finalized, so the terminal-guarded
+    // updateTrace would drop this linkage — merge it payload-only.
+    if (!repository->updateTracePayload(owner_id, new_trace_id, payload.dump())) {
         LOG_WARN("Replay trace linkage failed for " + new_trace_id);
     }
 

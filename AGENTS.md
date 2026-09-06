@@ -14,7 +14,7 @@ This file provides guidance to AI coding agents (ZCode / Lingma / Claude Code) w
 ```bash
 # 构建 / 测试 / 运行（WSL2 内）
 ./run.sh build                # cmake + make（输出到 build/）
-./run.sh test                 # 全部 36 套测试（ctest --output-on-failure --timeout 30）
+./run.sh test                 # 全部 37 套测试（ctest --output-on-failure --timeout 30）
 ./run.sh test -R <name>       # 运行单个测试（附加参数透传给 ctest）
 cd build && ctest -N          # 列出全部测试名
 cd build && ctest --output-on-failure -R test_agent_router_properties   # 单测示例

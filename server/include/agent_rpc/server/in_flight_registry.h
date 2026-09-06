@@ -3,27 +3,21 @@
  * @brief P24 C0/C2: request-scoped cancellation hub for A2A calls
  *
  * Two-level cancellation model (P24 C2):
- *  - Request-level token (`cancelled_requests_`): the single source of
- *    truth for "this request was cancelled". Written by every detection
- *    point (client disconnect, post-return IsCancelled checks); read by
- *    registerInFlight (pre-arms fresh calls so a cancelled request's new
- *    HTTP/LLM calls abort on their first progress callback) and by the
- *    LLM callers via tokenFor(). Bounded and swept to prevent unbounded
- *    growth across requests.
- *  - Per-call flag (`in_flight_calls_`): the curl-readable copy. Kept
- *    separate so a DAG subtask timeout can abort ONE call by URL without
- *    touching sibling subtasks of the same request (R18).
+ *  - Request-level token (`cancelled_requests_`): single source of truth
+ *    for "this request was cancelled", written by every detection point
+ *    (client disconnect, post-return IsCancelled checks) and read by
+ *    registerInFlight (pre-arms fresh calls) and LLM callers via tokenFor().
+ *  - Per-call flag (`in_flight_calls_`): the curl-readable copy, kept
+ *    separate so a DAG subtask timeout aborts ONE call by URL without
+ *    touching sibling subtasks (R18) — a concurrent request sharing the
+ *    same agent URL is never aborted as collateral; entries with an empty
+ *    owner_request_id are anonymous and cancelable by any URL-scoped
+ *    request.
  *
- * Every path that issues a blocking A2A HTTP call (DAG subtask via
- * buildCallAgent, single-agent fast path, direct adapter path, ExecutePlan
- * call agent) registers a per-call abort flag here before the call and
- * unregisters it on every exit path. The libcurl XFERINFO progress
- * callback reads the flag and interrupts the transfer.
- *
- * Cancellation is scoped by owner_request_id: aborting one request never
- * touches a concurrent request's in-flight calls sharing the same agent
- * URL (R18). Entries whose owner_request_id is empty are treated as
- * anonymous and are cancelled by any request scoped to the same URL.
+ * Every path issuing a blocking A2A HTTP call (DAG subtask, single-agent
+ * fast path, direct adapter path, ExecutePlan call agent) registers a flag
+ * before the call and unregisters on every exit path; the libcurl XFERINFO
+ * progress callback reads the flag and interrupts the transfer.
  */
 
 #pragma once
@@ -57,18 +51,14 @@ public:
         return tokenForLocked(request_id);
     }
 
-    // Create and register a fresh abort flag bound to (agent_url, owner).
-    // The flag starts pre-armed when the request was already cancelled
-    // (P24 C2): the call aborts on its first progress callback instead of
-    // doing doomed work.
+    // Create and register a fresh abort flag bound to (agent_url, owner),
+    // pre-armed when the request was already cancelled.
     std::shared_ptr<std::atomic<bool>> registerInFlight(
         const std::string& agent_url, const std::string& owner_request_id) {
         std::lock_guard<std::mutex> lock(mutex_);
-        // Pre-arm from the request-level token (P24 C2) — the lookup and
-        // the emplace share one lock scope: cancelled_requests_ is mutated
-        // by tokenFor()/cancelInFlightByRequest() on other request threads.
-        // A pending-cancel marker (timeout fired while the worker was still
-        // inside buildCallAgent) is consumed here the same way.
+        // Pre-arm from the request-level token or a pending-cancel marker;
+        // the lookups and the emplace share one lock scope — both maps are
+        // mutated on concurrent request threads.
         const bool pre_armed =
             isRequestCancelledUnlocked(owner_request_id) ||
             pending_cancels_.erase(pendingCancelKey(owner_request_id,
@@ -126,16 +116,13 @@ public:
         return "";
     }
 
-    // Abort the named request's live calls sharing agent_url (timeout
-    // entry points know the exact URL). Deliberately does NOT mark the
-    // request-level token: sibling subtasks of the same request keep
-    // running. When no live entry matched, a pending-cancel marker is
-    // recorded: the worker may still be inside buildCallAgent (URL
-    // validated, flag not yet registered), and without the marker its call
-    // would run un-armed to the full HTTP timeout (P24 review: the
-    // check-then-act window between the collector's timeout and the
-    // worker's registration). The marker is consumed by the next
-    // registerInFlight for the same (owner, url).
+    // Abort the named request's live calls sharing agent_url (DAG subtask
+    // timeout). Does NOT mark the request-level token — sibling subtasks of
+    // the same request keep running. A miss (worker still inside
+    // buildCallAgent, flag not yet registered) records a pending-cancel
+    // marker consumed by the next registerInFlight for (owner, url),
+    // closing the check-then-act window between the collector's timeout
+    // and the worker's registration.
     void cancelInFlight(const std::string& agent_url,
                         const std::string& owner_request_id) {
         std::vector<std::shared_ptr<std::atomic<bool>>> flags;
@@ -157,10 +144,9 @@ public:
         }
     }
 
-    // Abort every live call owned by the request regardless of URL AND
-    // mark the request-level token (P24 C2): future calls of this request
-    // register pre-armed. Client-disconnect entry points usually do not
-    // know which agent URL is in flight.
+    // Abort every live call owned by the request regardless of URL and
+    // mark the request-level token so future calls register pre-armed
+    // (disconnect entry points do not know the in-flight URL).
     void cancelInFlightByRequest(const std::string& owner_request_id) {
         std::vector<std::shared_ptr<std::atomic<bool>>> flags;
         {
@@ -192,11 +178,9 @@ public:
 private:
     InFlightAbortRegistry() = default;
 
-    // Must hold mutex_. Sweeps stale markers on insert so the map stays
-    // bounded: entries older than kTokenTtl are dropped (a request whose
-    // token is evicted simply loses the "future calls abort instantly"
-    // optimization — terminal-state correctness is owned by the durable
-    // pipeline, not by this registry).
+    // Must hold mutex_. Sweeps stale markers so the map stays bounded; an
+    // evicted request only loses the pre-arm optimization — terminal-state
+    // correctness is owned by the durable pipeline, not here.
     std::shared_ptr<std::atomic<bool>> tokenForLocked(
         const std::string& request_id) {
         const auto now = std::chrono::steady_clock::now();

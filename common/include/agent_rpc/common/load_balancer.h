@@ -68,6 +68,7 @@ public:
 private:
     mutable std::mutex endpoints_mutex_;
     std::vector<ServiceEndpoint> healthy_endpoints_;
+    std::map<std::string, bool> endpoint_health_;
     std::random_device rd_;
     mutable std::mt19937 gen_;
 };

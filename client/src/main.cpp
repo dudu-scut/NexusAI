@@ -31,11 +31,11 @@ using namespace agent_rpc::common;
 // Global flag for graceful shutdown
 std::atomic<bool> g_running{true};
 
-void signalHandler(int signal) {
-    std::cout << "\n收到信号 " << signal << ", 退出..." << std::endl;
+void signalHandler(int) {
+    // async-signal-safe: only flip the flag — the main loop checks it after
+    // every blocking read. std::exit/iostream here would skip client teardown
+    // (heartbeat thread still running) and risk an output-lock deadlock.
     g_running = false;
-    // Exit directly since getline is blocking and cannot be interrupted by signals
-    std::exit(0);
 }
 
 void printHelp() {

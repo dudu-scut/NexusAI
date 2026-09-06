@@ -173,10 +173,8 @@ std::string MemoryService::getUserMemory(const std::string& user_id) const {
             try {
                 domain_repo_->insertUserMemoryHintIfAbsent(hint);
             } catch (const std::exception&) {
-                // P24 review: two concurrent backfills can both pass the
-                // NOT EXISTS check and the loser hits unique_violation.
-                // Absorb per key — losing the race means the durable value
-                // is newer, and the remaining keys must still backfill.
+                // Lost insert-if-absent race = the durable value is newer;
+                // absorb and keep backfilling the remaining keys.
             }
         }
     }
@@ -335,10 +333,8 @@ void MemoryService::setCrossAgentSummaryFor(const std::string& context_id,
     // SETEX: the agent-specialized summary is a cache entry with a bounded
     // lifetime (default 7 days), keyed per taking-over agent.
     redis_->setex(summaryKeyFor(context_id, agent_id), ttl_seconds, summary);
-    // P24 review: the per-agent row also lands in PG (V015
-    // cross_agent_summaries) — without the write-through a restart lost the
-    // specialization and listCrossAgentSummaries' per-agent filter was dead
-    // code. Redis stays the read path; PG is the durable copy.
+    // Write-through to PG (V015 cross_agent_summaries): without it a
+    // restart lost the specialization. Redis stays the read path.
     if (domain_repo_) {
         try {
             domain_repo_->upsertCrossAgentSummary(context_id, agent_id, summary);

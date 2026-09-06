@@ -157,6 +157,9 @@ private:
     
     // Connection management
     mutable std::mutex connection_mutex_;
+    // Serializes reconnect(): the heartbeat thread and a user thread can
+    // both enter it after a transport failure.
+    std::mutex reconnect_mutex_;
     std::chrono::steady_clock::time_point last_connection_time_;
     int connection_retry_count_ = 0;
     static constexpr int MAX_RETRY_COUNT = 5;
