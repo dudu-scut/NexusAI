@@ -24,6 +24,12 @@ namespace a2a_adapter {
 
 using json = nlohmann::json;
 
+// deep-review ad-R1: thread-local per-request timeout override; 0 = unset
+// (the config default applies). Each gRPC handler sets its own value on its
+// own thread right before invoking the adapter, so concurrent requests can
+// never crosstalk deadlines through a shared knob.
+thread_local long A2AAdapter::request_timeout_seconds_ = 0;
+
 A2AAdapter::A2AAdapter()
     : request_adapter_(std::make_unique<RequestAdapter>())
     , response_adapter_(std::make_unique<ResponseAdapter>()) {
@@ -43,11 +49,6 @@ bool A2AAdapter::initialize(const A2AConfig& config) {
     if (!config_.validate()) {
         LOG_WARN("A2A configuration had invalid values, defaults were applied");
     }
-
-    // Each call creates its own A2AClient (a bare URL + options holder), so
-    // there is no shared connection state to guard; keep only the timeout
-    // knob for per-query deadline propagation.
-    request_timeout_seconds_ = config_.request_timeout_seconds;
     initialized_ = true;
     return true;
 }
@@ -95,7 +96,8 @@ bool A2AAdapter::processQuery(
         // Send via a per-request client (gRPC handlers run concurrently, so
         // per-call headers/timeouts must not live on shared state).
         a2a::A2AClient client(config_.orchestrator_url);
-        client.set_timeout(request_timeout_seconds_.load());
+        client.set_timeout(request_timeout_seconds_ > 0 ? request_timeout_seconds_
+                            : config_.request_timeout_seconds);
         // P24: abort flag → client disconnect interrupts the transfer.
         if (abort_flag) {
             client.set_abort_flag(abort_flag.get());
@@ -358,7 +360,8 @@ void A2AAdapter::processQueryStreaming(
         // Per-request client: concurrent gRPC handlers must not share
         // header/timeout state.
         a2a::A2AClient client(config_.orchestrator_url);
-        client.set_timeout(request_timeout_seconds_.load());
+        client.set_timeout(request_timeout_seconds_ > 0 ? request_timeout_seconds_
+                            : config_.request_timeout_seconds);
         // P24: abort flag → client disconnect interrupts the SSE transfer.
         if (abort_flag) {
             client.set_abort_flag(abort_flag.get());
@@ -368,8 +371,15 @@ void A2AAdapter::processQueryStreaming(
             client.add_header("x-delegation-depth", std::to_string(depth + 1));
         }
 
+        // deep-review ad-R2/R9: A2A terminal FAILED/CANCELED/REJECTED status
+        // frames and JSON-RPC error frames must mark the run as failed — the
+        // breaker then records failure and the error surfaces as an event.
+        // Previously such runs fell through to an unconditional recordSuccess
+        // + complete (a failed run was counted as success).
+        bool had_terminal_failure = false;
         client.send_message_streaming(params,
-            [this, &callback, &context_id, trace_id](const std::string& event_line) {
+            [this, &callback, &context_id, trace_id,
+             &had_terminal_failure](const std::string& event_line) {
                 // Skip empty blocks
                 if (event_line.empty() || event_line == "\n" || event_line == "\r\n") {
                     return;
@@ -426,6 +436,7 @@ void A2AAdapter::processQueryStreaming(
                         response_adapter_->buildStreamEvent(
                             error_msg, context_id, "error", &event);
                         callback(event);
+                        had_terminal_failure = true;
                         return;
                     }
                     
@@ -506,6 +517,21 @@ void A2AAdapter::processQueryStreaming(
                                             }
                                         }
                                     }
+                                } else {
+                                    // A2A terminal failure states
+                                    // (failed/canceled/rejected/...) — surface
+                                    // as an error event and mark the run failed
+                                    // so breaker accounting stays honest.
+                                    had_terminal_failure = true;
+                                    const std::string failure_detail =
+                                        status_obj.value("status_description", "");
+                                    agent_communication::AIStreamEvent event;
+                                    response_adapter_->buildStreamEvent(
+                                        failure_detail.empty()
+                                            ? ("Agent reported terminal state: " + state)
+                                            : failure_detail,
+                                        context_id, "error", &event);
+                                    callback(event);
                                 }
                             }
                         }
@@ -517,8 +543,13 @@ void A2AAdapter::processQueryStreaming(
 
         // The RAII span guard closed the streaming span on every exit path.
 
-        // Record streaming success to circuit breaker
-        streaming_cb->recordSuccess();
+        // Record streaming success/failure to circuit breaker (deep-review
+        // ad-R2: a run that saw a failure frame must never count as success).
+        if (had_terminal_failure) {
+            streaming_cb->recordFailure();
+        } else {
+            streaming_cb->recordSuccess();
+        }
 
         // Send completion event
         agent_communication::AIStreamEvent complete_event;
@@ -555,7 +586,8 @@ bool A2AAdapter::cancelTask(const std::string& task_id) {
 
     try {
         a2a::A2AClient client(config_.orchestrator_url);
-        client.set_timeout(request_timeout_seconds_.load());
+        client.set_timeout(request_timeout_seconds_ > 0 ? request_timeout_seconds_
+                            : config_.request_timeout_seconds);
         client.cancel_task(task_id);
         return true;
     } catch (...) {
@@ -564,6 +596,8 @@ bool A2AAdapter::cancelTask(const std::string& task_id) {
 }
 
 void A2AAdapter::setRequestTimeout(long seconds) {
+    // thread-local (deep-review ad-R1): only the calling request thread
+    // observes this value; no cross-request crosstalk.
     if (seconds > 0) {
         request_timeout_seconds_ = seconds;
     }
@@ -623,7 +657,8 @@ bool A2AAdapter::processQueryDirect(
         // Deadline propagation: read the shrunken atomic instead of the
         // static config value, so gRPC-deadline-contracted requests on the
         // direct path honor the same budget as the orchestrator path.
-        client.set_timeout(request_timeout_seconds_.load());
+        client.set_timeout(request_timeout_seconds_ > 0 ? request_timeout_seconds_
+                            : config_.request_timeout_seconds);
         // P24: abort flag → client disconnect interrupts the transfer.
         if (abort_flag) {
             client.set_abort_flag(abort_flag.get());
@@ -801,7 +836,8 @@ void A2AAdapter::processQueryStreamingDirect(
         std::string context_id = params.context_id().value_or("");
 
         a2a::A2AClient client(agent_url);
-        client.set_timeout(request_timeout_seconds_.load());
+        client.set_timeout(request_timeout_seconds_ > 0 ? request_timeout_seconds_
+                            : config_.request_timeout_seconds);
         // P24: abort flag → client disconnect interrupts the SSE transfer.
         if (abort_flag) {
             client.set_abort_flag(abort_flag.get());
@@ -835,8 +871,13 @@ void A2AAdapter::processQueryStreamingDirect(
 
         // Autonomy-level header removed (see processQuery).
 
+        // deep-review ad-R2/R9: terminal failure frames must mark the run
+        // failed (breaker accounting + error surfacing), mirroring the
+        // orchestrator streaming path.
+        bool had_terminal_failure = false;
         client.send_message_streaming(params,
-            [this, &callback, &context_id, trace_id](const std::string& event_line) {
+            [this, &callback, &context_id, trace_id,
+             &had_terminal_failure](const std::string& event_line) {
                 if (event_line.empty() || event_line == "\n" || event_line == "\r\n") {
                     return;
                 }
@@ -884,6 +925,7 @@ void A2AAdapter::processQueryStreamingDirect(
                         response_adapter_->buildStreamEvent(
                             error_msg, context_id, "error", &event);
                         callback(event);
+                        had_terminal_failure = true;
                         return;
                     }
 
@@ -960,6 +1002,20 @@ void A2AAdapter::processQueryStreamingDirect(
                                             }
                                         }
                                     }
+                                } else {
+                                    // A2A terminal failure states
+                                    // (failed/canceled/rejected/...) — surface
+                                    // as an error event and mark the run failed.
+                                    had_terminal_failure = true;
+                                    const std::string failure_detail =
+                                        status_obj.value("status_description", "");
+                                    agent_communication::AIStreamEvent event;
+                                    response_adapter_->buildStreamEvent(
+                                        failure_detail.empty()
+                                            ? ("Agent reported terminal state: " + state)
+                                            : failure_detail,
+                                        context_id, "error", &event);
+                                    callback(event);
                                 }
                             }
                         }
@@ -971,8 +1027,13 @@ void A2AAdapter::processQueryStreamingDirect(
 
         // The RAII span guard closed the streaming-direct span on every exit path.
 
-        // Record streaming direct success to circuit breaker
-        streaming_direct_cb->recordSuccess();
+        // Record streaming direct success/failure to circuit breaker
+        // (deep-review ad-R2: failure frames must never count as success).
+        if (had_terminal_failure) {
+            streaming_direct_cb->recordFailure();
+        } else {
+            streaming_direct_cb->recordSuccess();
+        }
 
         agent_communication::AIStreamEvent complete_event;
         response_adapter_->buildStreamEvent(

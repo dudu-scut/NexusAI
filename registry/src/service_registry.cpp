@@ -36,6 +36,13 @@ namespace {
 
 void ServiceRegistry::recordAgentCall(const std::string& agent_id,
                                       bool success, double latency_ms) {
+    // deep-review reg-R6: module-level guard mirrors seedLiveMetricsBaseline
+    // — an empty id would create a "" metrics entry that then feeds the
+    // evaluation loop and the PG health snapshot. Callers already guard,
+    // but the module must not depend on that (defense symmetry).
+    if (agent_id.empty()) {
+        return;
+    }
     std::lock_guard<std::mutex> lock(live_metrics_mutex_);
     auto& m = live_metrics_[agent_id];
 

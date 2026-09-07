@@ -269,6 +269,25 @@ bool AIQueryServiceImpl::beginDurableRows(DurableQueryRun& run, const std::strin
                 return true;
             }
         }
+        // db-R1 (deep-review 2026-09-08): a retried "rejected" request keeps
+        // executing (rejected is deliberately NOT a replay terminal — N3),
+        // but the rows would stay "rejected" for the whole run; a crash
+        // mid-run would then leave status=rejected next to a committed
+        // budget reservation (billing facts contradict the state). Flip both
+        // rows back to "running"; finalize owns the terminal write. The
+        // update guards exempt rejected on purpose, so this transition is
+        // always allowed.
+        if (existing->status == "rejected") {
+            LOG_INFO("Retrying previously rejected request " + run.request_id +
+                     ", flipping status back to running");
+            domain_repo_->updateQueryLog(log);
+            common::TraceRecord rerun_trace;
+            rerun_trace.id = run.trace_row_id;
+            rerun_trace.owner_id = run.owner_id;
+            rerun_trace.query_log_id = run.request_id;
+            rerun_trace.status = "running";
+            domain_repo_->updateTrace(rerun_trace);
+        }
     }
 
     nlohmann::json trace_start;

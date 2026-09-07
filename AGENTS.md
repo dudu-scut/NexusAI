@@ -32,7 +32,7 @@ cd frontend && npm ci && npm run dev    # Vite :5173，代理到 Node proxy :808
 cd frontend && npm run typecheck        # lint 即 typecheck（vue-tsc）
 cd frontend && npm run build
 
-# 网关契约测试（116 例，Windows 原生）
+# 网关契约测试（126 例，Windows 原生）
 cd gateway/proxy && npm test
 
 # E2E
@@ -83,7 +83,7 @@ db/             → PostgreSQL 迁移 V001–V015（PostgreSQL 是唯一持久�
 
 - **Durable Query Pipeline**：Query/QueryStream 六步固定顺序（认证取 owner → 确保会话 → 登记 running → 预算预留 → 组装 SystemContext → compare-exchange 单次终结），任何一步失败落库终态。**owner 一律来自认证上下文，请求体 `user_id` 被无条件覆盖**。幂等由确定性主键保证（`msg-user-<request_id>`、`usage-<request_id>`）；同 `request_id` 重试只产生一条预算预留与台账；客户端中止 → `cancelled`，预算不足 → `rejected` + RESOURCE_EXHAUSTED。
 - **AgentRouter 四级路由**：Embedding（约 80% 查询，<100ms）→ LLM → IDF 关键词 → Fallback，线程安全，用户反馈经 Beta 平滑聚合成路由质量系数驱动加权选择。
-- **TaskPlanner/TaskExecutor**：LLM 分解为 DAG → Kahn 拓扑分层 → 同层 `std::async` 并行，前置结果注入下游；全局超时；委派深度限制 5 层。
+- **TaskPlanner/TaskExecutor**：LLM 分解为 DAG → Kahn 拓扑分层 → 同层经固定 worker 线程池（SubtaskPool）并行，前置结果注入下游；全局超时；委派深度限制 5 层。
 - **MemoryService 三层记忆**：按 Agent 隔离的对话历史 + 用户长期记忆（Hash）+ 跨 Agent LLM 摘要，每次查询前注入 SystemContext。
 - **CircuitBreaker**：CLOSED→OPEN→HALF_OPEN 三态，按 Agent 粒度。
 - **BackgroundScheduler**：协调者 + Worker 池的周期任务（span 刷盘、反馈聚合、指标聚合、画像提取、健康评估、缓存清理）；Cron/Canary 已移除。

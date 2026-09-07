@@ -206,8 +206,13 @@ std::vector<RetrievedTool> ToolRetriever::retrieve(const std::string& query, int
         return results;
         
     } catch (const std::exception& e) {
+        // deep-review A5: an embedding/search failure must NOT look like an
+        // empty result — the caller would hand the agent ZERO tools instead
+        // of degrading to the documented "all tools" fallback. Re-throw so
+        // MCPAgentIntegration::getRelevantTools' exception fallback (all
+        // available tools) takes over.
         LOG_ERROR("Failed to retrieve tools: " + std::string(e.what()));
-        return {};
+        throw;
     }
 }
 

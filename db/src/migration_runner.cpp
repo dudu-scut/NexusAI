@@ -94,7 +94,13 @@ std::vector<MigrationRunner::Migration> MigrationRunner::discover(
         std::smatch match;
         const std::string filename = entry.path().filename().string();
         if (!std::regex_match(filename, match, pattern)) {
-            continue;
+            // db-R4 (deep-review 2026-09-08): a migration file that does not
+            // match V<digits>__name.sql would be silently skipped — but the
+            // directory is declared the authoritative schema (AGENTS.md); a
+            // typo'd filename must fail loudly instead of quietly never
+            // applying. Only non-regular entries (dirs, sockets) skip.
+            throw std::invalid_argument(
+                "migration file does not match V<version>__name.sql: " + filename);
         }
         migrations.push_back(Migration{
             .version = match[1].str(),
@@ -103,9 +109,19 @@ std::vector<MigrationRunner::Migration> MigrationRunner::discover(
         });
     }
 
-    std::sort(migrations.begin(), migrations.end(), [](const Migration& left, const Migration& right) {
-        return left.version < right.version;
-    });
+    std::sort(migrations.begin(), migrations.end(),
+              [](const Migration& left, const Migration& right) {
+                  // db-R3 (deep-review 2026-09-08): version strings are
+                  // zero-padded V001-V999 today, but the pattern allows 4+
+                  // digits — lexicographic order would then put V1000 before
+                  // V999. Compare numerically so the execution order always
+                  // matches the version numbers.
+                  const auto left_version =
+                      std::stoull(left.version);
+                  const auto right_version =
+                      std::stoull(right.version);
+                  return left_version < right_version;
+              });
     for (std::size_t index = 1; index < migrations.size(); ++index) {
         if (migrations[index - 1].version == migrations[index].version) {
             throw std::invalid_argument("duplicate migration version: " + migrations[index].version);

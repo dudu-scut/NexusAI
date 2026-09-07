@@ -252,15 +252,24 @@ agent_communication::QueryStatusResponse AIQueryClient::getQueryStatus(
     const std::string& context_id) {
     
     agent_communication::QueryStatusResponse response;
-    
-    if (!connected_) {
-        LOG_ERROR("AIQueryClient not connected");
-        auto* status = response.mutable_status();
-        status->set_code(-1);
-        status->set_message("Client not connected");
-        return response;
+
+    // deep-review client-R4: snapshot the stub under the mutex (same pattern
+    // as query()/queryStream()) — a concurrent reconnect may replace the
+    // shared stub mid-call, and GetQueryStatus was the one public RPC that
+    // still dereferenced it unlocked.
+    std::shared_ptr<agent_communication::AIQueryService::Stub> stub;
+    {
+        std::lock_guard<std::mutex> lock(stub_mutex_);
+        if (!connected_) {
+            LOG_ERROR("AIQueryClient not connected");
+            auto* status = response.mutable_status();
+            status->set_code(-1);
+            status->set_message("Client not connected");
+            return response;
+        }
+        stub = stub_;
     }
-    
+
     grpc::ClientContext context;
     auto deadline = std::chrono::system_clock::now() + std::chrono::seconds(10);
     context.set_deadline(deadline);
@@ -271,7 +280,7 @@ agent_communication::QueryStatusResponse AIQueryClient::getQueryStatus(
     
     LOG_INFO("Getting query status for task: " + task_id);
     
-    grpc::Status status = stub_->GetQueryStatus(&context, request, &response);
+    grpc::Status status = stub->GetQueryStatus(&context, request, &response);
     
     if (!status.ok()) {
         LOG_ERROR("Failed to get query status: " + status.error_message());

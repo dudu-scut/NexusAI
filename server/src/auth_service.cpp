@@ -360,9 +360,15 @@ grpc::Status AuthServiceImpl::Logout(
     // cache layer; the PG revoke below stays authoritative.
     AuthCache::markRevoked(token_hash);
 
-    // P22: idempotent PG revocation. A second logout finds no active session
-    // (revoked_at already set) and still answers OK — the goal state "this
-    // session is revoked" is already reached.
+    // P22: idempotent PG revocation. A repeated logout that still reaches
+    // this handler (racing double-click before the deny marker lands) finds
+    // no active session (revoked_at already set) and still answers OK — the
+    // goal state "this session is revoked" is already reached.
+    // NOTE (deep-review proto-R12): the handler-level idempotency only
+    // applies to callers that bypass the auth gate — a SECOND logout through
+    // the real chain is refused earlier by the deny marker (60s) at the
+    // interceptor/gateway with UNAUTHENTICATED, which is the intended
+    // conservative behavior for an already-revoked credential.
     try {
         if (repository_ != nullptr) {
             const auto session =

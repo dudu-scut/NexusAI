@@ -403,8 +403,15 @@ void HttpClient::post_stream(const std::string& url,
         curl_easy_setopt(curl.get(), CURLOPT_XFERINFOFUNCTION, abort_check_callback);
         curl_easy_setopt(curl.get(), CURLOPT_XFERINFODATA, impl_->abort_flag_);
     } else {
-        curl_easy_setopt(curl.get(), CURLOPT_XFERINFOFUNCTION,
-                         [](void*, curl_off_t, curl_off_t, curl_off_t, curl_off_t) { return 0; });
+        // deep-review a2a-R1 (P0): the callback slot must receive a plain
+        // function pointer. Passing a non-capturing lambda through the
+        // varargs slot copies the CLOSURE OBJECT by value — libcurl then
+        // calls object bytes as a function pointer once the progress meter
+        // fires (~1s into any active transfer). abort_check_callback already
+        // handles a null flag (its guard reads flag && flag->load()), so the
+        // no-abort case reuses it with null data.
+        curl_easy_setopt(curl.get(), CURLOPT_XFERINFOFUNCTION, abort_check_callback);
+        curl_easy_setopt(curl.get(), CURLOPT_XFERINFODATA, nullptr);
     }
 
     // Set headers
@@ -418,15 +425,37 @@ void HttpClient::post_stream(const std::string& url,
 
     CURLcode res = curl_easy_perform(curl.get());
 
-    // Flush any remaining buffered data
-    ctx.flush();
-
     if (res != CURLE_OK) {
+        // deep-review a2a-R4: never flush a half-received buffer onto the
+        // callback before raising the transport error — a truncated frame
+        // (no "\n\n", possibly mid-UTF-8) must not surface as data first.
         throw A2AException(
             std::string("CURL error: ") + curl_easy_strerror(res),
             ErrorCode::InternalError
         );
     }
+
+    // deep-review a2a-R2: transport success is NOT protocol success — an
+    // HTTP 4xx/5xx (proxy error page, unsupported message/stream peer)
+    // would otherwise look like an empty successful stream and the caller
+    // would finalize "completed" with a silent empty answer.
+    long status_code = 0;
+    curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &status_code);
+    if (status_code < 200 || status_code >= 300) {
+        if (status_code >= 400 && status_code < 500 && status_code != 429) {
+            throw A2AException(
+                "HTTP protocol error: " + std::to_string(status_code),
+                ErrorCode::InvalidRequest
+            );
+        }
+        throw A2AException(
+            "HTTP request failed: " + std::to_string(status_code),
+            ErrorCode::InternalError
+        );
+    }
+
+    // Flush any remaining buffered data (success path only).
+    ctx.flush();
 }
 
 void HttpClient::set_timeout(long seconds) {

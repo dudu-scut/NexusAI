@@ -114,15 +114,15 @@ private:
 
     // Redis key helpers — all components sanitized to prevent injection.
     //
-    // P23 键分类约定（存储分层治理，2026-09-03 批次七建档；2026-09-04 批次八复核补全）：
-    //   - [事实源]（PG 无表、暂居 Redis，待 V014/V015 迁移）——
-    //       nexusai:memory:<uid>（Tier-2 长期记忆 hints）
-    //       nexusai:summary:<ctx>（context 级跨 Agent 摘要，无 TTL 覆盖写；
-    //         注：仅 agent 级 nexusai:summary:<ctx>:<agent> 为 SETEX 7 天）
-    //       user_profile:<uid>（用户画像）
+    // P23 键分类约定（存储分层治理，2026-09-03 批次七建档；2026-09-04 批次八复核补全；
+    // 2026-09-08 deep-review 修正归类：V015/V004 落地后事实源键已清零）
+    //   - [cache-only]（PG 为事实源的投影，丢失可重建）——
+    //       nexusai:memory:<uid>（V015 后 PG user_memory_hints 为源，Redis 为投影）
+    //       nexusai:summary:<ctx>（V015 后 PG cross_agent_summaries 为源；
+    //         仅 agent 级 nexusai:summary:<ctx>:<agent> 为 SETEX 7 天投影）
+    //       user_profile:<uid>（V004 user_profiles 为源，Redis 为投影）
     //       user_profile_raw:<uid>（schema 校验失败的画像原文，检查用，
     //         profile_summarizer 写、无读者）
-    //   - [cache-only]（PG 为事实源的投影，丢失可重建）——
     //       nexusai:conv:*（Tier-1 会话镜像，主查询读 PG）
     //       auth:session:<token_hash>（P22 B 认证会话缓存，AuthCache 读写，
     //         TTL = 会话真实剩余（P26 T2），PG auth_sessions 为事实源）

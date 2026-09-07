@@ -85,24 +85,35 @@ message AIStreamEvent {
     string event_id = 1;
     // event_type values:
     //   "partial"           — streaming content fragment (content: text chunk)
-    //   "status"            — status change (content: description)
+    //   "status"            — status change (content: description; a
+    //                          plan-only stream ENDS with content =
+    //                          "awaiting_confirmation" and no terminal event)
     //   "complete"          — request completed
-    //   "error"             — error (content: error message)
+    //   "error"             — error (content: error message; the gateway may
+    //                          attach runtime code/code_name/details fields to
+    //                          its SSE error frames)
     //   "plan"              — multi-agent execution plan (content: ExecutionPlan JSON)
     //   "subtask_start"     — subtask started (task_state: subtask_id)
-    //   "subtask_complete"  — subtask completed (task_state: subtask_id, content: result summary)
+    //   "subtask_complete"  — subtask finished (task_state: subtask_id, content:
+    //                          result summary; failures reuse this type with a
+    //                          content prefixed "FAILED: " — no dedicated
+    //                          failure event type)
     // Note: ObserveSession (sharing_service) also emits "snapshot" events on
-    // this message type. Fields trace_summary / activity_json /
-    // intervention_required are RESERVED but not yet wired end-to-end (no
-    // producer/consumer pair yet) — do not build behavior against them.
+    // this message type.
     string event_type = 2;
     string content = 3;
     string task_state = 4;
     string context_id = 5;
     int64 timestamp = 6;
-    string trace_summary = 8;      // reserved: trace summary on 'complete' events (not wired)
-    string activity_json = 9;      // reserved: JSON activity record for feed (not wired)
-    bool intervention_required = 10; // reserved: true when user action is needed (not wired)
+    // Field 7 was never assigned; keep it reserved to protect wire compat.
+    reserved 7;
+    // trace_summary: filled by AIQueryServiceImpl on streaming "complete"
+    // terminal events (QueryStream path). activity_json /
+    // intervention_required still have no producer/consumer pair — do not
+    // build behavior against those two.
+    string trace_summary = 8;
+    string activity_json = 9;      // not wired: no producer/consumer yet
+    bool intervention_required = 10; // not wired: no producer/consumer yet
 }
 
 // Query status request

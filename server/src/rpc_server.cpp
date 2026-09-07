@@ -472,9 +472,21 @@ void RpcServer::initializeServiceRegistry() {
         // the PostgreSQL agent_registry table.
         LOG_WARN("etcd service registry is not part of the supported local "
                  "deployment; expect no maintenance for this backend");
-        auto etcd = std::make_shared<registry::EtcdServiceRegistry>();
-        etcd->initialize(stripScheme(config_.registry_address, "etcd"));
-        service_registry_ = etcd;
+        // deep-review reg-R2: EtcdServiceRegistry is a stub whose every call
+        // throws "not implemented" — an uncaught throw here would escape
+        // initialize() and std::terminate the process with no log line.
+        // Catch and degrade to the in-memory registry (consistent with the
+        // fail-soft "registration is optional" style of this function).
+        try {
+            auto etcd = std::make_shared<registry::EtcdServiceRegistry>();
+            etcd->initialize(stripScheme(config_.registry_address, "etcd"));
+            service_registry_ = etcd;
+        } catch (const std::exception& error) {
+            LOG_ERROR("etcd registry backend unavailable (" +
+                      std::string(error.what()) +
+                      "); falling back to the in-memory registry");
+            service_registry_ = std::make_shared<registry::MemoryServiceRegistry>();
+        }
     } else {
         auto consul = std::make_shared<registry::ConsulServiceRegistry>();
         consul->initialize(config_.registry_address);

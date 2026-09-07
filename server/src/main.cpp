@@ -462,6 +462,16 @@ int main(int argc, char* argv[]) {
                         metrics_unhealthy_streak.erase(agent_id);
                     }
                     router->markAgentUnhealthy(agent_id);
+                    // deep-review reg-R1: the durable agent_registry row is
+                    // only ever set "healthy" by registration/heartbeat — a
+                    // crashed agent's row would stay healthy forever and the
+                    // CompareAgents gate (health_status == "healthy") would
+                    // keep admitting it. Write the offline verdict back here;
+                    // a fresh heartbeat restores "healthy" (agent_service
+                    // upsert), so no per-cycle write amplification.
+                    if (auto* runtime_repo = server.getAgentRuntimeRepository()) {
+                        runtime_repo->markAgentStatus(agent_id, "offline");
+                    }
                     continue;
                 }
                 // Metrics-only UNHEALTHY: probation counter decides.
@@ -482,6 +492,12 @@ int main(int argc, char* argv[]) {
                              "); fresh samples will decide the next verdict");
                 } else {
                     router->markAgentUnhealthy(agent_id);
+                    // deep-review reg-R1: metrics probation failure also
+                    // demotes the durable status column (same rationale as
+                    // the heartbeat branch above).
+                    if (auto* runtime_repo = server.getAgentRuntimeRepository()) {
+                        runtime_repo->markAgentStatus(agent_id, "offline");
+                    }
                 }
             }
         },

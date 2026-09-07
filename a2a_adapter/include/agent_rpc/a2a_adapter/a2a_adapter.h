@@ -128,6 +128,16 @@ public:
      *
      * @param seconds Timeout in seconds
      */
+    /**
+     * @brief Set per-request timeout override (seconds).
+     *
+     * deep-review ad-R1: stored in a thread-local slot, NOT a shared member
+     * — a shared atomic written by every request thread and read by a
+     * different one would leak one request's gRPC deadline into another
+     * request's curl timeout (deadline crosstalk under concurrency). The
+     * caller sets the value on ITS OWN thread right before invoking the
+     * adapter, and the adapter reads it on the same thread.
+     */
     void setRequestTimeout(long seconds);
 
     /**
@@ -174,9 +184,12 @@ public:
                          double confidence = 1.0) const;
 
 private:
-    // Callers run on multiple gRPC threads, so all HTTP calls use a
-    // per-request local A2AClient; only this timeout knob is shared.
-    std::atomic<long> request_timeout_seconds_{30};
+    // deep-review ad-R1: the per-request timeout override lives in a
+    // thread-local slot (see setRequestTimeout) so concurrent gRPC handlers
+    // cannot leak one request's gRPC deadline into another request's curl
+    // timeout. Config.defaultTimeout() below stays the fallback for calls
+    // that never set an override on this thread.
+    static thread_local long request_timeout_seconds_;
     std::unique_ptr<RequestAdapter> request_adapter_;
     std::unique_ptr<ResponseAdapter> response_adapter_;
     A2AConfig config_;

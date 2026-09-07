@@ -352,7 +352,7 @@ GTest 集成测试与 RapidCheck 属性测试相结合，覆盖 durable 查询�
 cd build && ctest --output-on-failure   # 等价方式
 ```
 
-### 网关契约测试（116 例）
+### 网关契约测试（126 例）
 
 位于 `gateway/proxy/test/`，覆盖平台契约、gRPC→HTTP 错误映射运行时契约、proto 与前端类型定义的字段级防漂移契约、前端静态守卫：
 

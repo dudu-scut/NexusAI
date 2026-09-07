@@ -287,25 +287,48 @@ grpc::Status OrchestrationServiceImpl::executePlan(
             if (!summary.empty()) {
                 memory_ctx += "[Prior Context]\n" + summary + "\n";
             }
-            // User profile read-back (same shape as P17(k)).
-            if (redis_ && redis_->isConnected()) {
-                std::string profile_raw;
-                if (redis_->get("user_profile:" + user_id, profile_raw) &&
-                    !profile_raw.empty()) {
+            // User profile read-back — same shape as P17(k), but PG-first
+            // (deep-review c-R2): the write path deletes the Redis projection
+            // after a successful PG upsert, so a Redis-only read would miss
+            // for every profile that ever reached PostgreSQL, and ExecutePlan
+            // would silently lose the [User Profile] block.
+            auto read_profile_raw = [&]() -> std::string {
+                if (domain_repo_) {
                     try {
-                        const auto profile_json = nlohmann::json::parse(profile_raw);
-                        const std::string identity =
-                            profile_json.value("identity", nlohmann::json::object()).dump();
-                        const std::string preferences =
-                            profile_json.value("preferences", nlohmann::json::array()).dump();
-                        const std::string profile_summary =
-                            common::ProfileSummarizer::summarize(identity, preferences);
-                        if (!profile_summary.empty()) {
-                            memory_ctx += "[User Profile] " + profile_summary + "\n";
+                        const auto pg_profile =
+                            domain_repo_->getUserProfile(user_id);
+                        if (pg_profile.has_value() &&
+                            !pg_profile->identity.empty()) {
+                            return "{\"identity\":" + pg_profile->identity +
+                                   ",\"preferences\":" +
+                                   pg_profile->preferences + "}";
                         }
-                    } catch (const nlohmann::json::exception&) {
-                        // Corrupt profile — silent degradation guard.
+                    } catch (const std::exception&) {
+                        // PG read failed — fall through to the Redis cache.
                     }
+                }
+                std::string raw;
+                if (redis_ && redis_->isConnected() &&
+                    redis_->get("user_profile:" + user_id, raw)) {
+                    return raw;
+                }
+                return {};
+            };
+            const std::string profile_raw = read_profile_raw();
+            if (!profile_raw.empty()) {
+                try {
+                    const auto profile_json = nlohmann::json::parse(profile_raw);
+                    const std::string identity =
+                        profile_json.value("identity", nlohmann::json::object()).dump();
+                    const std::string preferences =
+                        profile_json.value("preferences", nlohmann::json::array()).dump();
+                    const std::string profile_summary =
+                        common::ProfileSummarizer::summarize(identity, preferences);
+                    if (!profile_summary.empty()) {
+                        memory_ctx += "[User Profile] " + profile_summary + "\n";
+                    }
+                } catch (const nlohmann::json::exception&) {
+                    // Corrupt profile — silent degradation guard.
                 }
             }
         } else {

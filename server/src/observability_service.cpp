@@ -175,11 +175,21 @@ grpc::Status ObservabilityServiceImpl::GetTraceDetail(
     }
     if (!trace.has_value()) {
         // P6 遗留收口：PG 无记录时回退读批量 flush 键（PG 主、Redis 兜底）。
+        // deep-review proto-R4: the flush key carries the FULL id
+        // ("trace:spans:trace-<request_id>", main.cpp span_batch_flush); a
+        // bare-id request must retry with the prefixed key or the fallback
+        // never matches.
         if (redis_client_ && redis_client_->isConnected()) {
             const std::string redis_key = "trace:spans:" + trace_id;
+            const std::string redis_key_prefixed =
+                "trace:spans:trace-" + trace_id;
             if (redis_client_->exists(redis_key)) {
                 return buildRedisFallbackTrace(redis_key, trace_id, owner,
                                                response);
+            }
+            if (redis_client_->exists(redis_key_prefixed)) {
+                return buildRedisFallbackTrace(redis_key_prefixed, trace_id,
+                                               owner, response);
             }
         }
         auto* status = response->mutable_status();

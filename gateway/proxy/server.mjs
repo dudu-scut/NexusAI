@@ -178,9 +178,10 @@ function buildMetadata(headers) {
 // NEXUSAI_TRUST_PROXY=1; default-off keeps the legacy passthrough exactly)
 // ============================================================================
 
-// RPCs the proxy forwards WITHOUT local authentication (must mirror the
-// backend whitelist): auth bootstrap + the restricted public share read +
-// liveness probes (never carry a Bearer).
+// RPCs the proxy forwards WITHOUT local authentication: auth bootstrap,
+// the restricted public share read, and the liveness probes (the backend
+// HealthService handlers never consult auth — they answer from a local
+// health callback — so no identity injection is needed or meaningful).
 const AUTH_BYPASS_RPCS = new Set([
   'agent_communication.auth.UserService/Register',
   'agent_communication.auth.UserService/Login',
@@ -234,15 +235,26 @@ export function __setAuthCacheBackendForTest(backend) {
   injectedBackend = backend;
 }
 
+// Connection-attempt cooldown: when Redis is down, every request would
+// otherwise burn a 1s connect timeout before falling back to ValidateToken.
+let redisDownUntil = 0;
+const REDIS_RETRY_COOLDOWN_MS = 10_000;
+
 async function redisGet(key) {
   const client = authCacheBackend();
   if (!client) return null;
   try {
+    // deep-review gw-R3: skip reconnect attempts during the cooldown window
+    // and fall straight back to the ValidateToken RPC (the connection died
+    // moments ago; retrying per-request just adds latency).
     if (typeof client.isReady === 'boolean' && !client.isReady) {
+      if (Date.now() < redisDownUntil) return null;
       await client.connect();
+      redisDownUntil = 0;
     }
     return await client.get(key);
   } catch {
+    redisDownUntil = Date.now() + REDIS_RETRY_COOLDOWN_MS;
     return null;  // Redis unavailable → caller falls back to ValidateToken
   }
 }
@@ -257,7 +269,22 @@ function validateTokenViaRpc(token, tokenHash) {
       return resolve({ ok: false, reason: 'UserService unavailable' });
     }
     client.validateToken({ token }, new grpc.Metadata(), (err, resp) => {
-      if (err || !resp || !resp.valid || !resp.user_id) {
+      if (err) {
+        // deep-review gw-R1: an infrastructure failure (backend PG down /
+        // deadline) must NOT be folded into "token invalid" — answering 401
+        // would log every valid user out on a backend blip. Mark the result
+        // retryable so the caller answers 503 instead.
+        const infra =
+          err.code === grpc.status.UNAVAILABLE ||
+          err.code === grpc.status.DEADLINE_EXCEEDED ||
+          err.code === grpc.status.INTERNAL;
+        return resolve(
+          infra
+            ? { ok: false, retryable: true, reason: 'Auth backend unavailable' }
+            : { ok: false, reason: 'Token invalid or expired' },
+        );
+      }
+      if (!resp || !resp.valid || !resp.user_id) {
         return resolve({ ok: false, reason: 'Token invalid or expired' });
       }
       resolve({
@@ -446,7 +473,15 @@ function streamCall(serviceName, methodName, body, metadata, res) {
       completeSeen = true;
     }
     const json = JSON.stringify(sanitizeBuffers(event));
-    res.write(`data: ${json}\n\n`);
+    // deep-review gw-R2: honor the HTTP write backpressure — a slow SSE
+    // consumer must pause the upstream gRPC stream instead of letting the
+    // proxy buffer grow unbounded.
+    if (res.write(`data: ${json}\n\n`) === false && !ended) {
+      stream.pause();
+      res.once('drain', () => {
+        if (!ended) stream.resume();
+      });
+    }
   });
 
   stream.on('end', () => {
@@ -598,13 +633,24 @@ function handleRequest(req, res) {
     if (TRUST_PROXY && !AUTH_BYPASS_RPCS.has(rpcPath)) {
       const auth = await authenticateRequest(req.headers);
       if (!auth.ok) {
+        // deep-review gw-R1: infrastructure failures (backend PG down,
+        // Redis down + RPC fallback failing) answer 503 — never 401 — so a
+        // backend blip cannot masquerade as "session revoked" and log every
+        // valid user out.
+        const statusCode = auth.retryable
+          ? GRPC_HTTP_STATUS[grpc.status.UNAVAILABLE] || 503
+          : GRPC_HTTP_STATUS[grpc.status.UNAUTHENTICATED] || 401;
+        const code = auth.retryable
+          ? grpc.status.UNAVAILABLE
+          : grpc.status.UNAUTHENTICATED;
+        const codeName = auth.retryable ? 'UNAVAILABLE' : 'UNAUTHENTICATED';
         const payload = {
-          error: `UNAUTHENTICATED: ${auth.reason}`,
-          code: grpc.status.UNAUTHENTICATED,
-          code_name: 'UNAUTHENTICATED',
+          error: `${codeName}: ${auth.reason}`,
+          code,
+          code_name: codeName,
           details: auth.reason,
         };
-        res.writeHead(401, {
+        res.writeHead(statusCode, {
           'Content-Type': 'application/json',
           'Access-Control-Allow-Origin': '*',
         });
@@ -631,8 +677,8 @@ function handleRequest(req, res) {
     } catch (err) {
       const codeLabel = err.code != null ? err.code : 'N/A';
       console.error(`[proxy] RPC error (${serviceName}.${methodName}):`, err.message, `(code: ${codeLabel})`);
-      // Map the five contract codes (plus ALREADY_EXISTS) to stable
-      // HTTP statuses; everything else is a generic 500.
+      // Map the gRPC code onto a stable HTTP status via the GRPC_HTTP_STATUS
+      // table above (single source of truth).
       const status = (typeof err.code === 'number' && GRPC_HTTP_STATUS[err.code]) || 500;
       const payload = grpcErrorPayload(err, 'RPC failed');
 

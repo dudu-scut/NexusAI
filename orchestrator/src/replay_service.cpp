@@ -92,7 +92,13 @@ grpc::Status handleReplayRequestImpl(
     // PostgreSQL is the source of truth. The lookup is scoped by the
     // authenticated owner, so a foreign or unknown trace is NOT_FOUND —
     // never an existence leak.
-    const auto trace = repository->getTraceById(owner_id, trace_id);
+    // deep-review proto-R3: traces are stored as "trace-<request_id>" but
+    // clients may send the bare id (GetTraceDetail tolerates both); accept
+    // both spellings here too so cross-RPC behavior is symmetric.
+    auto trace = repository->getTraceById(owner_id, trace_id);
+    if (!trace.has_value()) {
+        trace = repository->getTraceById(owner_id, "trace-" + trace_id);
+    }
     if (!trace.has_value()) {
         return grpc::Status(grpc::StatusCode::NOT_FOUND,
                             "Trace not found: " + trace_id);

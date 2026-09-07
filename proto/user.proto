@@ -16,7 +16,7 @@ message RegisterRequest {
 // Register response
 message RegisterResponse {
     common.Status status = 1;
-    string user_id = 2;            // Server-generated UUID
+    string user_id = 2;            // Server-generated hex id (not a UUID)
     string username = 3;
     string role = 4;               // USER | ADMIN
 }
@@ -32,12 +32,12 @@ message LoginResponse {
     common.Status status = 1;
     string user_id = 2;
     string username = 3;
-    string token = 4;              // Auth token (UUID)
+    string token = 4;              // High-entropy hex token (64 hex chars)
     int64 expires_at = 5;          // Expiry time (Unix timestamp)
     string role = 6;               // USER | ADMIN
 }
 
-// Token validation request (internal / interceptor use)
+// Token validation request (gateway/interceptor fallback use)
 message ValidateTokenRequest {
     string token = 1;
 }
@@ -72,7 +72,8 @@ service UserService {
     // User login
     rpc Login(LoginRequest) returns (LoginResponse);
 
-    // Validate token (for interceptor internal use)
+    // Validate a bearer token: authoritative fallback for the gateway's
+    // local auth-cache miss (trusted-proxy mode) and for the interceptor.
     rpc ValidateToken(ValidateTokenRequest) returns (ValidateTokenResponse);
 
     // Revoke the calling session (logout). Protected endpoint: the token is

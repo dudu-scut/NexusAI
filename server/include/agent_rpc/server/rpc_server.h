@@ -64,6 +64,13 @@ public:
         return query_domain_repository_.get();
     }
 
+    // deep-review reg-R1: the 30s health-evaluation loop rewrites the
+    // durable agent_registry.health_status (offline) so downstream gates
+    // that read the PG column (CompareAgents) never admit a dead agent.
+    common::AgentRuntimeRepository* getAgentRuntimeRepository() {
+        return runtime_repository_.get();
+    }
+
     // Redis client (liveness/metrics cache only)
     common::RedisClient* getRedisClient() { return redis_client_.get(); }
     

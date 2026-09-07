@@ -192,20 +192,37 @@ int main(int argc, char **argv) {
 
         char* res_ptr = nullptr;
 
-        for (const auto& plugin : loader->GetPlugins()) {
+         for (const auto& plugin : loader->GetPlugins()) {
             if (plugin.instance->GetType() == PLUGIN_TYPE_TOOLS) {
                 for (int i = 0; i < plugin.instance->GetToolCount(); i++) {
                     auto pluginTool = plugin.instance->GetTool(i);
-                    if (pluginTool->name == request["params"]["name"]) {
+                    // deep-review B1: guard the params lookup — a call
+                    // without params/name used to throw json::out_of_range.
+                    const bool name_matches =
+                        request.contains("params") &&
+                        request["params"].is_object() &&
+                        request["params"].contains("name") &&
+                        pluginTool->name == request["params"]["name"];
+                    if (name_matches) {
                         res_ptr = plugin.instance->HandleRequest(request.dump().c_str());
                         if (res_ptr) {
                             try {
-                                response["result"] = json::parse(res_ptr);
-                                response["result"]["isError"] = false;
-                            } catch (const json::parse_error& e) {
+                                json parsed_result = json::parse(res_ptr);
+                                // deep-review B2: preserve the plugin's own
+                                // isError verdict — overriding it to false
+                                // turned plugin-level failures into "success"
+                                // for the calling agent.
+                                if (!parsed_result.contains("isError")) {
+                                    parsed_result["isError"] = false;
+                                }
+                                response["result"] = std::move(parsed_result);
+                            } catch (const json::exception& e) {
                                 response["result"]["isError"] = true;
                                 response["result"]["content"] = json::array();
-                                response["result"]["content"].push_back({{"type", "text"}, {"text", "Plugin returned malformed data."}});
+                                response["result"]["content"].push_back(
+                                    {{"type", "text"},
+                                     {"text", std::string("Plugin returned malformed data: ") +
+                                                     e.what()}});
                             }
                             // Free the allocated memory
                             delete[] res_ptr;

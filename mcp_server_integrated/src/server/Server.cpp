@@ -145,11 +145,19 @@ namespace vx::mcp {
                     LOG(DEBUG) << "Sending Response: " << response.dump() << std::endl;
                     transport_->Write(response.dump());
                 }
-            } catch (json::parse_error &e) {
-                // ok... what should we do in this case ? exit process ? does nothing ?
-                // for now, we manage a max parser consecutive errors
-                LOG(ERROR) << "Error parsing JSON: " << e.what() << std::endl;
-                if (++parserErrors_ > MAX_PARSER_ERRORS) return false;
+            } catch (const json::exception &e) {
+                // deep-review B1: catch the whole nlohmann exception family —
+                // type_error/out_of_range from HandleRequest's unchecked
+                // request["..."] accesses would otherwise escape the loop
+                // and std::terminate the whole server on a malformed-but-
+                // parseable request.
+                LOG(ERROR) << "Error handling JSON request: " << e.what() << std::endl;
+                const auto* parse_error =
+                    dynamic_cast<const json::parse_error*>(&e);
+                if (parse_error != nullptr &&
+                    ++parserErrors_ > MAX_PARSER_ERRORS) {
+                    return false;
+                }
             }
         }
 

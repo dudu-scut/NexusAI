@@ -12,9 +12,27 @@ test('MCP-off build graph does not require MCP targets or headers', () => {
   const main = read('server/src/main.cpp');
 
   assert.match(rootCmake, /option\(ENABLE_MCP[^\n]+OFF\)/);
-  assert.match(orchestratorCmake, /if\(ENABLE_MCP\)[\s\S]*agent_rpc_mcp[\s\S]*endif\(\)/);
-  assert.match(orchestratorCmake, /target_compile_definitions\(orchestrator[^)]*AGENT_RPC_ENABLE_MCP/s);
-  assert.match(main, /#ifdef AGENT_RPC_ENABLE_MCP/);
+  // P7 (批次十一): the vector-routing tier moved to agent_rpc_common, so the
+  // orchestrator no longer links agent_rpc_mcp and no longer defines the
+  // AGENT_RPC_ENABLE_MCP layout macro (the dual-implementation / ODR hazard
+  // class is gone). Assert the ABSENCE so a regression cannot silently
+  // re-introduce the MCP coupling.
+  assert.match(orchestratorCmake, /if\(ENABLE_MCP\)/);
+  assert.doesNotMatch(
+    orchestratorCmake,
+    /target_link_libraries\(orchestrator[^)]*agent_rpc_mcp/s,
+    'orchestrator must not link agent_rpc_mcp (P7 decoupling)',
+  );
+  assert.doesNotMatch(
+    orchestratorCmake,
+    /target_compile_definitions\(orchestrator[^)]*AGENT_RPC_ENABLE_MCP/s,
+    'AGENT_RPC_ENABLE_MCP must not be defined for orchestrator (P7)',
+  );
+  assert.doesNotMatch(
+    main,
+    /#ifdef AGENT_RPC_ENABLE_MCP/,
+    'main.cpp must not contain MCP-gated code (P7)',
+  );
 });
 
 test('Docker build context excludes secrets and generated artifacts', () => {
