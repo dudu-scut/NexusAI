@@ -579,7 +579,22 @@ int main(int argc, char* argv[]) {
                 }
 
                 std::string key = "trace:spans:" + qs.trace_id;
-                redis->rpush(key, span_json.dump());
+                // deep-review lc-R4: a command-level failure (half-open Redis,
+                // command timeout) must re-queue the whole remaining batch —
+                // the connection-level check above cannot see it, and without
+                // this guard every flush tick would silently drop one batch
+                // of spans while logging success.
+                if (!redis->rpush(key, span_json.dump())) {
+                    const std::size_t requeued = batch.size();
+                    std::lock_guard<std::mutex> lock(g_span_queue_mutex);
+                    while (!batch.empty()) {
+                        g_span_queue.push_front(std::move(batch.back()));
+                        batch.pop_back();
+                    }
+                    LOG_WARN("Span batch flush: Redis command failed, re-queued " +
+                             std::to_string(requeued) + " spans");
+                    return;
+                }
                 // Set 24h TTL on the trace key (refreshed on each push)
                 redis->expire(key, 86400);
                 ++flushed;

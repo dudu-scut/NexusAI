@@ -217,6 +217,16 @@ grpc::Status SharingServiceImpl::ReadSharedConversation(
     if (request->token().empty()) {
         return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "token is required");
     }
+    // deep-review R8: the raw token is the only credential on this
+    // unauthenticated endpoint — cap its length BEFORE hashing so anonymous
+    // callers cannot make the server digest arbitrarily large inputs.
+    // (Real tokens are 96 lowercase hex chars; the cap only guards against
+    // multi-MB inputs, deliberately not enforcing the exact shape so
+    // operator-inserted test/legacy hashes keep their semantic errors.)
+    constexpr std::size_t kMaxShareTokenLength = 256;
+    if (request->token().size() > kMaxShareTokenLength) {
+        return grpc::Status(grpc::StatusCode::NOT_FOUND, "Share link not found");
+    }
 
     struct ShareRow {
         std::string owner_id;

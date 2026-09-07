@@ -83,6 +83,20 @@ const completedCount = computed(() =>
   props.plan.tasks.filter(t => t.status === 'completed' || t.status === 'failed').length
 )
 
+// deep-review fr-R2: task text lands verbatim inside a mermaid quoted label —
+// quotes/brackets/newlines break the flowchart syntax and <...> would reach
+// the DOM through htmlLabels + innerHTML. Escape before interpolating.
+function mermaidLabel(text: string): string {
+  return String(text)
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '&quot;')
+    .replace(/\[/g, '&#91;')
+    .replace(/\]/g, '&#93;')
+    .replace(/\n/g, '\\n')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+}
+
 function generateMermaid(plan: ExecutionPlan): string {
   let mermaid = 'graph TD\n'
   mermaid += '  Q["🔍 Query"] --> N1\n'
@@ -92,7 +106,7 @@ function generateMermaid(plan: ExecutionPlan): string {
     const icon = task.status === 'completed' ? '✅' :
                  task.status === 'running' ? '⏳' :
                  task.status === 'failed' ? '❌' : '○'
-    mermaid += `  ${nodeId}["${icon} ${task.skill}\\n${task.description.slice(0, 30)}"]\n`
+    mermaid += `  ${nodeId}["${icon} ${mermaidLabel(task.skill)}\n${mermaidLabel(task.description.slice(0, 30))}"]\n`
 
     for (const dep of task.depends_on) {
       const depIdx = plan.tasks.findIndex(t => t.id === dep)
@@ -141,7 +155,7 @@ async function renderMermaid() {
         secondaryColor: '#1e293b',
         tertiaryColor: '#0f172a',
       },
-      securityLevel: 'loose',
+      securityLevel: 'strict',
       flowchart: {
         useMaxWidth: true,
         htmlLabels: true,

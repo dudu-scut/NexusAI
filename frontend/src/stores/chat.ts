@@ -32,11 +32,16 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
-  function sendQuestion(text: string, planOnly = false) {
-    if (isStreaming.value || !text.trim()) return
+  // Returns whether the question was accepted (queued for streaming).
+  // deep-review fr-R5: a rejection (stream busy / awaiting plan confirmation)
+  // must be visible to the caller so the UI keeps the text and tells the
+  // user — previously the send was silently swallowed while the input box
+  // was cleared and a fake "Sending query" activity entry was logged.
+  function sendQuestion(text: string, planOnly = false): boolean {
+    if (isStreaming.value || !text.trim()) return false
     // B1: a delivered plan awaits confirmation — block new questions so
     // "confirm" cannot accidentally execute the wrong (newer) message's plan.
-    if (messages.value.some((m) => m.awaitingConfirmation)) return
+    if (messages.value.some((m) => m.awaitingConfirmation)) return false
 
     messages.value.push({
       id: crypto.randomUUID(),
@@ -46,6 +51,7 @@ export const useChatStore = defineStore('chat', () => {
     })
 
     startStream(text, planOnly)
+    return true
   }
 
   // Shared streaming path for fresh questions and retries. planOnly drives

@@ -35,15 +35,16 @@ std::string generateRowId(const char* prefix) {
     return std::string{prefix} + "-" + suffix;
 }
 
-// Feedback dimensions form a closed key space. agent_id and
-// skill_name must either be empty (dimension omitted) or a bounded
-// identifier from the known charset — unknown/arbitrary keys are refused
-// before any write so the feedback/quality tables never accumulate garbage
-// dimensions.
+// Feedback dimensions form a closed key space. agent_id and skill_name are
+// bounded identifiers from the known charset — unknown/arbitrary keys are
+// refused before any write so the feedback/quality tables never accumulate
+// garbage dimensions. (deep-review R12: empty values are refused too — a
+// row with agent_id='' would aggregate into an owner/agent combination no
+// consumer ever reads, silently dropping the feedback.)
 bool validFeedbackKey(const std::string& value) {
     constexpr std::size_t kMaxLength = 128;
     if (value.empty()) {
-        return true;
+        return false;
     }
     if (value.size() > kMaxLength) {
         return false;

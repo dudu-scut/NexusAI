@@ -14,15 +14,15 @@
         <div class="agent-selects">
           <select v-model="selectedAgents[0]" class="select-input">
             <option value="">-- Select Agent --</option>
-            <option v-for="a in availableAgents" :key="a" :value="a">{{ a }}</option>
+            <option v-for="a in availableAgents" :key="a.id" :value="a.id">{{ a.label }}</option>
           </select>
           <select v-model="selectedAgents[1]" class="select-input">
             <option value="">-- Select Agent --</option>
-            <option v-for="a in availableAgents" :key="a" :value="a">{{ a }}</option>
+            <option v-for="a in availableAgents" :key="a.id" :value="a.id">{{ a.label }}</option>
           </select>
           <select v-model="selectedAgents[2]" class="select-input">
             <option value="">-- Select Agent --</option>
-            <option v-for="a in availableAgents" :key="a" :value="a">{{ a }}</option>
+            <option v-for="a in availableAgents" :key="a.id" :value="a.id">{{ a.label }}</option>
           </select>
         </div>
       </div>
@@ -81,7 +81,7 @@ import { getAgents, compareAgents } from '../services/grpc-client'
 import type { CompareAgentsResponse } from '../types/proto'
 import GlassCard from '../components/layout/GlassCard.vue'
 
-const availableAgents = ref<string[]>([])
+const availableAgents = ref<{ id: string; label: string }[]>([])
 const selectedAgents = ref<string[]>(['', '', ''])
 const compareQuery = ref('')
 
@@ -93,7 +93,13 @@ const compareOutcome = ref<CompareAgentsResponse | null>(null)
 onMounted(async () => {
   try {
     const resp = await getAgents()
-    availableAgents.value = resp.agents.map(a => a.service_name)
+    // deep-review fr-R1: the backend resolves agents by their COMPOSITE
+    // registration key (service_name-host-port) — submitting the bare
+    // service_name made every comparison fail with "agent is not registered".
+    availableAgents.value = resp.agents.map(a => ({
+      id: `${a.service_name}-${a.host}-${a.port}`,
+      label: a.service_name,
+    }))
   } catch (e) {
     console.warn('Failed to load agents:', e)
   }

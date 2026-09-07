@@ -87,7 +87,15 @@ RpcServer::RpcServer() {
 
 RpcServer::~RpcServer() {
     stop();
-    
+
+    // deep-review lc-R1: the gRPC Server must outlive every registered
+    // service object. ~Server drains in-flight handlers (a synchronous
+    // handler that outlived the 5s Shutdown deadline still holds pointers
+    // into the service impls), so release server_ FIRST and only then the
+    // service members. The previous order (services first, server_ last)
+    // destroyed service impls while their handlers were still executing.
+    server_.reset();
+
     // Explicitly release members to guarantee destructor order
     service_impl_.reset();
     health_service_impl_.reset();
@@ -102,7 +110,6 @@ RpcServer::~RpcServer() {
     budget_repository_.reset();
     auth_repository_.reset();
     postgres_store_.reset();
-    server_.reset();
     builders_.clear();
 }
 

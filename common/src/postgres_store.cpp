@@ -245,6 +245,11 @@ std::string PostgresStore::connectionString() const {
            << "dbname='" << EscapeConnectionValue(config_.database) << "' "
            << "user='" << EscapeConnectionValue(config_.user) << "' "
            << "password='" << EscapeConnectionValue(config_.password) << "'";
+    // deep-review lc-R3: bound the TCP connect so a network black-hole (not
+    // a refusal) cannot wedge initialize()/health checks/stop() forever —
+    // libpq defaults to an unbounded connect attempt. Keepalives detect
+    // half-dead peers on long-lived pooled connections.
+    stream << " connect_timeout=5 keepalives=1 keepalives_idle=30";
     return stream.str();
 }
 

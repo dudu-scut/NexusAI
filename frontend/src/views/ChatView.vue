@@ -335,7 +335,14 @@ function handleSend() {
   if (composing.value) return
   const text = inputText.value.trim()
   if (!text) return
-  chatStore.sendQuestion(text, planOnlyMode.value)
+  // deep-review fr-R5: only clear the box / log the activity when the
+  // question was actually accepted — a busy stream or an awaiting-plan
+  // confirmation keeps the text so the user knows the send did not land.
+  const accepted = chatStore.sendQuestion(text, planOnlyMode.value)
+  if (!accepted) {
+    toast?.addToast?.({ type: 'warning', message: '请等待当前回答完成或先确认执行计划' })
+    return
+  }
   planOnlyMode.value = false
   inputText.value = ''
   if (textareaRef.value) {

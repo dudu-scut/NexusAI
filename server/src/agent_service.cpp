@@ -100,10 +100,20 @@ void AgentCommunicationServiceImpl::updateAgentHeartbeat(const std::string& agen
 void AgentCommunicationServiceImpl::cleanupOfflineAgents() {
     std::lock_guard<std::mutex> lock(agents_mutex_);
     auto now = std::chrono::steady_clock::now();
-    auto timeout = std::chrono::seconds(300);  // 5 min grace period for agents without heartbeat
 
     auto it = agents_.begin();
     while (it != agents_.end()) {
+        // deep-review R4: the grace period must honor the TTL negotiated at
+        // registration (max(3*interval, 300s), stored in agent_liveness_ttl_
+        // by RegisterAgent and read back by Heartbeat) — a fixed 300s here
+        // would delete perfectly healthy agents whose legal heartbeat
+        // interval exceeds 100s, dropping their queued inbox messages.
+        int ttl = kDefaultLivenessTtlSeconds;
+        const auto ttl_it = agent_liveness_ttl_.find(it->first);
+        if (ttl_it != agent_liveness_ttl_.end()) {
+            ttl = ttl_it->second;
+        }
+        const auto timeout = std::chrono::seconds(ttl);
         if (now - it->second.last_heartbeat > timeout) {
             LOG_WARN("Agent offline, removing: " + it->first);
             removeFromIndexes(it->first);
@@ -521,6 +531,10 @@ grpc::Status AgentCommunicationServiceImpl::Heartbeat(
     // Only agents registered through this process may be refreshed: a bare
     // heartbeat for an unknown id must not mint a durable "healthy" row
     // (registration is the ADMIN-gated path).
+    // deep-review R1: heartbeats are also owner-scoped — an arbitrary logged-
+    // in user must not be able to keep another registrant's agent alive
+    // (same tenant-isolation rule as ReceiveMessage's inbox ownership).
+    const std::string heartbeat_caller = AuthInterceptor::currentUserId();
     const bool known_here = [this, &request]() {
         std::lock_guard<std::mutex> lock(agents_mutex_);
         return agent_liveness_ttl_.find(request->agent_id()) !=
@@ -531,6 +545,15 @@ grpc::Status AgentCommunicationServiceImpl::Heartbeat(
         status->set_code(1);
         status->set_message("Agent not registered: " + request->agent_id());
         return grpc::Status::OK;
+    }
+    {
+        std::lock_guard<std::mutex> lock(agents_mutex_);
+        const auto owner_it = agent_queue_owners_.find(request->agent_id());
+        if (owner_it == agent_queue_owners_.end() ||
+            owner_it->second != heartbeat_caller) {
+            return grpc::Status(grpc::StatusCode::PERMISSION_DENIED,
+                                "Only the agent's registrant may send heartbeats");
+        }
     }
 
     updateAgentHeartbeat(request->agent_id());
