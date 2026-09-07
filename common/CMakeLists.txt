@@ -19,6 +19,12 @@ set(COMMON_SOURCES
     src/agent_runtime_repository.cpp
     src/auth_repository.cpp
     src/profile_summarizer.cpp  # Batch 4 U2
+    # P7 (批次十一): RAG vector building blocks moved out of agent_rpc_mcp so
+    # the default build (no -DENABLE_MCP) can host the embedding routing tier.
+    src/rag/embedding_service.cpp
+    src/rag/vector_index.cpp
+    src/rag/embedding_cache.cpp
+    src/rag/semantic_cache_index.cpp
 )
 
 # 创建静态库

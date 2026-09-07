@@ -92,6 +92,13 @@ TEST(LocalAuthContractTest, RepositorySupportsUserIdLookupAndRpcServerOwnsPostgr
     expectContains(rpc_source, "PostgresConfig::fromEnvironment");
     expectContains(rpc_source, "AuthServiceImpl");
     expectContains(rpc_source, "PostgresUnavailable");
+    // P26 T3: trust mode must be assembled with a fail-fast secret check
+    // (never silently trust unsigned headers) and admin re-checks must be
+    // able to reach the auth service.
+    expectContains(rpc_source, "NEXUSAI_TRUST_PROXY");
+    expectContains(rpc_source, "NEXUSAI_PROXY_HMAC_SECRET");
+    expectContains(rpc_source, "setTrustedProxy");
+    expectContains(rpc_source, "setAuthService");
 }
 
 }  // namespace

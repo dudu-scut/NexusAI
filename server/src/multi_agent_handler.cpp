@@ -103,6 +103,19 @@ int planningTimeoutFor(grpc::ServerContext* context, int effective_timeout_secon
         1, std::min<long long>(kMaxPlanningTimeoutSeconds, bounded)));
 }
 
+// A6 (批次十一): deadline 已越过 → 不再发起任何注定失败的执行调用，直接早退
+// failed 终态（调用方收口）。remaining 是秒级整型（duration_cast<seconds>），
+// count() <= 0 的判断自带 ~1s 保守余量，无需额外魔法阈值。
+bool deadlineAlreadyPassed(grpc::ServerContext* context) {
+    if (context == nullptr ||
+        context->deadline() == std::chrono::system_clock::time_point::max()) {
+        return false;
+    }
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               context->deadline() - std::chrono::system_clock::now())
+               .count() <= 0;
+}
+
 // MultiAgentHandler never emits terminal stream events. The top-level
 // AIQueryServiceImpl::QueryStream is the single emitter of "complete" and
 // "error" events; this thread-local slot hands the accumulated answer/error
@@ -419,7 +432,17 @@ grpc::Status MultiAgentHandler::handleQuery(
         auto now = std::chrono::system_clock::now();
         auto remaining = std::chrono::duration_cast<std::chrono::seconds>(
             gpr_deadline - now);
-        if (remaining.count() > 0 && remaining.count() < effective_timeout_seconds) {
+        // A6: 收缩条件原为 remaining.count() > 0 —— deadline 已越过（≤0）时
+        // 反而不收缩、Agent 会持全量 timeout 出手必败；这里直接早退 failed。
+        if (remaining.count() <= 0) {
+            LOG_WARN("Deadline already passed, refusing sync query: " + request_id);
+            auto* st = response->mutable_status();
+            st->set_code(-1);
+            st->set_message("Deadline passed before agent execution");
+            return grpc::Status(grpc::StatusCode::DEADLINE_EXCEEDED,
+                                "Deadline passed before agent execution");
+        }
+        if (remaining.count() < effective_timeout_seconds) {
             effective_timeout_seconds = static_cast<int>(remaining.count());
         }
     }
@@ -498,6 +521,16 @@ grpc::Status MultiAgentHandler::handleQuery(
     // the final terminal state: a failed fast-path attempt is an internal
     // probe that gets retried below, and recording it would double-count
     // the request (two entries for one query).
+    // A6: 规划可能已耗尽 deadline —— 执行前统一早退（单 Agent 与 DAG 同受
+    // 保护），零 Agent 调用、零 token 计费。
+    if (deadlineAlreadyPassed(context)) {
+        LOG_WARN("Deadline passed after planning, refusing sync execution: " + request_id);
+        auto* st = response->mutable_status();
+        st->set_code(-1);
+        st->set_message("Deadline passed before agent execution");
+        return grpc::Status(grpc::StatusCode::DEADLINE_EXCEEDED,
+                            "Deadline passed before agent execution");
+    }
     if (plan.is_single_agent) {
         bool success = executeSingleAgentSync(plan, *request, response);
         if (success) {
@@ -518,6 +551,14 @@ grpc::Status MultiAgentHandler::handleQuery(
             if (!plan.single_agent_id.empty()) {
                 agent_rpc::registry::ServiceRegistry::recordAgentCall(
                     plan.single_agent_id, success, duration.count());
+                // P8 S2: feed only REAL completed calls into the optional
+                // load-balancer latency tier (same agent-id granularity;
+                // timeouts/failures are skipped like the health evaluation).
+                if (success && agent_router_) {
+                    agent_router_->recordEndpointLatency(
+                        plan.single_agent_id,
+                        static_cast<double>(duration.count()));
+                }
             }
             return success ? grpc::Status::OK
                            : grpc::Status(grpc::StatusCode::INTERNAL,
@@ -540,6 +581,15 @@ grpc::Status MultiAgentHandler::handleQuery(
         }
         task_planner_->resolveAgents(plan, *agent_router_);
         if (plan.is_single_agent) {
+            // A6: 快路径执行已耗时——重试前的再次执行同样受 deadline 早退保护。
+            if (deadlineAlreadyPassed(context)) {
+                LOG_WARN("Deadline passed during fast-path retry, refusing sync execution: " + request_id);
+                auto* st = response->mutable_status();
+                st->set_code(-1);
+                st->set_message("Deadline passed before agent execution");
+                return grpc::Status(grpc::StatusCode::DEADLINE_EXCEEDED,
+                                    "Deadline passed before agent execution");
+            }
             success = executeSingleAgentSync(plan, *request, response);
             if (success) {
                 update_status_(request_id, "completed",
@@ -557,6 +607,14 @@ grpc::Status MultiAgentHandler::handleQuery(
             if (!plan.single_agent_id.empty()) {
                 agent_rpc::registry::ServiceRegistry::recordAgentCall(
                     plan.single_agent_id, success, duration.count());
+                // P8 S2: feed only REAL completed calls into the optional
+                // load-balancer latency tier (same agent-id granularity;
+                // timeouts/failures are skipped like the health evaluation).
+                if (success && agent_router_) {
+                    agent_router_->recordEndpointLatency(
+                        plan.single_agent_id,
+                        static_cast<double>(duration.count()));
+                }
             }
             return success ? grpc::Status::OK
                            : grpc::Status(grpc::StatusCode::INTERNAL,
@@ -633,6 +691,11 @@ grpc::Status MultiAgentHandler::handleQuery(
             if (!actual_agent_id.empty()) {
                 agent_rpc::registry::ServiceRegistry::recordAgentCall(
                     actual_agent_id, result.success, result.duration_ms);
+                // P8 S2: latency feed for REAL completed subtask calls only.
+                if (result.success && agent_router_) {
+                    agent_router_->recordEndpointLatency(
+                        actual_agent_id, result.duration_ms);
+                }
             }
             recordInvocationFact(request_id, agent_id, skill_name,
                                  result.success ? "success" : "failed",
@@ -771,6 +834,12 @@ grpc::Status MultiAgentHandler::handleQueryStream(
 
     // Single-agent fast path. No terminal event is emitted anywhere in this
     // branch; AIQueryServiceImpl owns the single terminal emission.
+    // A6: 规划后执行前统一早退（单 Agent / 重试 / DAG 同受保护）。
+    if (deadlineAlreadyPassed(context)) {
+        LOG_WARN("Deadline passed after planning, refusing stream execution: " + request_id);
+        return grpc::Status(grpc::StatusCode::DEADLINE_EXCEEDED,
+                            "Deadline passed before agent execution");
+    }
     if (plan.is_single_agent) {
         auto outcome = executeSingleAgentStream(plan, context, request, writer,
                                                 request_id, start_time,
@@ -807,6 +876,12 @@ grpc::Status MultiAgentHandler::handleQueryStream(
         }
         task_planner_->resolveAgents(plan, *agent_router_);
         if (plan.is_single_agent) {
+            // A6: 快路径执行已耗时——重试前再次执行同样受 deadline 早退保护。
+            if (deadlineAlreadyPassed(context)) {
+                LOG_WARN("Deadline passed during fast-path retry, refusing stream execution: " + request_id);
+                return grpc::Status(grpc::StatusCode::DEADLINE_EXCEEDED,
+                                    "Deadline passed before agent execution");
+            }
             outcome = executeSingleAgentStream(plan, context, request, writer,
                                                request_id, start_time);
             if (outcome == SingleStreamOutcome::Success) {
@@ -979,6 +1054,11 @@ grpc::Status MultiAgentHandler::handleQueryStream(
             if (!actual_agent_id.empty()) {
                 agent_rpc::registry::ServiceRegistry::recordAgentCall(
                     actual_agent_id, result.success, result.duration_ms);
+                // P8 S2: latency feed for REAL completed subtask calls only.
+                if (result.success && agent_router_) {
+                    agent_router_->recordEndpointLatency(
+                        actual_agent_id, result.duration_ms);
+                }
             }
             recordInvocationFact(request_id, agent_id, skill_name,
                                  result.success ? "success" : "failed",

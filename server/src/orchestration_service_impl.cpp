@@ -16,6 +16,7 @@
 #include "agent_rpc/common/query_domain_repository.h"
 #include "agent_rpc/common/postgres_budget_repository.h"
 #include "agent_rpc/common/redis_client.h"
+#include "agent_rpc/common/key_validation.h"
 #include "agent_rpc/common/profile_summarizer.h"
 #include "agent_rpc/orchestrator/export_service.h"
 #include "agent_rpc/orchestrator/replay_service.h"
@@ -162,6 +163,13 @@ grpc::Status OrchestrationServiceImpl::executePlan(
     const std::string request_id = "execute-plan-" + trace_id;
     const std::string context_id =
         request->context_id().empty() ? request_id : request->context_id();
+    // P25 (批次十一): context_id 入口白名单 — 含 sanitize 有损字符集
+    // （: \n \r 控制符）或超长直接拒绝，让有损字符到不了键清洗函数。
+    if (!common::isSafeKeyComponent(context_id)) {
+        return grpc::Status(
+            grpc::StatusCode::INVALID_ARGUMENT,
+            "context_id contains characters unsafe for conversation keys");
+    }
     const bool durable = (domain_repo_ != nullptr) && (budget_repo_ != nullptr);
 
     // Crash guard: PG/Redis faults must never escape into the gRPC handler
@@ -408,6 +416,15 @@ grpc::Status OrchestrationServiceImpl::executePlan(
                 }
             }
         };
+        // A6 (批次十一): ExecutePlan 持有独立 gRPC deadline——已越过则不再
+        // 发起 DAG 执行（throw 走既有 catch 的 failed 终态收口，与执行中
+        // 超时的最终语义一致）。
+        if (context->deadline() != std::chrono::system_clock::time_point::max() &&
+            std::chrono::duration_cast<std::chrono::seconds>(
+                context->deadline() - std::chrono::system_clock::now())
+                    .count() <= 0) {
+            throw std::runtime_error("Deadline passed before DAG execution");
+        }
         auto results = task_executor_->execute(plan, call_agent, nullptr, on_cancel,
                                                cancelled_probe);
         for (const auto& [tid, result] : results) {
@@ -421,6 +438,12 @@ grpc::Status OrchestrationServiceImpl::executePlan(
                 agent_rpc::registry::ServiceRegistry::recordAgentCall(
                     result.agent_id, result.success,
                     static_cast<double>(result.duration_ms));
+                // P8 S2: latency feed for REAL completed subtask calls only
+                // (ExecutePlan shares the router's load-balancer tier).
+                if (result.success && agent_router_) {
+                    agent_router_->recordEndpointLatency(
+                        result.agent_id, result.duration_ms);
+                }
             }
         }
 

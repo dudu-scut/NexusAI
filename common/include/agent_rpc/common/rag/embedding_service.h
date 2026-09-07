@@ -14,7 +14,7 @@
 #include <chrono>
 
 namespace agent_rpc {
-namespace mcp {
+namespace common {
 namespace rag {
 
 /**
@@ -138,5 +138,5 @@ private:
 };
 
 } // namespace rag
-} // namespace mcp
+} // namespace common
 } // namespace agent_rpc

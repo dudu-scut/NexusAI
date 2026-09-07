@@ -10,10 +10,8 @@
 #include "agent_rpc/common/memory_service.h"
 #include "agent_rpc/common/query_domain_repository.h"
 #include <a2a/llm_client.hpp>
-#ifdef AGENT_RPC_ENABLE_MCP
-#include <agent_rpc/mcp/rag/embedding_service.h>
-#include <agent_rpc/mcp/rag/vector_index.h>
-#endif
+#include <agent_rpc/common/rag/embedding_service.h>
+#include <agent_rpc/common/rag/vector_index.h>
 #include "ai_query.pb.h"
 
 #include <future>
@@ -39,12 +37,11 @@ constexpr std::size_t kSummaryHistoryLimit = 20;
 // 比余弦相似度，>0.9 的重复条目跳过写入。进程级单例、懒加载、mutex 保护；
 // 仅 MCP 构建 + NEXUSAI_MEMORY_DEDUP_EMBEDDING=1 时启用；embedding 服务
 // 未配置/失败时静默降级为不去重。
-#ifdef AGENT_RPC_ENABLE_MCP
 namespace {
 struct HintDedupIndex {
     std::mutex mutex;
-    std::unique_ptr<agent_rpc::mcp::rag::EmbeddingService> embedding;
-    std::unique_ptr<agent_rpc::mcp::rag::VectorIndex> index;
+    std::unique_ptr<agent_rpc::common::rag::EmbeddingService> embedding;
+    std::unique_ptr<agent_rpc::common::rag::VectorIndex> index;
     // B7 (P11): composite text → (key, value), so the recall side can map a
     // search hit back to the structured hint instead of a raw string.
     std::unordered_map<std::string, std::pair<std::string, std::string>>
@@ -53,15 +50,15 @@ struct HintDedupIndex {
     bool ensureInitializedLocked() {
         if (embedding) return true;
         try {
-            agent_rpc::mcp::rag::EmbeddingConfig cfg;
+            agent_rpc::common::rag::EmbeddingConfig cfg;
             cfg.api_key = agent_rpc::common::envOrDefault("LLM_API_KEY", "");
             cfg.model = agent_rpc::common::envOrDefault("EMBEDDING_MODEL", "");
             cfg.api_url = agent_rpc::common::envOrDefault("EMBEDDING_API_URL", "");
             if (cfg.api_key.empty() && cfg.api_url.empty()) {
                 return false;  // embedding not configured — degrade silently
             }
-            embedding = std::make_unique<agent_rpc::mcp::rag::EmbeddingService>(cfg);
-            index = std::make_unique<agent_rpc::mcp::rag::VectorIndex>();
+            embedding = std::make_unique<agent_rpc::common::rag::EmbeddingService>(cfg);
+            index = std::make_unique<agent_rpc::common::rag::VectorIndex>();
             return true;
         } catch (const std::exception&) {
             embedding.reset();
@@ -86,7 +83,7 @@ struct HintDedupIndex {
         std::lock_guard<std::mutex> lock(mutex);
         if (!ensureInitializedLocked()) return;
         try {
-            agent_rpc::mcp::rag::IndexedTool tool;
+            agent_rpc::common::rag::IndexedTool tool;
             tool.name = text;
             tool.embedding = embedding->embed(text);
             index->addTool(std::move(tool));
@@ -132,7 +129,6 @@ HintDedupIndex& hintDedupIndex() {
     return instance;
 }
 }  // anonymous namespace
-#endif
 
 QueryHelpers::~QueryHelpers() {
     // Drain pending summary tasks so destruction never races with a live
@@ -483,24 +479,20 @@ void QueryHelpers::maybeExtractMemorySegment(
                             if (!it.value().is_string()) continue;
                             const std::string hint_text =
                                 it.key() + ": " + it.value().get<std::string>();
-#ifdef AGENT_RPC_ENABLE_MCP
                             if (dedup_enabled &&
                                 hintDedupIndex().isDuplicate(hint_text)) {
                                 continue;  // semantically identical hint exists
                             }
-#endif
                             hints[it.key()] = it.value().get<std::string>();
                         }
                     }
                     if (!hints.empty()) {
                         memory_service->updateUserMemoryFromHints(user_id, hints);
-#ifdef AGENT_RPC_ENABLE_MCP
                         if (dedup_enabled) {
                             for (const auto& [k, v] : hints) {
                                 hintDedupIndex().rememberHint(k, v);
                             }
                         }
-#endif
                         LOG_INFO("Memory segment extracted for context: " +
                                  context_id + " (" +
                                  std::to_string(hints.size()) + " hints)");
@@ -533,16 +525,10 @@ void QueryHelpers::maybeExtractMemorySegment(
 std::vector<QueryHelpers::RelevantHint> QueryHelpers::recallRelevantHints(
     const std::string& query_text, int top_k, float threshold) {
     std::vector<QueryHelpers::RelevantHint> out;
-#ifdef AGENT_RPC_ENABLE_MCP
     for (const auto& [key, value, similarity] :
          hintDedupIndex().searchSimilar(query_text, top_k, threshold)) {
         out.push_back(QueryHelpers::RelevantHint{key, value, similarity});
     }
-#else
-    (void)query_text;
-    (void)top_k;
-    (void)threshold;
-#endif
     return out;
 }
 

@@ -2,6 +2,7 @@
 #include "agent_rpc/server/auth_interceptor.h"
 #include "agent_rpc/common/logger.h"
 #include "agent_rpc/common/metrics.h"
+#include "agent_rpc/common/key_validation.h"
 #include "agent_rpc/orchestrator/agent_router.h"
 #include "agent_rpc/orchestrator/agent_info.h"
 #include "agent_rpc/registry/service_registry.h"
@@ -320,20 +321,29 @@ grpc::Status AgentCommunicationServiceImpl::RegisterAgent(
 
     const auto& info = request->agent_info();
 
-    // Validate required fields
-    if (info.service_name().empty()) {
+    // Validate required fields + P25(b): agent 注册原料（service_name/host）
+    // 入口白名单 — service_name 段参与 agent_id 拼接与 Redis 键构造，若含
+    // sanitize 有损字符（冒号/控制符）会与合法键同形（a:b vs a_b 碰撞伪冒），
+    // 这里直接拒绝；host 按 hostname[:port] 结构校验。
+    if (info.service_name().empty() ||
+        !common::isSafeKeyComponent(info.service_name(), 64)) {
         auto* status = response->mutable_status();
         status->set_code(3); // INVALID_ARGUMENT
-        status->set_message("agent_info.service_name is required");
-        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
-                           "agent_info.service_name is required");
+        status->set_message(
+            "agent_info.service_name is required and must be 1-64 safe characters");
+        return grpc::Status(
+            grpc::StatusCode::INVALID_ARGUMENT,
+            "agent_info.service_name is required and must be 1-64 safe characters");
     }
-    if (info.host().empty() || info.port() <= 0) {
+    if (info.host().empty() || !common::isSafeHostComponent(info.host()) ||
+        info.port() <= 0) {
         auto* status = response->mutable_status();
         status->set_code(3);
-        status->set_message("agent_info.host and port are required");
-        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
-                           "agent_info.host and port are required");
+        status->set_message(
+            "agent_info.host must be a hostname[:port] of safe characters and port is required");
+        return grpc::Status(
+            grpc::StatusCode::INVALID_ARGUMENT,
+            "agent_info.host must be a hostname[:port] of safe characters and port is required");
     }
 
     std::string agent_id = info.service_name() + "-" + info.host() + "-" + std::to_string(info.port());

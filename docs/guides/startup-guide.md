@@ -60,7 +60,7 @@ LLM_API_URL=https://api.deepseek.com/v1/chat/completions
 
 | 变量 | 默认 | 说明 |
 |------|------|------|
-| `NEXUSAI_INTENT_CACHE` | 关 | 相似查询复用 LLM 意图分类结果（需 MCP 构建 + Embedding 层） |
+| `NEXUSAI_INTENT_CACHE` | 关 | 相似查询复用 LLM 意图分类结果（向量基建随默认构建，`NEXUSAI_EMBEDDING_ROUTER` 默认开） |
 | `NEXUSAI_PLAN_SKILL_PRUNE` | 关 | 规划前用向量相似度剪枝技能清单（route-then-plan） |
 | `NEXUSAI_MEMORY_VECTOR_RECALL` | 关 | 大规模 hints 下按相关性 Top-K 注入（其余折叠） |
 | `NEXUSAI_MEMORY_DEDUP_EMBEDDING` | 关 | hints 写入前 embedding 余弦去重（P18 末闸） |

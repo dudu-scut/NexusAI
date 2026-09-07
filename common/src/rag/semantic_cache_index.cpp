@@ -3,7 +3,7 @@
  * @brief Implementation of SemanticCacheIndex
  */
 
-#include "agent_rpc/mcp/rag/semantic_cache_index.h"
+#include "agent_rpc/common/rag/semantic_cache_index.h"
 #include <cmath>
 #include <cstring>
 #include <cstdint>
@@ -13,9 +13,10 @@
 #include <algorithm>
 
 namespace agent_rpc {
-namespace mcp {
+namespace common {
+namespace rag {
 
-SemanticCacheIndex::SemanticCacheIndex(rag::EmbeddingService* embedding)
+SemanticCacheIndex::SemanticCacheIndex(EmbeddingService* embedding)
     : embedding_(embedding) {}
 
 std::string SemanticCacheIndex::vectorToKey(const std::vector<float>& v) {
@@ -168,5 +169,6 @@ void SemanticCacheIndex::cleanup() {
     }
 }
 
-} // namespace mcp
+} // namespace rag
+} // namespace common
 } // namespace agent_rpc

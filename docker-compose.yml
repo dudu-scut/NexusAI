@@ -48,6 +48,9 @@ services:
       NEXUSAI_POSTGRES_USER: ${POSTGRES_USER:-nexusai}
       NEXUSAI_POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nexusai-dev-password}
       NEXUSAI_MIGRATIONS_DIR: /usr/local/share/nexusai/migrations
+      # P26 T3 trusted proxy (default off; secret must match the proxy service)
+      NEXUSAI_TRUST_PROXY: ${NEXUSAI_TRUST_PROXY:-0}
+      NEXUSAI_PROXY_HMAC_SECRET: ${NEXUSAI_PROXY_HMAC_SECRET:-}
       # Admin user for agent management RPCs (RegisterAgent/UnregisterAgent);
       # empty means no user gets the ADMIN role. Pass through from .env.
       NEXUSAI_ADMIN_USERNAME: ${NEXUSAI_ADMIN_USERNAME:-}
@@ -89,8 +92,16 @@ services:
     environment:
       GRPC_TARGET: rpc-server:50051
       PROXY_PORT: "8081"
+      # P26 T3 trusted proxy: local auth check reads the shared Redis; the
+      # HMAC secret must equal the rpc-server value (>= 32 chars when on).
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      NEXUSAI_TRUST_PROXY: ${NEXUSAI_TRUST_PROXY:-0}
+      NEXUSAI_PROXY_HMAC_SECRET: ${NEXUSAI_PROXY_HMAC_SECRET:-}
     depends_on:
       rpc-server:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     expose: ["8081"]
     healthcheck:

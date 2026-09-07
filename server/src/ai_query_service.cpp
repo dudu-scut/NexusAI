@@ -34,6 +34,7 @@
 #include "agent_rpc/orchestrator/export_service.h"
 #include "agent_rpc/orchestrator/replay_service.h"
 #include "agent_rpc/common/cost_tracker.h"
+#include "agent_rpc/common/key_validation.h"
 #include "agent_rpc/common/profile_summarizer.h"
 #include <nlohmann/json.hpp>
 
@@ -131,23 +132,22 @@ bool AIQueryServiceImpl::initialize(
 
             LOG_INFO("Multi-agent orchestrator enabled (LLM: " + model + ")");
 
-            // P7: optional embedding routing tier (NEXUSAI_EMBEDDING_ROUTER,
-            // default off). Any failure degrades silently — the router keeps
-            // the 3-tier pipeline (Embedding(high) -> LLM -> Keyword) and
-            // startup is never blocked or failed by this wiring.
-            if (agent_router_ &&
-                common::envOrDefault("NEXUSAI_EMBEDDING_ROUTER", "0") == "1") {
+            // P7 (批次十一): embedding routing tier ON by default — the
+            // vector building blocks now ship in every build (agent_rpc_common),
+            // so the switch defaults to enabled and only an explicit
+            // NEXUSAI_EMBEDDING_ROUTER=0 turns it off. Missing API key skips
+            // the assembly entirely (a key-less tier would fail on every
+            // embed call); any other assembly failure degrades silently to
+            // the LLM/keyword pipeline.
+            if (agent_router_ && !api_key.empty() &&
+                common::envOrDefault("NEXUSAI_EMBEDDING_ROUTER", "1") != "0") {
                 orchestrator::EmbeddingRouterConfig embedding_config;
                 embedding_config.enabled = true;
                 embedding_config.api_key = api_key;  // LLM_API_KEY fallback
                 if (agent_router_->enableEmbedding(embedding_config)) {
-                    LOG_INFO("Embedding router enabled (NEXUSAI_EMBEDDING_ROUTER=1)");
+                    LOG_INFO("Embedding router enabled (default-on, NEXUSAI_EMBEDDING_ROUTER!=0)");
                 } else {
-#ifdef AGENT_RPC_ENABLE_MCP
                     LOG_WARN("embedding router disabled: embedding service unavailable or invalid config, fallback to 3-tier pipeline");
-#else
-                    LOG_WARN("embedding router disabled: built without AGENT_RPC_ENABLE_MCP, fallback to 3-tier pipeline");
-#endif
                 }
             }
         } else {
@@ -885,6 +885,14 @@ grpc::Status AIQueryServiceImpl::Query(
     if (context_id.empty()) {
         context_id = "ctx-" + request_id;
     }
+    // P25 (批次十一): context_id 入口白名单 — 含 sanitize 有损字符集
+    // （: \n \r 控制符）或超长的 context_id 直接拒绝，让有损字符到不了键
+    // 清洗函数（a:b 与 a_b 同形碰撞面归零）。默认生成的 ctx-<uuid> 恒合规。
+    if (!agent_rpc::common::isSafeKeyComponent(context_id)) {
+        return grpc::Status(
+            grpc::StatusCode::INVALID_ARGUMENT,
+            "context_id contains characters unsafe for conversation keys");
+    }
 
     // P24: reject a concurrent same-request_id duplicate before any
     // durable row is touched.
@@ -999,6 +1007,24 @@ grpc::Status AIQueryServiceImpl::Query(
             finalizeDurableQuery(run, "failed", "", "Circuit breaker open");
             helpers_.updateTaskStatus(request_id, "failed", "", "", "Circuit breaker open");
             return grpc::Status(grpc::StatusCode::UNAVAILABLE, "A2A backend circuit breaker open");
+        }
+
+        // A6 (批次十一): 直连路径独立 deadline 收缩点——已越过则不再发起
+        // 注定失败的 A2A 调用（std::max(1L, remaining) 会把 ≤0 变成 1s 必败
+        // 调用），直接 failed 终态。
+        if (context->deadline() != std::chrono::system_clock::time_point::max() &&
+            std::chrono::duration_cast<std::chrono::seconds>(
+                context->deadline() - std::chrono::system_clock::now())
+                    .count() <= 0) {
+            LOG_WARN("Deadline already passed, refusing direct A2A query: " + request_id);
+            auto* status = response->mutable_status();
+            status->set_code(-1);
+            status->set_message("Deadline passed before agent execution");
+            finalizeDurableQuery(run, "failed", "", "Deadline passed before agent execution");
+            helpers_.updateTaskStatus(request_id, "failed", "", "",
+                                      "Deadline passed before agent execution");
+            return grpc::Status(grpc::StatusCode::DEADLINE_EXCEEDED,
+                                "Deadline passed before agent execution");
         }
 
         // Propagate gRPC deadline to A2A HTTP timeout
@@ -1172,6 +1198,14 @@ grpc::Status AIQueryServiceImpl::QueryStream(
     std::string context_id = request->context_id();
     if (context_id.empty()) {
         context_id = "ctx-" + request_id;
+    }
+    // P25 (批次十一): context_id 入口白名单 — 含 sanitize 有损字符集
+    // （: \n \r 控制符）或超长的 context_id 直接拒绝，让有损字符到不了键
+    // 清洗函数（a:b 与 a_b 同形碰撞面归零）。默认生成的 ctx-<uuid> 恒合规。
+    if (!agent_rpc::common::isSafeKeyComponent(context_id)) {
+        return grpc::Status(
+            grpc::StatusCode::INVALID_ARGUMENT,
+            "context_id contains characters unsafe for conversation keys");
     }
 
     // P24: same in-flight dedup as the sync Query path.
@@ -1347,6 +1381,21 @@ grpc::Status AIQueryServiceImpl::QueryStream(
     bool write_failed = false;
     std::string lower_error;
     std::string streamed_content;
+
+    // A6 (批次十一): 直连流路径独立 deadline 收缩点——已越过则不再发起
+    // 注定失败的 A2A 调用，向客户端发结构化 error 事件并落 failed 终态。
+    if (context->deadline() != std::chrono::system_clock::time_point::max() &&
+        std::chrono::duration_cast<std::chrono::seconds>(
+            context->deadline() - std::chrono::system_clock::now())
+                .count() <= 0) {
+        LOG_WARN("Deadline already passed, refusing direct A2A stream: " + request_id);
+        emitTerminal("error", "Deadline passed before agent execution");
+        finalizeDurableQuery(run, "failed", "", "Deadline passed before agent execution");
+        helpers_.updateTaskStatus(request_id, "failed", "", "",
+                                  "Deadline passed before agent execution");
+        return grpc::Status(grpc::StatusCode::DEADLINE_EXCEEDED,
+                            "Deadline passed before agent execution");
+    }
 
     // Propagate gRPC deadline to A2A HTTP timeout
     if (context->deadline() != std::chrono::system_clock::time_point::max()) {

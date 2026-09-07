@@ -26,22 +26,32 @@
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
+#include <iomanip>
 #include <iterator>
 #include <memory>
 #include <mutex>
 #include <set>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <openssl/hmac.h>
 
 #include <grpcpp/grpcpp.h>
 
 #include "agent_rpc/common/postgres_store.h"
 #include "agent_rpc/common/postgres_budget_repository.h"
 #include "agent_rpc/common/query_domain_repository.h"
+#include "agent_rpc/common/auth_repository.h"
+#include "agent_rpc/common/redis_client.h"
 #include "agent_rpc/a2a_adapter/a2a_config.h"
 #include "agent_rpc/server/rpc_server.h"
 #include "agent_rpc/server/multi_agent_handler.h"
+#include "agent_rpc/server/auth_cache.h"
+#include "agent_rpc/server/auth_service.h"
+
+#include <nlohmann/json.hpp>
 
 #include "ai_query.grpc.pb.h"
 #include "ai_query.pb.h"
@@ -726,6 +736,84 @@ TEST_F(DurableQueryPipelineTest, UnauthenticatedQueryCreatesNoRows) {
     EXPECT_EQ(countRows("conversations", "id", request.context_id()), 0);
 }
 
+// P22 (批次十一阶段②): Logout closes the revocation loop — PG revoke +
+// cache DEL + 60s deny marker. After logout the same token is refused by
+// ValidateToken (deny hit) and by protected RPCs (interceptor refuses the
+// revoked session), so an in-flight cache entry can never resurrect it.
+TEST_F(DurableQueryPipelineTest, LogoutRevokesSessionAndDenyMarkerBlocksRefill) {
+    startPipeline("ok");
+    const auto user = registerUser("logout");
+
+    // Warm the session cache through the shared ValidateToken path.
+    {
+        agent_communication::auth::ValidateTokenRequest vt;
+        vt.set_token(user.token);
+        agent_communication::auth::ValidateTokenResponse vr;
+        grpc::ClientContext context;
+        ASSERT_TRUE(user_stub_->ValidateToken(&context, vt, &vr).ok());
+        ASSERT_TRUE(vr.valid());
+    }
+
+    // Manual logout: bearer token rides the authorization metadata.
+    agent_communication::auth::LogoutRequest lr;
+    agent_communication::auth::LogoutResponse lr_response;
+    grpc::ClientContext logout_context;
+    applyAuth(logout_context, user);
+    const auto logout_status =
+        user_stub_->Logout(&logout_context, lr, &lr_response);
+    ASSERT_TRUE(logout_status.ok()) << logout_status.error_message();
+
+    // The same token is refused everywhere afterwards.
+    {
+        agent_communication::auth::ValidateTokenRequest vt;
+        vt.set_token(user.token);
+        agent_communication::auth::ValidateTokenResponse vr;
+        grpc::ClientContext context;
+        ASSERT_TRUE(user_stub_->ValidateToken(&context, vt, &vr).ok());
+        EXPECT_FALSE(vr.valid()) << "revoked token must not validate";
+    }
+    {
+        const std::string request_id = "dqp-logout-" + uniqueSuffix();
+        auto request = makeRequest(request_id,
+                                   "dqp-ctx-logout-" + uniqueSuffix());
+        agent_communication::AIQueryResponse response;
+        grpc::ClientContext context;
+        applyAuth(context, user);
+        const auto query_status = query_stub_->Query(&context, request, &response);
+        EXPECT_EQ(query_status.error_code(), grpc::StatusCode::UNAUTHENTICATED);
+    }
+}
+
+// Logout is a protected endpoint: without a valid bearer token the handler
+// refuses (UNAUTHENTICATED), it never answers OK for an anonymous caller.
+TEST_F(DurableQueryPipelineTest, UnauthenticatedLogoutIsRefused) {
+    startPipeline("ok");
+    agent_communication::auth::LogoutRequest lr;
+    agent_communication::auth::LogoutResponse lr_response;
+    grpc::ClientContext context;  // no authorization metadata
+    const auto status = user_stub_->Logout(&context, lr, &lr_response);
+    EXPECT_EQ(status.error_code(), grpc::StatusCode::UNAUTHENTICATED);
+}
+
+// P25 (批次十一): context_id entries carrying sanitize-lossy characters
+// (colons would fold into "_" and collide with legal keys) are refused
+// before any conversation row is touched.
+TEST_F(DurableQueryPipelineTest, UnsafeContextIdIsRefusedWithInvalidArgument) {
+    startPipeline("ok");
+    const auto user = registerUser("ctxguard");
+    const std::string evil = "evil:ctx:with:colons";
+    const std::string request_id = "dqp-ctxguard-" + uniqueSuffix();
+    auto request = makeRequest(request_id, evil);
+
+    agent_communication::AIQueryResponse response;
+    grpc::ClientContext context;
+    applyAuth(context, user);
+    const auto status = query_stub_->Query(&context, request, &response);
+    EXPECT_EQ(status.error_code(), grpc::StatusCode::INVALID_ARGUMENT);
+    EXPECT_EQ(countRows("conversations", "id", evil), 0);
+    EXPECT_EQ(countRows("query_logs", "id", request_id), 0);
+}
+
 // Requirement F.1: the request body cannot spoof the owner.
 TEST_F(DurableQueryPipelineTest, SpoofedBodyUserIdIsIgnoredAndOwnerIsAuthenticated) {
     startPipeline("ok");
@@ -1116,6 +1204,104 @@ private:
     std::string old_value_;
 };
 
+// P26 T3: HMAC-SHA256 (hex) — mirrors the auth interceptor's verification so
+// the trust-mode tests sign headers exactly like the gateway does.
+std::string testHmacSha256Hex(const std::string& secret,
+                              const std::string& data) {
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int digest_length = 0;
+    HMAC(EVP_sha256(), secret.data(), static_cast<int>(secret.size()),
+         reinterpret_cast<const unsigned char*>(data.data()), data.size(),
+         digest, &digest_length);
+    std::ostringstream output;
+    output << std::hex << std::setfill('0');
+    for (unsigned int index = 0; index < digest_length; ++index) {
+        output << std::setw(2) << static_cast<int>(digest[index]);
+    }
+    return output.str();
+}
+
+// P26 T3 (批次十一阶段③): trusted-proxy dual mode — HMAC-signed
+// x-nexusai-* headers authenticate the call and Logout revokes through the
+// injected token hash (the Bearer was consumed by the gateway).
+TEST_F(DurableQueryPipelineTest, TrustProxySignedHeadersAuthenticateAndRevoke) {
+    FastPathEnvGuard trust("NEXUSAI_TRUST_PROXY", "1");
+    FastPathEnvGuard secret("NEXUSAI_PROXY_HMAC_SECRET",
+                            "durable-test-proxy-secret-0123456789abcdef");
+    startPipeline("ok");
+    const auto user = registerUser("trustlogout");
+
+    const std::string token_hash =
+        server_ns::AuthServiceImpl::hashToken(user.token);
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const std::string exp = std::to_string(now + 60);
+    const std::string canonical = user.id + "|dqp-trust-logout|USER|" + exp +
+                                  "|" + token_hash;
+    const std::string signature = testHmacSha256Hex(
+        "durable-test-proxy-secret-0123456789abcdef", canonical);
+
+    grpc::ClientContext context;
+    context.AddMetadata("x-nexusai-user-id", user.id);
+    context.AddMetadata("x-nexusai-username", "dqp-trust-logout");
+    context.AddMetadata("x-nexusai-role", "USER");
+    context.AddMetadata("x-nexusai-exp", exp);
+    context.AddMetadata("x-nexusai-token-hash", token_hash);
+    context.AddMetadata("x-nexusai-signature", signature);
+
+    agent_communication::auth::LogoutRequest request;
+    agent_communication::auth::LogoutResponse response;
+    const auto status = user_stub_->Logout(&context, request, &response);
+    ASSERT_TRUE(status.ok()) << status.error_message();
+
+    // The session was revoked through the injected hash (Bearer never sent).
+    agent_communication::auth::ValidateTokenRequest vt;
+    vt.set_token(user.token);
+    agent_communication::auth::ValidateTokenResponse vr;
+    grpc::ClientContext validate_context;
+    ASSERT_TRUE(user_stub_->ValidateToken(&validate_context, vt, &vr).ok());
+    EXPECT_FALSE(vr.valid()) << "revoked via injected token hash";
+}
+
+// A forged signature next to a REAL bearer token must be refused WITHOUT
+// falling back to Bearer validation (otherwise smuggling a fake header next
+// to a stolen token would escalate or slip through the trust boundary).
+TEST_F(DurableQueryPipelineTest, TrustProxyForgedSignatureNeverFallsBackToBearer) {
+    FastPathEnvGuard trust("NEXUSAI_TRUST_PROXY", "1");
+    FastPathEnvGuard secret("NEXUSAI_PROXY_HMAC_SECRET",
+                            "durable-test-proxy-secret-0123456789abcdef");
+    startPipeline("ok");
+    const auto user = registerUser("trustforge");
+
+    const std::string token_hash =
+        server_ns::AuthServiceImpl::hashToken(user.token);
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
+    grpc::ClientContext context;
+    context.AddMetadata("authorization", "Bearer " + user.token);
+    context.AddMetadata("x-nexusai-user-id", user.id);
+    context.AddMetadata("x-nexusai-username", "dqp-trust-forge");
+    context.AddMetadata("x-nexusai-role", "ADMIN");  // escalation attempt
+    context.AddMetadata("x-nexusai-exp", std::to_string(now + 60));
+    context.AddMetadata("x-nexusai-token-hash", token_hash);
+    context.AddMetadata("x-nexusai-signature", std::string(64, '0'));
+
+    agent_communication::auth::LogoutRequest request;
+    agent_communication::auth::LogoutResponse response;
+    const auto status = user_stub_->Logout(&context, request, &response);
+    EXPECT_FALSE(status.ok());
+    EXPECT_EQ(status.error_code(), grpc::StatusCode::UNAUTHENTICATED);
+
+    // The session is untouched: the Bearer was NOT used as a fallback.
+    agent_communication::auth::ValidateTokenRequest vt;
+    vt.set_token(user.token);
+    agent_communication::auth::ValidateTokenResponse vr;
+    grpc::ClientContext validate_context;
+    ASSERT_TRUE(user_stub_->ValidateToken(&validate_context, vt, &vr).ok());
+    EXPECT_TRUE(vr.valid()) << "forged headers must not degrade to Bearer";
+}
+
 TEST(SingleIntentFastPathTest, MultiIntentDetectorVetoesParallelSignals) {
     using server_ns::MultiAgentHandler;
 
@@ -1193,6 +1379,231 @@ TEST(SingleIntentFastPathTest, LowConfidenceOrMultiIntentGoesToPlanning) {
     // Switch off (default state) → fast path never applies, even with a hit.
     FastPathEnvGuard off("NEXUSAI_SINGLE_INTENT_FAST_PATH", nullptr);
     EXPECT_FALSE(handler.tryBuildFastPathPlan("帮我翻译这段话成英文", plan));
+}
+
+// P26 T2 (批次十一阶段①): AuthCache logical-invalidation semantics against
+// real PostgreSQL + real Redis. AuthServiceImpl methods are driven directly
+// (no gRPC server / interceptor), so the ValidateToken RPC exercises the same
+// AuthCache::validateTokenCached path the interceptor uses on every RPC.
+class AuthCacheInvalidationTest : public ::testing::Test {
+protected:
+    static constexpr int kSessionTtlHours = 24;
+
+    std::unique_ptr<common_ns::PostgresStore> store_;
+    std::unique_ptr<server_ns::AuthServiceImpl> auth_;
+    common_ns::RedisClient redis_;
+    bool redis_available_ = false;
+    common_ns::RedisClient* previous_redis_ = nullptr;
+    std::string user_id_;
+    std::string token_;
+
+    void SetUp() override {
+        previous_redis_ = server_ns::AuthCache::redis();
+
+        try {
+            auto config = common_ns::PostgresConfig::fromEnvironment();
+            config.pool_size = 2;
+            store_ = std::make_unique<common_ns::PostgresStore>(std::move(config));
+            if (!store_->healthCheck()) {
+                store_.reset();
+            }
+        } catch (const std::exception&) {
+            store_.reset();
+        }
+        if (!store_) {
+            GTEST_SKIP() << "PostgreSQL test DSN is unavailable";
+        }
+        const std::string migration =
+            readFileOrEmpty(rootPath() + "/db/migrations/V010__local_auth.sql");
+        if (migration.empty()) {
+            GTEST_SKIP() << "V010__local_auth.sql unreadable";
+        }
+        try {
+            store_->executeTransaction([&migration](pqxx::work& transaction) {
+                transaction.exec(migration);
+            });
+        } catch (const std::exception&) {
+            GTEST_SKIP() << "V010 migration failed";
+        }
+        auth_ = std::make_unique<server_ns::AuthServiceImpl>(*store_);
+
+        redis_available_ = redis_.connect();
+        if (redis_available_) {
+            server_ns::AuthCache::setRedisClient(&redis_);
+        }
+
+        registerAndLogin();
+    }
+
+    void TearDown() override {
+        server_ns::AuthCache::setRedisClient(previous_redis_);
+    }
+
+    void registerAndLogin() {
+        const std::string username = "dqp-authcache-" + uniqueSuffix();
+        agent_communication::auth::RegisterRequest register_request;
+        register_request.set_username(username);
+        register_request.set_password("authcache-password");
+        agent_communication::auth::RegisterResponse register_response;
+        grpc::ServerContext register_context;
+        ASSERT_TRUE(auth_->Register(&register_context, &register_request,
+                                    &register_response)
+                        .ok());
+        user_id_ = register_response.user_id();
+        ASSERT_FALSE(user_id_.empty());
+
+        agent_communication::auth::LoginRequest login_request;
+        login_request.set_username(username);
+        login_request.set_password("authcache-password");
+        agent_communication::auth::LoginResponse login_response;
+        grpc::ServerContext login_context;
+        ASSERT_TRUE(auth_->Login(&login_context, &login_request, &login_response)
+                        .ok());
+        token_ = login_response.token();
+        ASSERT_FALSE(token_.empty());
+    }
+
+    bool callValidateToken(const std::string& token) {
+        agent_communication::auth::ValidateTokenRequest request;
+        request.set_token(token);
+        agent_communication::auth::ValidateTokenResponse response;
+        grpc::ServerContext context;
+        const auto status = auth_->ValidateToken(&context, &request, &response);
+        EXPECT_TRUE(status.ok()) << status.error_message();
+        return response.valid();
+    }
+
+    std::string tokenHash() const {
+        return server_ns::AuthServiceImpl::hashToken(token_);
+    }
+
+    // Session-cache payload ("" when the key is absent).
+    std::string cachedPayload() {
+        std::string payload;
+        if (!redis_.get(server_ns::AuthCache::sessionKey(tokenHash()), payload)) {
+            return {};
+        }
+        return payload;
+    }
+
+    void revokeSessionInPostgres() {
+        // token_hash is hex — safe to interpolate in a test UPDATE.
+        store_->executeTransaction([&](pqxx::work& transaction) {
+            transaction.exec(
+                "UPDATE auth_sessions SET revoked_at = NOW(), updated_at = NOW() "
+                "WHERE token_hash = '" + tokenHash() + "'");
+        });
+    }
+};
+
+TEST_F(AuthCacheInvalidationTest, RefillTtlEqualsTrueRemainingLifetime) {
+    if (!redis_available_) {
+        GTEST_SKIP() << "Redis not available";
+    }
+    ASSERT_TRUE(callValidateToken(token_));  // miss → PG → refill
+
+    const std::string payload_text = cachedPayload();
+    ASSERT_FALSE(payload_text.empty()) << "session cache must be refilled";
+    const auto payload = nlohmann::json::parse(payload_text);
+    EXPECT_EQ(payload.value("user_id", ""), user_id_);
+    EXPECT_EQ(payload.value<std::int64_t>("epoch", -1), 0);  // no INCR ever fired
+
+    const std::int64_t payload_expires =
+        payload.value<std::int64_t>("expires_at", 0);
+    const auto now_epoch = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const std::int64_t full_ttl = kSessionTtlHours * 3600;
+    EXPECT_GT(payload_expires, now_epoch + full_ttl - 10);
+    EXPECT_LT(payload_expires, now_epoch + full_ttl + 10);
+
+    // The key TTL is the session's true remaining lifetime (±2s between
+    // refill and this read) — never the old fixed 300s approximation.
+    std::int64_t key_ttl = 0;
+    ASSERT_TRUE(redis_.ttl(server_ns::AuthCache::sessionKey(tokenHash()), key_ttl));
+    EXPECT_GT(key_ttl, full_ttl - 12);
+    EXPECT_LT(key_ttl, full_ttl + 2);
+}
+
+TEST_F(AuthCacheInvalidationTest, DenyMarkerOverridesExistingCacheEntry) {
+    if (!redis_available_) {
+        GTEST_SKIP() << "Redis not available";
+    }
+    ASSERT_TRUE(callValidateToken(token_));
+    ASSERT_FALSE(cachedPayload().empty());
+
+    // Session-level revocation bus fires (Logout will be the producer;
+    // this test arms the marker directly): deny must refuse even while the
+    // stale cache entry is still present.
+    EXPECT_TRUE(redis_.setex(server_ns::AuthCache::denyKey(tokenHash()), 60, "1"));
+    EXPECT_FALSE(callValidateToken(token_)) << "deny hit must refuse";
+
+    // The entry was not deleted — the deny marker (not deletion) refuses.
+    ASSERT_FALSE(cachedPayload().empty());
+
+    // Marker expires → the session is served again (PG never revoked it).
+    EXPECT_TRUE(redis_.del(server_ns::AuthCache::denyKey(tokenHash())));
+    EXPECT_TRUE(callValidateToken(token_));
+}
+
+TEST_F(AuthCacheInvalidationTest, EpochIncrementInvalidatesStaleEntryAndRefills) {
+    if (!redis_available_) {
+        GTEST_SKIP() << "Redis not available";
+    }
+    ASSERT_TRUE(callValidateToken(token_));
+    ASSERT_EQ(nlohmann::json::parse(cachedPayload())
+                  .value<std::int64_t>("epoch", -1),
+              0);
+
+    // User-level revocation bus fires (ban/demote/change-password path — no
+    // production RPC yet; simulated like a DBA maintenance step).
+    std::int64_t incremented = 0;
+    ASSERT_TRUE(redis_.incrby(server_ns::AuthCache::epochKey(user_id_), 1,
+                              incremented));
+    ASSERT_EQ(incremented, 1);
+
+    // Stale entry (epoch 0) no longer matches → PG re-validation, which
+    // still accepts the session → refill with the new epoch.
+    EXPECT_TRUE(callValidateToken(token_));
+    EXPECT_EQ(nlohmann::json::parse(cachedPayload())
+                  .value<std::int64_t>("epoch", -1),
+              1);
+}
+
+TEST_F(AuthCacheInvalidationTest, RevokedSessionNeverResurrectsAfterRevokePlusEpoch) {
+    if (!redis_available_) {
+        GTEST_SKIP() << "Redis not available";
+    }
+    ASSERT_TRUE(callValidateToken(token_));
+    ASSERT_FALSE(cachedPayload().empty());
+
+    // DBA-style revocation: PG revoke + INCR epoch (documented operator
+    // constraint). The stale entry is refused by the epoch mismatch and the
+    // re-validation hits PG's revoked_at — invalid forever (no negative
+    // cache: every call re-asks PG, and PG is the final judge).
+    revokeSessionInPostgres();
+    std::int64_t incremented = 0;
+    ASSERT_TRUE(redis_.incrby(server_ns::AuthCache::epochKey(user_id_), 1,
+                              incremented));
+    ASSERT_EQ(incremented, 1);
+
+    EXPECT_FALSE(callValidateToken(token_));
+    EXPECT_FALSE(callValidateToken(token_));
+    ASSERT_FALSE(cachedPayload().empty());  // stale entry stays, always refused
+}
+
+TEST_F(AuthCacheInvalidationTest, RedisUnavailableDegradesToPostgres) {
+    // Simulate Redis down: every call is the authoritative PG JOIN check
+    // (fail-safe, only the allowed false-negative/refusal direction).
+    server_ns::AuthCache::setRedisClient(nullptr);
+    EXPECT_TRUE(callValidateToken(token_));
+
+    revokeSessionInPostgres();
+    EXPECT_FALSE(callValidateToken(token_));
+    EXPECT_FALSE(callValidateToken(token_));  // never resurrects after revoke
+
+    if (redis_available_) {
+        server_ns::AuthCache::setRedisClient(&redis_);
+    }
 }
 #endif  // !_WIN32
 

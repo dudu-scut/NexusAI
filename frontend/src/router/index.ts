@@ -82,7 +82,9 @@ router.beforeEach((to) => {
 
   const auth = useAuthStore()
   if (!auth.isAuthenticated) {
-    if (auth.token) auth.logout()
+    // Passive cleanup: the token is expired/missing, so no Logout RPC is
+    // sent (nothing to revoke server-side).
+    if (auth.token) auth._clearLocalOnly()
     return { name: 'login' }
   }
   // Client-side admin gate is a UX nicety only — the server enforces

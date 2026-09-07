@@ -333,9 +333,18 @@ TEST_F(LeastResponseTimeAdvancedTest, ResponseTimeUpdateChangesSelection) {
     auto ep1 = lb.selectEndpoint(endpoints);
     EXPECT_EQ(endpointId(ep1), "10.0.0.1:8080");
 
-    // Update: make endpoint 2 faster
+    // P8 S1 (EMA α=0.1): a single fast sample must NOT flip the selection
+    // (that was the latest-sample oscillation this change removes). Sustained
+    // improvement converges the EMA below the leader — feed 5ms 30 times
+    // (100·0.9^30 + 5·(1−0.9^30) ≈ 7.7 < 10) and the pick flips.
     lb.updateResponseTime("10.0.0.2:8080", std::chrono::milliseconds(5));
+    auto stable = lb.selectEndpoint(endpoints);
+    EXPECT_EQ(endpointId(stable), "10.0.0.1:8080")
+        << "one fast sample must not flip an EMA-smoothed selection";
 
+    for (int i = 0; i < 30; ++i) {
+        lb.updateResponseTime("10.0.0.2:8080", std::chrono::milliseconds(5));
+    }
     auto ep2 = lb.selectEndpoint(endpoints);
     EXPECT_EQ(endpointId(ep2), "10.0.0.2:8080");
 }
@@ -383,6 +392,24 @@ TEST_F(LeastResponseTimeAdvancedTest, ExponentialMovingAverageSmooths) {
     EXPECT_EQ(endpointId(ep), "10.0.0.1:8080");
 }
 
+// P8 S1: EMA (α=0.1) must resist a single outlier that a latest-sample
+// strategy would latch onto: a=100→1000 (EMA 100→190) vs b=200 (seed).
+// Latest sampling would pick b (1000 > 200); EMA keeps a (190 < 200).
+TEST_F(LeastResponseTimeAdvancedTest, EmaResistsSingleOutlierInsteadOfLatestSample) {
+    std::vector<common::ServiceEndpoint> endpoints = {
+        makeEndpoint("10.0.0.1", 8080),
+        makeEndpoint("10.0.0.2", 8080),
+    };
+
+    lb.updateResponseTime("10.0.0.1:8080", std::chrono::milliseconds(100));
+    lb.updateResponseTime("10.0.0.1:8080", std::chrono::milliseconds(1000));
+    lb.updateResponseTime("10.0.0.2:8080", std::chrono::milliseconds(200));
+
+    const auto ep = lb.selectEndpoint(endpoints);
+    EXPECT_EQ(endpointId(ep), "10.0.0.1:8080")
+        << "EMA (190) stays below the seeded 200; latest-sample (1000) would lose";
+}
+
 // LoadBalancerManager (setStrategy) tests
 
 class LoadBalancerManagerTest : public ::testing::Test {
@@ -392,6 +419,20 @@ protected:
         makeEndpoint("10.0.0.2", 8080)
     };
 };
+
+// P8 S2: the manager forwards latency feeds to the active strategy
+// (LoadBalancer virtual-channel surface used by AgentRouter).
+TEST_F(LoadBalancerManagerTest, ManagerRecordResponseTimeFeedsActiveStrategy) {
+    common::LoadBalancerManager manager(
+        common::LoadBalanceStrategy::LEAST_RESPONSE_TIME);
+
+    manager.updateEndpoints(endpoints);
+    manager.recordResponseTime("10.0.0.1:8080", std::chrono::milliseconds(400));
+    manager.recordResponseTime("10.0.0.2:8080", std::chrono::milliseconds(40));
+
+    const auto ep = manager.selectEndpoint(endpoints);
+    EXPECT_EQ(endpointId(ep), "10.0.0.2:8080");
+}
 
 TEST_F(LoadBalancerManagerTest, DefaultStrategyIsRoundRobin) {
     common::LoadBalancerManager manager;

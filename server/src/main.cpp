@@ -17,9 +17,6 @@
 #include "agent_rpc/common/env_loader.h"
 #include "agent_rpc/common/background_scheduler.h"
 #include "agent_rpc/orchestrator/feedback_aggregator.h"
-#ifdef AGENT_RPC_ENABLE_MCP
-#include "agent_rpc/mcp/rag/semantic_cache_index.h"
-#endif
 #include "agent_rpc/common/profile_summarizer.h"
 #include "agent_rpc/common/trace_context.h"
 #include "agent_rpc/common/redis_client.h"
@@ -350,17 +347,6 @@ int main(int argc, char* argv[]) {
         []() { agent_rpc::orchestrator::FeedbackAggregator::recalculateMetrics(); },
         std::chrono::seconds(3600));
 
-#ifdef AGENT_RPC_ENABLE_MCP
-    // Register semantic cache cleanup task (every 10 minutes)
-    // The SemanticCacheIndex instance should be shared from wherever it is owned
-    // (e.g., held by the MCP module or AIQueryService).  At startup the shared_ptr
-    // is null, so the lambda is a safe no-op until the cache is wired up.
-    static std::shared_ptr<agent_rpc::mcp::SemanticCacheIndex> semantic_cache;
-    agent_rpc::common::BackgroundScheduler::instance().scheduleAtFixedRate(
-        "cache_cleanup",
-        []() { if (semantic_cache) semantic_cache->cleanup(); },
-        std::chrono::seconds(600));
-#endif
 
     // Register profile extraction task (every 5 minutes)
     // Calls ProfileSummarizer::processPending(), which performs real work

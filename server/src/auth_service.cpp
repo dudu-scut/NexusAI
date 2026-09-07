@@ -1,4 +1,6 @@
 #include "agent_rpc/server/auth_service.h"
+#include "agent_rpc/server/auth_cache.h"
+#include "agent_rpc/server/auth_interceptor.h"
 
 #include "agent_rpc/common/logger.h"
 
@@ -296,14 +298,16 @@ grpc::Status AuthServiceImpl::ValidateToken(
     std::string user_id;
     std::string username;
     std::string role;
-    bool valid = false;
-    try {
-        valid = validateTokenInternal(request->token(), user_id, username, role);
-    } catch (const std::exception& error) {
-        LOG_ERROR("Failed to validate token: " + std::string(error.what()));
+    std::int64_t expires_at = 0;
+    // P26 T2: shared cache read-modify-write (deny hit → cache + epoch
+    // match → PG refill) — the same code path the auth interceptor uses.
+    const AuthValidationResult outcome = AuthCache::validateTokenCached(
+        *this, request->token(), user_id, username, role, expires_at);
+    if (outcome == AuthValidationResult::kUnavailable) {
         return unavailable(response, "PostgreSQL is unavailable");
     }
 
+    const bool valid = outcome == AuthValidationResult::kValid;
     response->set_valid(valid);
     if (valid) {
         response->mutable_status()->set_code(0);
@@ -318,28 +322,108 @@ grpc::Status AuthServiceImpl::ValidateToken(
     return grpc::Status::OK;
 }
 
-bool AuthServiceImpl::validateToken(const std::string& token,
-                                    std::string& user_id,
-                                    std::string& username,
-                                    std::string& role) {
+grpc::Status AuthServiceImpl::Logout(
+    grpc::ServerContext* context,
+    const agent_communication::auth::LogoutRequest* request,
+    agent_communication::auth::LogoutResponse* response) {
+    (void)request;
+    if (context == nullptr || response == nullptr) {
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                            "Request and response are required");
+    }
+    // Protected endpoint (never whitelisted): the interceptor already
+    // validated the caller, but a handler must never assume the gate ran
+    // (defence in depth for direct/local callers).
+    if (!AuthInterceptor::isAuthenticated()) {
+        return grpc::Status(grpc::StatusCode::UNAUTHENTICATED,
+                            "Valid authentication token required");
+    }
+
+    // The session token comes from the same authorization metadata the
+    // interceptor validated — never from the body.
+    // P26 T3: under trust mode the gateway consumed the Bearer and injected
+    // x-nexusai-token-hash (HMAC-signed, stored on the TLS context by the
+    // interceptor); the legacy Bearer path stays as the fallback.
+    std::string token_hash = AuthInterceptor::currentTokenHash();
+    if (token_hash.empty()) {
+        const std::string token =
+            AuthInterceptor::extractBearerToken(context->client_metadata());
+        if (token.empty()) {
+            return grpc::Status(grpc::StatusCode::UNAUTHENTICATED,
+                                "Valid authentication token required");
+        }
+        token_hash = hashToken(token);
+    }
+
+    // P26 T2: cache-side revocation first (DEL + short deny marker) — even
+    // if PostgreSQL is momentarily unavailable the session is refused on the
+    // cache layer; the PG revoke below stays authoritative.
+    AuthCache::markRevoked(token_hash);
+
+    // P22: idempotent PG revocation. A second logout finds no active session
+    // (revoked_at already set) and still answers OK — the goal state "this
+    // session is revoked" is already reached.
     try {
-        return validateTokenInternal(token, user_id, username, role);
+        if (repository_ != nullptr) {
+            const auto session =
+                repository_->findActiveSessionByTokenHash(token_hash);
+            if (session.has_value()) {
+                repository_->revokeSession(session->id);
+            }
+        }
+    } catch (const std::exception& error) {
+        LOG_ERROR("Failed to revoke session: " + std::string(error.what()));
+        return unavailable(response, "PostgreSQL is unavailable");
+    }
+
+    response->mutable_status()->set_code(0);
+    response->mutable_status()->set_message("Logged out");
+    return grpc::Status::OK;
+}
+
+std::string AuthServiceImpl::resolveRoleByUserId(const std::string& user_id) {
+    try {
+        if (repository_ == nullptr || user_id.empty()) {
+            return {};
+        }
+        const auto user = repository_->findUserById(user_id);
+        return user ? user->role : std::string{};
+    } catch (const std::exception& error) {
+        LOG_WARN("Role resolution unavailable: " + std::string(error.what()));
+        return {};
+    }
+}
+
+AuthValidationResult AuthServiceImpl::validateTokenWithStatus(
+    const std::string& token,
+    std::string& user_id,
+    std::string& username,
+    std::string& role,
+    std::int64_t& expires_at) {
+    try {
+        if (validateTokenInternal(token, user_id, username, role, expires_at)) {
+            return AuthValidationResult::kValid;
+        }
+        return AuthValidationResult::kInvalid;
     } catch (const std::exception& error) {
         LOG_WARN("Token validation unavailable: " + std::string(error.what()));
         user_id.clear();
         username.clear();
         role.clear();
-        return false;
+        expires_at = 0;
+        return AuthValidationResult::kUnavailable;
     }
 }
 
 bool AuthServiceImpl::validateTokenInternal(const std::string& token,
                                             std::string& user_id,
                                             std::string& username,
-                                            std::string& role) {
+                                            std::string& role,
+                                            std::int64_t& expires_at) {
     user_id.clear();
     username.clear();
     role.clear();
+    expires_at = 0;
     if (repository_ == nullptr || token.size() != kTokenHexLength ||
         !std::all_of(token.begin(), token.end(), [](const unsigned char character) {
             return std::isxdigit(character) != 0;
@@ -358,6 +442,9 @@ bool AuthServiceImpl::validateTokenInternal(const std::string& token,
     user_id = session_with_user->user_id;
     username = session_with_user->username;
     role = session_with_user->role;
+    // P26 T2: surface the session's real expiry so the auth cache TTL equals
+    // the remaining lifetime instead of a fixed approximation.
+    expires_at = session_with_user->expires_epoch;
     return true;
 }
 

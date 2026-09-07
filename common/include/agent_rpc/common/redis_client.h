@@ -41,6 +41,16 @@ public:
     bool del(const std::string& key);
     bool exists(const std::string& key);
 
+    /**
+     * Atomically fetch several keys in one round-trip (MGET).
+     * Returns true when the command succeeded; a missing key yields an
+     * empty value at its index (callers must not treat "" as an error).
+     * P26 T2: the auth cache check reads deny + session in a single
+     * round-trip, then compares the epoch key on a hit.
+     */
+    bool mget(const std::vector<std::string>& keys,
+              std::vector<std::string>& values);
+
     /** Set key with TTL in seconds. */
     bool setex(const std::string& key, int ttl_seconds, const std::string& value);
 
@@ -87,6 +97,13 @@ public:
 
     /** Set TTL on a key (seconds). */
     bool expire(const std::string& key, int seconds);
+
+    /**
+     * Remaining TTL of a key in seconds. Returns false on command failure;
+     * on success seconds is < 0 for a missing or TTL-less key (Redis
+     * semantics: -2 missing, -1 no expiry).
+     */
+    bool ttl(const std::string& key, std::int64_t& seconds);
 
     /** Atomically increment key by increment. Returns the new value via result. */
     bool incrby(const std::string& key, int64_t increment, int64_t& result);

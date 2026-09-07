@@ -31,9 +31,10 @@ target_compile_definitions(rpc_server PRIVATE
     NEXUSAI_MIGRATIONS_DEFAULT_DIR="${NEXUSAI_MIGRATIONS_DEFAULT_DIR_FOR_COMPILE}"
 )
 if(ENABLE_MCP)
-    target_include_directories(rpc_server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../mcp/include)
-    target_compile_definitions(rpc_server PRIVATE AGENT_RPC_ENABLE_MCP=1)
-    target_compile_definitions(agent_rpc_server PRIVATE AGENT_RPC_ENABLE_MCP=1)
+    # P7 (批次十一): AgentRouter and the server no longer reference MCP
+    # headers or the AGENT_RPC_ENABLE_MCP layout macro (the vector tier now
+    # lives in agent_rpc_common), so nothing MCP-specific is compiled here.
+    # agent_rpc_mcp remains available for MCP-side tests/tools.
 endif()
 
 target_link_libraries(rpc_server

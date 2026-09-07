@@ -19,6 +19,8 @@ import type {
   RegisterResponse,
   LoginRequest,
   LoginResponse,
+  LogoutRequest,
+  LogoutResponse,
   GetTraceDetailResponse,
   GetCostReportResponse,
   ReplayQueryRequest,
@@ -82,11 +84,12 @@ async function unaryCall<TReq, TRes>(
   servicePath: string,
   method: string,
   request: TReq,
+  tokenOverride?: string,
 ): Promise<TRes> {
   const url = `${BASE_URL}${servicePath}/${method}`
 
   const headers: Record<string, string> = { 'Content-Type': 'application/json' }
-  const token = _getAuthToken?.()
+  const token = tokenOverride || _getAuthToken?.()
   if (token) {
     headers['Authorization'] = `Bearer ${token}`
   }
@@ -343,6 +346,15 @@ export async function login(
 ): Promise<LoginResponse> {
   const req: LoginRequest = { username, password }
   return unaryCall<LoginRequest, LoginResponse>(USER_AUTH, 'Login', req)
+}
+
+/**
+ * Revoke the calling session (logout). The caller passes its token snapshot
+ * because the auth store clears local state before/while the RPC is in
+ * flight — the default token getter would already be null.
+ */
+export async function logout(tokenSnapshot: string): Promise<LogoutResponse> {
+  return unaryCall<LogoutRequest, LogoutResponse>(USER_AUTH, 'Logout', {}, tokenSnapshot)
 }
 
 // ObservabilityService

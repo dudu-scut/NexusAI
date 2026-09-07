@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
-import { login as apiLogin, register as apiRegister, setAuthTokenGetter, setOnUnauthorized } from '../services/grpc-client'
+import { login as apiLogin, register as apiRegister, logout as apiLogout, setAuthTokenGetter, setOnUnauthorized } from '../services/grpc-client'
 import { useChatStore } from './chat'
 import { useAgentsStore } from './agents'
 
@@ -74,6 +74,31 @@ export const useAuthStore = defineStore('auth', () => {
     localStorage.removeItem(AUTH_STORAGE_KEY)
   }
 
+  // Passive logout (401 response / expiry poll / route guard): local cleanup
+  // ONLY — the token is already invalid/expired, so there is nothing to
+  // revoke server-side and no RPC is sent.
+  function _clearLocalOnly() {
+    clearAuth()
+    useChatStore().newConversation()
+    useAgentsStore().stopPolling()
+  }
+
+  // Manual logout (user clicked logout): local cleanup + a best-effort
+  // Logout RPC that revokes the server-side session (PG revoke + cache DEL
+  // + deny marker). Fire-and-forget: local state is cleared first, so an
+  // RPC failure must never block or delay logout — the server session dies
+  // via its own 24h TTL if the revoke never lands.
+  function logout() {
+    const tokenSnapshot = token.value
+    _clearLocalOnly()
+    if (tokenSnapshot) {
+      apiLogout(tokenSnapshot).catch(() => {
+        // Failure is silent by design: local state is already cleared and
+        // the server TTL is the fallback.
+      })
+    }
+  }
+
   async function login(user: string, pass: string): Promise<string | null> {
     try {
       const resp = await apiLogin(user, pass)
@@ -99,26 +124,22 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
 
-  function logout() {
-    clearAuth()
-    useChatStore().newConversation()
-    useAgentsStore().stopPolling()
-  }
-
   // Wire token getter so all gRPC calls include auth header
   setAuthTokenGetter(() => token.value)
 
-  // Wire unauthorized callback so 401 responses trigger logout
-  // Only fire when user actually had a session (prevents 401 during login triggering logout)
+  // Wire unauthorized callback so 401 responses trigger a LOCAL logout
+  // (passive): the server already refused the token, so there is nothing to
+  // revoke. Only fire when the user actually had a session (prevents 401
+  // during login triggering logout).
   setOnUnauthorized(() => {
-    if (token.value) logout()
+    if (token.value) _clearLocalOnly()
   })
 
   // Periodic token expiry check — proactively logout when token expires
   // (Date.now() in computed isn't time-reactive, so we poll)
   _expiryCheckFn = () => {
     if (token.value && Date.now() > expiresAt.value) {
-      logout()
+      _clearLocalOnly()
     }
   }
   if (!_expiryTimer) {
@@ -135,5 +156,6 @@ export const useAuthStore = defineStore('auth', () => {
     login,
     register,
     logout,
+    _clearLocalOnly,
   }
 })

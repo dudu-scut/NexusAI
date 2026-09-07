@@ -238,6 +238,16 @@ export interface ValidateTokenResponse {
   role: string                    // USER | ADMIN
 }
 
+// LogoutRequest is intentionally empty: the session token rides the
+// authorization metadata (protected endpoint, never whitelisted).
+export interface LogoutRequest {
+  // no fields — mirrors user.proto LogoutRequest
+}
+
+export interface LogoutResponse {
+  status: Status
+}
+
 // Sharing & Templates (sharing.proto)
 
 export interface ShareSessionRequest {

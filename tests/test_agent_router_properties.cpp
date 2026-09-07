@@ -633,17 +633,13 @@ TEST(AgentRouterEmbeddingGateTest, DisabledEmbeddingKeepsBaselineBehavior) {
     EXPECT_TRUE(router.getAgent("math-agent").has_value());
     EXPECT_EQ(router.getHealthyAgentCount(), 1u);
 
-    // An enabled request in the default (non-MCP) build is refused by the
-    // stub and routing keeps its baseline behavior; in MCP builds the call
-    // may succeed or degrade, but skill lookup must keep working either way.
+    // P7 (批次十一): the tier is real in EVERY build now (vector blocks live
+    // in agent_rpc_common); an enabled request may succeed or degrade on
+    // embedding availability, but skill lookup must keep working either way.
     EmbeddingRouterConfig on_config;
     on_config.enabled = true;
     on_config.api_key = "test-key";
-#ifndef AGENT_RPC_ENABLE_MCP
-    EXPECT_FALSE(router.enableEmbedding(on_config));
-#else
     (void)router.enableEmbedding(on_config);
-#endif
     EXPECT_TRUE(router.getAgent("math-agent").has_value());
     EXPECT_EQ(router.getHealthyAgentCount(), 1u);
 }

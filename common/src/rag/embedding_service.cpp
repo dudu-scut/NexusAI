@@ -3,7 +3,7 @@
  * @brief EmbeddingService implementation (OpenAI-compatible API)
  */
 
-#include "agent_rpc/mcp/rag/embedding_service.h"
+#include "agent_rpc/common/rag/embedding_service.h"
 #include "agent_rpc/common/logger.h"
 
 #include <curl/curl.h>
@@ -17,7 +17,7 @@
 using json = nlohmann::json;
 
 namespace agent_rpc {
-namespace mcp {
+namespace common {
 namespace rag {
 
 bool EmbeddingConfig::loadApiKeyFromEnv() {
@@ -278,5 +278,5 @@ std::vector<std::vector<float>> EmbeddingService::parseEmbeddingResponse(
 }
 
 } // namespace rag
-} // namespace mcp
+} // namespace common
 } // namespace agent_rpc

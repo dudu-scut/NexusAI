@@ -7,12 +7,10 @@
 #include "agent_rpc/common/redis_client.h"
 #include "agent_rpc/common/load_balancer.h"
 #include "agent_rpc/common/logger.h"
-#ifdef AGENT_RPC_ENABLE_MCP
-#include <agent_rpc/mcp/rag/embedding_service.h>
-#include <agent_rpc/mcp/rag/vector_index.h>
-#include <agent_rpc/mcp/rag/embedding_cache.h>
-#include <agent_rpc/mcp/rag/semantic_cache_index.h>
-#endif
+#include <agent_rpc/common/rag/embedding_service.h>
+#include <agent_rpc/common/rag/vector_index.h>
+#include <agent_rpc/common/rag/embedding_cache.h>
+#include <agent_rpc/common/rag/semantic_cache_index.h>
 #include <a2a/llm_client.hpp>
 #include <algorithm>
 #include <cctype>
@@ -383,7 +381,6 @@ void AgentRouter::updateAgentList(const std::vector<AgentInfo>& agents) {
     // carries the skill); invalidate the old skill set plus every known new
     // skill because the skill set just changed wholesale. (MCP-only member —
     // no-op otherwise.)
-#ifdef AGENT_RPC_ENABLE_MCP
     if (intent_cache_) {
         for (const auto& skill : old_skills) {
             intent_cache_->invalidateAgent(skill);
@@ -395,7 +392,6 @@ void AgentRouter::updateAgentList(const std::vector<AgentInfo>& agents) {
             }
         }
     }
-#endif
 }
 
 void AgentRouter::addAgent(const AgentInfo& agent) {
@@ -403,13 +399,11 @@ void AgentRouter::addAgent(const AgentInfo& agent) {
     agents_[agent.id] = agent;
     rebuildSkillKeywordIndex();
     // P10(c): an agent's skill set may have changed — drop intents per skill.
-#ifdef AGENT_RPC_ENABLE_MCP
     if (intent_cache_) {
         for (const auto& skill : agent.skills) {
             intent_cache_->invalidateAgent(skill);
         }
     }
-#endif
 }
 
 bool AgentRouter::removeAgent(const std::string& agent_id) {
@@ -424,13 +418,11 @@ bool AgentRouter::removeAgent(const std::string& agent_id) {
         rebuildSkillKeywordIndex();
         // P10(c): intents cached for the removed agent's skills must not be
         // reused.
-#ifdef AGENT_RPC_ENABLE_MCP
         if (intent_cache_) {
             for (const auto& skill : removed_skills) {
                 intent_cache_->invalidateAgent(skill);
             }
         }
-#endif
     }
     return removed;
 }
@@ -815,12 +807,13 @@ namespace {
 // load-balance strategy enum. Unknown values yield nullopt; the caller logs
 // once and keeps the switch disabled (legacy routing).
 //
-// least_connections and shortest_response are intentionally NOT offered on
-// the server side: routing has no request-completion hook to release a
-// connection and no response-time data source, so those two strategies could
-// never behave as advertised here (their counters/stats stay empty and every
-// pick degrades to "first candidate"). The library implementations remain
-// available for the client SDK, which owns its connection lifecycle.
+// least_connections is intentionally NOT offered on the server side:
+// routing has no request-completion hook to release a connection, so its
+// counter stays empty and every pick degrades to "first candidate".
+// shortest_response IS offered (P8 S3): the feed channel
+// (recordEndpointLatency → LeastResponseTime EMA) now provides the missing
+// latency source — see the EMA feed below. The library implementations
+// remain available for the client SDK, which owns its connection lifecycle.
 std::optional<agent_rpc::common::LoadBalanceStrategy> parseLbStrategyName(
     const std::string& raw) {
     using agent_rpc::common::LoadBalanceStrategy;
@@ -828,10 +821,28 @@ std::optional<agent_rpc::common::LoadBalanceStrategy> parseLbStrategyName(
     if (raw == "random") return LoadBalanceStrategy::RANDOM;
     if (raw == "weighted_round_robin") return LoadBalanceStrategy::WEIGHTED_ROUND_ROBIN;
     if (raw == "consistent_hash") return LoadBalanceStrategy::CONSISTENT_HASH;
+    if (raw == "shortest_response") return LoadBalanceStrategy::LEAST_RESPONSE_TIME;
     return std::nullopt;
 }
 
 } // namespace
+
+void AgentRouter::recordEndpointLatency(const std::string& agent_id,
+                                        double latency_ms) {
+    if (agent_id.empty()) {
+        return;
+    }
+    ensureLbInitialized();
+    std::lock_guard<std::mutex> lock(lb_fingerprint_mutex_);
+    if (lb_manager_ == nullptr) {
+        return;  // switch off: no load-balancer tier to feed
+    }
+    // selectViaLoadBalancer() encodes every endpoint as host=agent_id /
+    // port=0; LeastResponseTime keys its stats on host:port, so the feed
+    // must use the identical encoding or the latency never matches a pick.
+    lb_manager_->recordResponseTime(
+        agent_id + ":0", std::chrono::milliseconds(static_cast<std::int64_t>(latency_ms)));
+}
 
 void AgentRouter::ensureLbInitialized() {
     std::call_once(lb_init_flag_, [this]() {
@@ -1076,7 +1087,6 @@ std::string AgentRouter::analyzeIntentWithLLM(const std::string& question) {
     return {};  // LLM returned a skill that's not registered
 }
 
-#ifdef AGENT_RPC_ENABLE_MCP
 bool AgentRouter::enableEmbedding(const EmbeddingRouterConfig& config) {
     // Step 1: Initialize/deinit embedding service under embedding_mutex_ only.
     // This avoids holding embedding_mutex_ while later acquiring agents_mutex_,
@@ -1095,14 +1105,14 @@ bool AgentRouter::enableEmbedding(const EmbeddingRouterConfig& config) {
         }
 
         try {
-            agent_rpc::mcp::rag::EmbeddingConfig emb_config;
+            agent_rpc::common::rag::EmbeddingConfig emb_config;
             emb_config.api_key = config.api_key;
             emb_config.model = config.model;
             emb_config.dimension = config.dimension;
             emb_config.api_url = config.api_url;
 
-            embedding_service_ = std::make_unique<agent_rpc::mcp::rag::EmbeddingService>(emb_config);
-            skill_index_ = std::make_unique<agent_rpc::mcp::rag::VectorIndex>();
+            embedding_service_ = std::make_unique<agent_rpc::common::rag::EmbeddingService>(emb_config);
+            skill_index_ = std::make_unique<agent_rpc::common::rag::VectorIndex>();
             skill_index_->setVersion(config.model);
 
             // P10(c): intent cache (NEXUSAI_INTENT_CACHE=1, default off).
@@ -1112,16 +1122,16 @@ bool AgentRouter::enableEmbedding(const EmbeddingRouterConfig& config) {
             // cleaned before each store (bounded entry count keeps the
             // scan cheap).
             if (agent_rpc::common::envOrDefault("NEXUSAI_INTENT_CACHE", "0") == "1") {
-                intent_cache_ = std::make_unique<agent_rpc::mcp::SemanticCacheIndex>(
+                intent_cache_ = std::make_unique<agent_rpc::common::rag::SemanticCacheIndex>(
                     embedding_service_.get());
             } else {
                 intent_cache_.reset();
             }
 
-            agent_rpc::mcp::rag::CacheConfig cache_config;
+            agent_rpc::common::rag::CacheConfig cache_config;
             cache_config.max_size = 500;
             cache_config.ttl_seconds = 3600;
-            embedding_cache_ = std::make_unique<agent_rpc::mcp::rag::EmbeddingCache>(cache_config);
+            embedding_cache_ = std::make_unique<agent_rpc::common::rag::EmbeddingCache>(cache_config);
 
         } catch (const std::exception&) {
             embedding_service_.reset();
@@ -1210,7 +1220,7 @@ void AgentRouter::buildSkillEmbeddingIndex() {
             }
 
             // Store in vector index (reuse IndexedTool with skill data)
-            agent_rpc::mcp::rag::IndexedTool tool;
+            agent_rpc::common::rag::IndexedTool tool;
             tool.name = skill;
             tool.description = (desc_it != agent.skill_descriptions.end()) ? desc_it->second : "";
             tool.embedding = std::move(embedding);
@@ -1317,40 +1327,10 @@ AgentRouter::resolveHighConfidenceSkill(const std::string& question) {
     return std::nullopt;
 }
 
-#else
-bool AgentRouter::enableEmbedding(const EmbeddingRouterConfig& config) {
-    std::lock_guard<std::mutex> lock(embedding_mutex_);
-    embedding_config_ = config;
-    embedding_config_.enabled = false;
-    return !config.enabled;
-}
-
-bool AgentRouter::isEmbeddingEnabled() const { return false; }
-
-void AgentRouter::buildSkillEmbeddingIndex() {}
-
-std::string AgentRouter::analyzeRequiredSkillEmbedding(const std::string&,
-                                                       std::vector<float>*,
-                                                       double*) { return {}; }
-
-void AgentRouter::storeIntentCache(const std::vector<float>&,
-                                   const std::string&) {}
-
-std::optional<std::pair<std::string, double>>
-AgentRouter::searchBestSkillEmbeddingLocked(const std::string&) { return std::nullopt; }
-
-std::optional<std::pair<std::string, double>>
-AgentRouter::searchBestSkillEmbeddingLockedWithVector(
-    const std::vector<float>&) { return std::nullopt; }
-
-std::optional<AgentRouter::HighConfidenceSkill>
-AgentRouter::resolveHighConfidenceSkill(const std::string&) { return std::nullopt; }
-#endif
 
 std::vector<std::pair<std::string, double>> AgentRouter::rankSkillsBySimilarity(
     const std::string& question, int top_k, float threshold) {
     std::vector<std::pair<std::string, double>> ranked;
-#ifdef AGENT_RPC_ENABLE_MCP
     if (!isEmbeddingEnabled() || top_k <= 0) {
         return ranked;
     }
@@ -1380,11 +1360,6 @@ std::vector<std::pair<std::string, double>> AgentRouter::rankSkillsBySimilarity(
         std::sort(ranked.begin(), ranked.end(),
                   [](const auto& a, const auto& b) { return a.second > b.second; });
     }
-#else
-    (void)question;
-    (void)top_k;
-    (void)threshold;
-#endif
     return ranked;
 }
 

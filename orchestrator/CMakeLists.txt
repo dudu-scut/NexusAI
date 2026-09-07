@@ -53,13 +53,10 @@ target_link_libraries(orchestrator
 
 
 if(ENABLE_MCP)
-    target_include_directories(orchestrator PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/../mcp/include
-    )
-    target_link_libraries(orchestrator PUBLIC agent_rpc_mcp)
-    # P20 遗留 ODR 根治：PUBLIC 传播编译宏，使链接本库的测试 TU 与库内
-    # AgentRouter 类布局一致（PRIVATE 曾导致 MCP 构建下堆损坏）。
-    target_compile_definitions(orchestrator PUBLIC AGENT_RPC_ENABLE_MCP=1)
+    # P7 (批次十一): AgentRouter's vector-routing tier moved to
+    # agent_rpc_common, so orchestrator no longer depends on agent_rpc_mcp
+    # or the AGENT_RPC_ENABLE_MCP layout macro (the old PRIVATE/PUBLIC ODR
+    # hazard class is gone with the dual implementations).
 endif()
 
 # Embedding routing requires C++20 (MCP module uses C++20)

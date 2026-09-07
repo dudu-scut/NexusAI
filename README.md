@@ -84,7 +84,7 @@ Node.js 网关将 gRPC 状态码映射为稳定的 HTTP 语义码：UNAUTHENTICA
 
 ### 认证与安全
 
-密码采用 OpenSSL scrypt（EVP_PBE_scrypt，32 字节随机盐）哈希存储；会话令牌为 32 字节 CSPRNG 随机数，服务端仅存 SHA-256 摘要，会话事实源在 PostgreSQL `auth_sessions`，拦截器层附带短 TTL 读缓存（300s，撤销延迟以此为上界）；仓储层提供 `revokeSession` 撤销原语，独立的 Logout RPC 尚未接线（泄漏 token 的自助吊销暂以等 TTL 过期兜底）。gRPC 拦截器对全部接口鉴权，白名单内的公开 RPC 免认证。匹配 `NEXUSAI_ADMIN_USERNAME` 的用户在注册时获得 ADMIN 角色，作为 RegisterAgent / UnregisterAgent 等管理面 RPC 的强制门槛。
+密码采用 OpenSSL scrypt（EVP_PBE_scrypt，32 字节随机盐）哈希存储；会话令牌为 32 字节 CSPRNG 随机数，服务端仅存 SHA-256 摘要，会话事实源在 PostgreSQL `auth_sessions`，拦截器层附带 cache-aside 读缓存（TTL = 会话真实剩余，epoch/deny 双机制显式失效——用户级事件 INCR epoch 全量逻辑失效、会话级登出走已接线的 Logout RPC：PG revoke + DEL + 60s deny 标记，泄漏 token 的自助吊销即时生效）。gRPC 拦截器对全部接口鉴权，白名单内的公开 RPC 免认证；可选 trusted proxy 模式（NEXUSAI_TRUST_PROXY=1）把会话代查上移到 Node 网关并注入 HMAC 签名身份头。匹配 `NEXUSAI_ADMIN_USERNAME` 的用户在注册时获得 ADMIN 角色，作为 RegisterAgent / UnregisterAgent 等管理面 RPC 的强制门槛。
 
 ## 架构概览
 

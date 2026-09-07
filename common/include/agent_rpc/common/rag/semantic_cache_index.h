@@ -1,6 +1,6 @@
 #pragma once
-#include "agent_rpc/mcp/rag/vector_index.h"
-#include "agent_rpc/mcp/rag/embedding_service.h"
+#include "agent_rpc/common/rag/vector_index.h"
+#include "agent_rpc/common/rag/embedding_service.h"
 #include <string>
 #include <optional>
 #include <unordered_map>
@@ -9,7 +9,8 @@
 #include <utility>
 
 namespace agent_rpc {
-namespace mcp {
+namespace common {
+namespace rag {
 
 /**
  * @brief A cached agent response, keyed by query embedding similarity.
@@ -30,7 +31,7 @@ struct CachedResponse {
  */
 class SemanticCacheIndex {
 public:
-    explicit SemanticCacheIndex(rag::EmbeddingService* embedding);
+    explicit SemanticCacheIndex(EmbeddingService* embedding);
 
     /// Look up a cached response by query vector.  Returns nullopt on miss.
     std::optional<CachedResponse> lookup(const std::vector<float>& query_vector);
@@ -50,7 +51,7 @@ public:
 private:
     static std::string vectorToKey(const std::vector<float>& v);
 
-    rag::EmbeddingService* embedding_;
+    EmbeddingService* embedding_;
 
     /// cache_key -> cached response
     std::unordered_map<std::string, CachedResponse> cache_;
@@ -67,5 +68,6 @@ private:
     static constexpr int64_t TTL_SECONDS = 86400; // 24h default
 };
 
-} // namespace mcp
+} // namespace rag
+} // namespace common
 } // namespace agent_rpc

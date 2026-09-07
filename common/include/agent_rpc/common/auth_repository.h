@@ -2,6 +2,7 @@
 
 #include "agent_rpc/common/postgres_store.h"
 
+#include <cstdint>
 #include <optional>
 #include <string>
 
@@ -32,11 +33,15 @@ struct AuthSessionRecord {
 // token validation needs a single PostgreSQL round-trip instead of two
 // (session lookup + user lookup). password_scrypt is deliberately not
 // selected — session validation never needs the password hash.
+// expires_epoch (Unix seconds, from EXTRACT(EPOCH)) gives the caller a
+// numeric expiry without parsing the timestamptz text (P26 T2: the auth
+// cache TTL is the session's true remaining lifetime, not a fixed bound).
 struct AuthSessionWithUser {
     AuthSessionRecord session;
     std::string user_id;
     std::string username;
     std::string role;
+    std::int64_t expires_epoch = 0;
 };
 
 class AuthRepository final {

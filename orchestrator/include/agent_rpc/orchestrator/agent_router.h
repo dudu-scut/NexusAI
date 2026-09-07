@@ -19,17 +19,14 @@
 #include <utility>
 #include <vector>
 
-// Forward declarations for MCP RAG types (embedding routing)
-#ifdef AGENT_RPC_ENABLE_MCP
-namespace agent_rpc { namespace mcp { namespace rag {
+// Forward declarations for the common vector-routing types (P7: moved from
+// agent_rpc_mcp to agent_rpc::common::rag, unconditional in every build).
+namespace agent_rpc { namespace common { namespace rag {
     class EmbeddingService;
     class VectorIndex;
     class EmbeddingCache;
-}}}
-namespace agent_rpc { namespace mcp {
     class SemanticCacheIndex;
-}}
-#endif
+}}}
 
 // Forward declaration for LLM-based intent classification
 class LLMClient;
@@ -92,6 +89,16 @@ public:
      * @brief Shutdown router
      */
     void shutdown();
+
+    /**
+     * @brief Feed a completed agent call's latency for the optional load-
+     *        balancer tier (P8 S2). Only REAL completed calls may be fed —
+     *        timeouts/failures are skipped by the caller. No-op when the
+     *        load balancer is disabled (NEXUSAI_ROUTER_LB_STRATEGY unset).
+     * @param agent_id   The agent that actually served the call
+     * @param latency_ms Completed-call latency in milliseconds
+     */
+    void recordEndpointLatency(const std::string& agent_id, double latency_ms);
     
     /**
      * @brief Select an agent for a request
@@ -349,8 +356,9 @@ public:
      * @brief Enable (or disable) the embedding routing tier.
      *
      * Public since P7: the service bootstrap reads NEXUSAI_EMBEDDING_ROUTER
-     * and wires the tier here. Builds compiled without AGENT_RPC_ENABLE_MCP
-     * keep the stub implementation (always reports disabled).
+     * and wires the tier here. P7 (批次十一): the vector building blocks are
+     * unconditional (agent_rpc_common) — every build hosts the real tier;
+     * failures inside enableEmbedding reset to the 3-layer pipeline.
      */
     bool enableEmbedding(const EmbeddingRouterConfig& config);
 
@@ -546,15 +554,13 @@ private:
 
     // Embedding-based routing
     EmbeddingRouterConfig embedding_config_;
-#ifdef AGENT_RPC_ENABLE_MCP
-    std::unique_ptr<agent_rpc::mcp::rag::EmbeddingService> embedding_service_;
-    std::unique_ptr<agent_rpc::mcp::rag::VectorIndex> skill_index_;
-    std::unique_ptr<agent_rpc::mcp::rag::EmbeddingCache> embedding_cache_;
+    std::unique_ptr<agent_rpc::common::rag::EmbeddingService> embedding_service_;
+    std::unique_ptr<agent_rpc::common::rag::VectorIndex> skill_index_;
+    std::unique_ptr<agent_rpc::common::rag::EmbeddingCache> embedding_cache_;
     // P10(c): intent cache — similar queries reuse the intent skill without
     // an LLM classification call. Created when NEXUSAI_INTENT_CACHE=1 and
     // the embedding tier is enabled; lookup shares the tier's query vector.
-    std::unique_ptr<agent_rpc::mcp::SemanticCacheIndex> intent_cache_;
-#endif
+    std::unique_ptr<agent_rpc::common::rag::SemanticCacheIndex> intent_cache_;
     mutable std::mutex embedding_mutex_;
     std::atomic<uint64_t> embedding_query_count_{0};
     std::atomic<uint64_t> embedding_hit_count_{0};

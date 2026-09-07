@@ -51,6 +51,17 @@ message ValidateTokenResponse {
     string role = 5;               // USER | ADMIN
 }
 
+// Logout request — intentionally empty: the session token is carried by the
+// authorization metadata (Logout is a protected endpoint, never whitelisted).
+message LogoutRequest {
+    // The token rides the authorization metadata, never the body.
+}
+
+// Logout response
+message LogoutResponse {
+    common.Status status = 1;
+}
+
 // User Service
 
 // User authentication service
@@ -63,4 +74,8 @@ service UserService {
 
     // Validate token (for interceptor internal use)
     rpc ValidateToken(ValidateTokenRequest) returns (ValidateTokenResponse);
+
+    // Revoke the calling session (logout). Protected endpoint: the token is
+    // read from the authorization metadata, not the body.
+    rpc Logout(LogoutRequest) returns (LogoutResponse);
 }

@@ -186,11 +186,33 @@ bool RpcServer::initialize(const common::RpcConfig& config) {
     health_service_impl_ = std::make_shared<HealthServiceImpl>();
     ai_query_service_impl_ = std::make_shared<AIQueryServiceImpl>();
     auth_service_impl_ = std::make_shared<AuthServiceImpl>(auth_repository_.get());
-    // P22 B: cache-aside session cache lives in the interceptor layer so
+    // P26 T2: the cache read-modify-write lives in the shared AuthCache
+    // helper (injected here through AuthInterceptor::setRedisClient) so
     // AuthServiceImpl stays Redis-free (PostgreSQL remains the sole session
     // fact source, contract-locked). Null/disconnected Redis degrades to the
     // authoritative JOIN lookup.
     AuthInterceptor::setRedisClient(redis_client_.get());
+
+    // P26 T3 (trusted proxy, dual-mode transition): NEXUSAI_TRUST_PROXY=1
+    // switches the interceptor to accept HMAC-signed x-nexusai-* identity
+    // headers injected by the gateway. The shared secret is mandatory in
+    // trust mode — missing/too short refuses startup (fail-fast) rather than
+    // silently trusting unsigned headers.
+    const char* trust_env = std::getenv("NEXUSAI_TRUST_PROXY");
+    const bool trust_proxy =
+        trust_env != nullptr && std::string(trust_env) == "1";
+    const char* hmac_env = std::getenv("NEXUSAI_PROXY_HMAC_SECRET");
+    const std::string hmac_secret =
+        hmac_env == nullptr ? std::string{} : std::string{hmac_env};
+    if (trust_proxy && hmac_secret.size() < 32) {
+        LOG_ERROR("NEXUSAI_TRUST_PROXY=1 requires NEXUSAI_PROXY_HMAC_SECRET "
+                  "(>= 32 chars); refusing to start in trust mode");
+        return false;
+    }
+    AuthInterceptor::setTrustedProxy(hmac_secret, trust_proxy);
+    // Trust mode requireAdmin() re-resolves the real role from PostgreSQL
+    // (the injected role header is never trusted for admin gates).
+    AuthInterceptor::setAuthService(auth_service_impl_.get());
     
     common::MessageSerializer::getInstance().initialize(common::SerializerFactory::PROTOBUF_BINARY);
     

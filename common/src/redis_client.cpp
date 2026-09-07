@@ -153,6 +153,43 @@ bool RedisClient::exists(const std::string& key) {
     return ok;
 }
 
+bool RedisClient::mget(const std::vector<std::string>& keys,
+                       std::vector<std::string>& values) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    values.clear();
+    if (keys.empty()) {
+        return true;
+    }
+    if (!ensureConnected()) return false;
+
+    // redisCommandArgv keeps binary-safe arguments and avoids any format-
+    // string / whitespace hazard when keys are concatenated into one line.
+    std::vector<const char*> argv;
+    argv.reserve(keys.size() + 1);
+    argv.push_back("MGET");
+    for (const auto& key : keys) {
+        argv.push_back(key.c_str());
+    }
+    auto* reply = static_cast<redisReply*>(redisCommandArgv(
+        ctx_, static_cast<int>(argv.size()), argv.data(), nullptr));
+    if (!reply) return false;
+
+    bool ok = (reply->type == REDIS_REPLY_ARRAY);
+    if (ok) {
+        values.reserve(reply->elements);
+        for (std::size_t i = 0; i < reply->elements; ++i) {
+            if (reply->element[i]->type == REDIS_REPLY_STRING) {
+                values.emplace_back(reply->element[i]->str,
+                                    reply->element[i]->len);
+            } else {
+                values.emplace_back();  // nil key → empty value
+            }
+        }
+    }
+    freeReplyObject(reply);
+    return ok;
+}
+
 bool RedisClient::setex(const std::string& key, int ttl_seconds,
                          const std::string& value) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -354,6 +391,23 @@ bool RedisClient::expire(const std::string& key, int seconds) {
     bool ok = (reply->type == REDIS_REPLY_INTEGER && reply->integer > 0);
     freeReplyObject(reply);
     return ok;
+}
+
+bool RedisClient::ttl(const std::string& key, std::int64_t& seconds) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!ensureConnected()) return false;
+
+    auto* reply = static_cast<redisReply*>(
+        redisCommand(ctx_, "TTL %s", key.c_str()));
+    if (!reply) return false;
+
+    if (reply->type == REDIS_REPLY_INTEGER) {
+        seconds = reply->integer;
+        freeReplyObject(reply);
+        return true;
+    }
+    freeReplyObject(reply);
+    return false;
 }
 
 bool RedisClient::incrby(const std::string& key, int64_t increment,

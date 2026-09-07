@@ -146,6 +146,7 @@ function watchHandler(call) {
 
 // Boot mock backend + real proxy
 const grpcServer = new grpc.Server();
+const logoutState = { sawAuth: '' };
 grpcServer.addService(userProto.agent_communication.auth.UserService.service, {
   register: (call, cb) => cb(null, {
     status: { code: 0, message: 'ok', details: '' },
@@ -156,6 +157,12 @@ grpcServer.addService(userProto.agent_communication.auth.UserService.service, {
     status: { code: 0, message: 'ok', details: '' },
     user_id: 'u', username: 'u', valid: true, role: 'USER',
   }),
+  // P22: Logout revocation — the token must ride the metadata untouched
+  // (the proxy never consumes or rewrites it for protected RPCs).
+  logout: (call, cb) => {
+    logoutState.sawAuth = (call.metadata.get('authorization') || [''])[0];
+    cb(null, { status: { code: 0, message: 'ok', details: '' } });
+  },
 });
 grpcServer.addService(agentProto.agent_communication.HealthService.service, {
   check: (call, cb) => cb(null, { status: 'SERVING' }),
@@ -228,6 +235,18 @@ test('Authorization header is forwarded to gRPC metadata', async () => {
 
   assert.equal(status, 200);
   assert.equal(body.username, 'Bearer pr-f-token-123');
+});
+
+test('Logout forwards with the bearer token in gRPC metadata (P22)', async () => {
+  const { status, body } = await unary(
+    '/agent_communication.auth.UserService/Logout',
+    {},
+    { authorization: 'Bearer pr-f-logout-token' },
+  );
+
+  assert.equal(status, 200);
+  assert.equal(body.status?.code, 0);
+  assert.equal(logoutState.sawAuth, 'Bearer pr-f-logout-token');
 });
 
 // 3. SSE: stream errors become structured error events, then close

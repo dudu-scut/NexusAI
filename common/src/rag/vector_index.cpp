@@ -3,7 +3,7 @@
  * @brief VectorIndex implementation
  */
 
-#include "agent_rpc/mcp/rag/vector_index.h"
+#include "agent_rpc/common/rag/vector_index.h"
 #include "agent_rpc/common/logger.h"
 
 #include <nlohmann/json.hpp>
@@ -15,7 +15,7 @@
 using json = nlohmann::json;
 
 namespace agent_rpc {
-namespace mcp {
+namespace common {
 namespace rag {
 
 void VectorIndex::addTool(const IndexedTool& tool) {
@@ -271,5 +271,5 @@ void VectorIndex::clear() {
 }
 
 } // namespace rag
-} // namespace mcp
+} // namespace common
 } // namespace agent_rpc

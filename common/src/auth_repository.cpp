@@ -147,7 +147,8 @@ std::optional<AuthSessionWithUser> AuthRepository::findActiveSessionWithUserByTo
             transaction,
             "SELECT s.id, s.owner_id, s.token_hash, s.expires_at::text AS expires_at, "
             "s.revoked_at::text AS revoked_at, s.created_at::text AS created_at, "
-            "s.updated_at::text AS updated_at, u.id AS user_id, u.username, u.role "
+            "s.updated_at::text AS updated_at, u.id AS user_id, u.username, u.role, "
+            "EXTRACT(EPOCH FROM s.expires_at)::bigint AS expires_epoch "
             "FROM auth_sessions s JOIN users u ON u.id = s.owner_id "
             "WHERE s.token_hash = $1 AND s.revoked_at IS NULL "
             "AND s.expires_at > NOW()",
@@ -165,6 +166,10 @@ std::optional<AuthSessionWithUser> AuthRepository::findActiveSessionWithUserByTo
             joined.role = row["role"].is_null()
                               ? std::string{}
                               : row["role"].template as<std::string>();
+            joined.expires_epoch =
+                row["expires_epoch"].is_null()
+                    ? 0
+                    : row["expires_epoch"].template as<std::int64_t>();
             session_with_user = std::move(joined);
         }
     });

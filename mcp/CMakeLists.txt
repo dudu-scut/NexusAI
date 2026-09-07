@@ -5,13 +5,11 @@ set(MCP_SOURCES
     src/mcp_client.cpp
     src/mcp_tool_manager.cpp
     src/mcp_agent_integration.cpp
-    # RAG-MCP source files
-    src/rag/embedding_service.cpp
-    src/rag/embedding_cache.cpp
-    src/rag/vector_index.cpp
+    # P7 (批次十一): embedding_service/vector_index/embedding_cache/
+    # semantic_cache_index moved to agent_rpc_common (common/src/rag/); the
+    # RAG tool-integration layer stays MCP-side.
     src/rag/tool_retriever.cpp
     src/rag/tool_validator.cpp
-    src/rag/semantic_cache_index.cpp
 )
 
 # Build the MCP library

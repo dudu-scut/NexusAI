@@ -5,9 +5,9 @@
 
 #pragma once
 
-#include "embedding_service.h"
-#include "embedding_cache.h"
-#include "vector_index.h"
+#include "agent_rpc/common/rag/embedding_service.h"
+#include "agent_rpc/common/rag/embedding_cache.h"
+#include "agent_rpc/common/rag/vector_index.h"
 #include "../mcp_agent_integration.h"
 
 #include <string>
@@ -18,6 +18,17 @@
 namespace agent_rpc {
 namespace mcp {
 namespace rag {
+
+// P7 (批次十一): the vector building blocks moved to agent_rpc::common::rag;
+// this MCP-side retriever bridges the namespaces so its call sites stay
+// unchanged.
+using agent_rpc::common::rag::EmbeddingService;
+using agent_rpc::common::rag::EmbeddingCache;
+using agent_rpc::common::rag::VectorIndex;
+using agent_rpc::common::rag::EmbeddingConfig;
+using agent_rpc::common::rag::CacheConfig;
+using agent_rpc::common::rag::CacheStats;
+using agent_rpc::common::rag::IndexedTool;
 
 /**
  * @brief Retriever configuration

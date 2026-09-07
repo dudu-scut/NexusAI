@@ -124,11 +124,16 @@ private:
     //         profile_summarizer 写、无读者）
     //   - [cache-only]（PG 为事实源的投影，丢失可重建）——
     //       nexusai:conv:*（Tier-1 会话镜像，主查询读 PG）
+    //       auth:session:<token_hash>（P22 B 认证会话缓存，AuthCache 读写，
+    //         TTL = 会话真实剩余（P26 T2），PG auth_sessions 为事实源）
     //       trace:spans:<trace_id>（span 批量冗余，PG 兜底读取，
     //         main.cpp 写 / observability 读，TTL 24h）
     //       agent_metrics:<aid>（feedback_aggregator 写 / GetAgentMetrics 读）
     //   - [transient]（无业务后果的瞬态/协调键）——
     //       nexusai:last_agent:*、限流计数、分布式短锁、预算实时计数面、
+    //       auth:deny:<token_hash>（P26 会话级撤销短锁，Logout 写点，TTL 60s）、
+    //       auth:epoch:<owner_id>（P26 用户级撤销版本号，无 TTL 不累积；
+    //         当前无 INCR 生产者——管理 RPC 落地时触发，DBA 直改 PG 后必须手动 INCR）、
     //       profile:pending（画像提取队列）/ profile:queued（HSETNX 去重守卫）、
     //       nexusai:memory:conflict:<uid>:<key>（C2 方向3 偏好冲突候选集，
     //         7 天 TTL，画像重算时消歧）、

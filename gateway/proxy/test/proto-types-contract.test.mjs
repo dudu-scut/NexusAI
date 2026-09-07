@@ -218,6 +218,24 @@ test('LoginResponse carries the C3 role field', () => {
   assert.match(ts.role, /string/);
 });
 
+test('Logout messages mirror the Logout RPC (P22 batch)', () => {
+  // LogoutRequest is deliberately field-free (the token rides the
+  // authorization metadata), so it cannot join CORE_MESSAGES whose loop
+  // asserts at least one field — pin it here instead.
+  assert.ok(protoMessages.LogoutRequest, 'proto/ must define LogoutRequest');
+  assert.ok(protoMessages.LogoutResponse, 'proto/ must define LogoutResponse');
+  const tsRequest = parseTsInterface('LogoutRequest');
+  assert.ok(tsRequest, 'proto.ts must declare LogoutRequest');
+  assert.deepEqual(
+    Object.keys(tsRequest),
+    [],
+    'LogoutRequest must stay field-free (token rides metadata)',
+  );
+  const tsResponse = parseTsInterface('LogoutResponse');
+  assert.ok(tsResponse, 'proto.ts must declare LogoutResponse');
+  assert.ok(tsResponse.status, 'proto.ts LogoutResponse.status must exist');
+});
+
 test('CostRecord carries the C3 estimated flag', () => {
   const ts = parseTsInterface('CostRecord');
   assert.ok(ts.estimated, 'CostRecord.estimated must exist');

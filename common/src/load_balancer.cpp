@@ -280,7 +280,9 @@ ServiceEndpoint ConsistentHashLoadBalancer::findEndpoint(uint64_t hash_value) {
     return it->endpoint;
 }
 
-LeastResponseTimeLoadBalancer::LeastResponseTimeLoadBalancer() = default;
+LeastResponseTimeLoadBalancer::LeastResponseTimeLoadBalancer(double ema_alpha)
+    : ema_alpha_(ema_alpha > 0.0 && ema_alpha <= 1.0 ? ema_alpha : 0.1) {}
+
 
 ServiceEndpoint LeastResponseTimeLoadBalancer::selectEndpoint(const std::vector<ServiceEndpoint>& endpoints) {
     if (endpoints.empty()) throw std::runtime_error("No endpoints available");
@@ -340,16 +342,26 @@ void LeastResponseTimeLoadBalancer::updateResponseTime(const std::string& endpoi
                                                       std::chrono::milliseconds response_time) {
     std::lock_guard<std::mutex> lock(stats_mutex_);
     auto& stats = endpoint_stats_[endpoint_id];
+    const auto previous = stats.ema_response_time_ms;
+    if (previous.count() == 0) {
+        // First sample seeds the EMA directly (no history to smooth yet).
+        stats.ema_response_time_ms = response_time;
+    } else {
+        // P8 S1: s = α·x + (1−α)·s — a single outlier moves the estimate by
+        // α of its distance instead of replacing it (latest-sample selection
+        // used to oscillate on one slow response).
+        stats.ema_response_time_ms = std::chrono::milliseconds(static_cast<std::int64_t>(
+            ema_alpha_ * static_cast<double>(response_time.count()) +
+            (1.0 - ema_alpha_) * static_cast<double>(previous.count())));
+    }
     stats.request_count++;
     stats.last_update = std::chrono::steady_clock::now();
-    // Use latest response time for immediate selection accuracy
-    stats.avg_response_time = response_time;
 }
 
 std::chrono::milliseconds LeastResponseTimeLoadBalancer::calculateAverageResponseTime(const std::string& endpoint_id) {
     auto it = endpoint_stats_.find(endpoint_id);
     if (it == endpoint_stats_.end()) return std::chrono::milliseconds(1000);
-    return it->second.avg_response_time;
+    return it->second.ema_response_time_ms;
 }
 
 std::unique_ptr<LoadBalancer> LoadBalancerFactory::createLoadBalancer(LoadBalanceStrategy strategy) {
@@ -416,6 +428,14 @@ void LoadBalancerManager::updateEndpoints(const std::vector<ServiceEndpoint>& en
 void LoadBalancerManager::markEndpointStatus(const std::string& endpoint_id, bool healthy) {
     std::lock_guard<std::mutex> lock(mutex_);
     load_balancer_->markEndpointStatus(endpoint_id, healthy);
+}
+
+void LoadBalancerManager::recordResponseTime(const std::string& endpoint_id,
+                                             std::chrono::milliseconds response_time) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (load_balancer_) {
+        load_balancer_->updateResponseTime(endpoint_id, response_time);
+    }
 }
 
 } // namespace common

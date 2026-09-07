@@ -36,6 +36,16 @@ public:
     virtual void markEndpointStatus(const std::string& endpoint_id, bool healthy) = 0;
     
     virtual std::string getStrategyName() const = 0;
+
+    // P8 S2: response-time feed channel. Only latency-aware strategies
+    // consume the value (LeastResponseTime); the default no-op keeps every
+    // other strategy untouched. Callers feed REAL completed calls only —
+    // timeouts/failures must not be fed (same口径 as health evaluation).
+    virtual void updateResponseTime(const std::string& endpoint_id,
+                                    std::chrono::milliseconds response_time) {
+        (void)endpoint_id;
+        (void)response_time;
+    }
 };
 
 class RoundRobinLoadBalancer : public LoadBalancer {
@@ -147,7 +157,9 @@ private:
 
 class LeastResponseTimeLoadBalancer : public LoadBalancer {
 public:
-    LeastResponseTimeLoadBalancer();
+    // P8 S1: ema_alpha smooths the latest-sample jitter (α=0.1 default,
+    // same value as the health-evaluation EMA); make it configurable.
+    explicit LeastResponseTimeLoadBalancer(double ema_alpha = 0.1);
     ~LeastResponseTimeLoadBalancer() = default;
 
     ServiceEndpoint selectEndpoint(const std::vector<ServiceEndpoint>& endpoints) override;
@@ -156,18 +168,21 @@ public:
     std::string getStrategyName() const override { return "LeastResponseTime"; }
 
     void updateResponseTime(const std::string& endpoint_id,
-                           std::chrono::milliseconds response_time);
+                           std::chrono::milliseconds response_time) override;
 
 private:
     struct EndpointStats {
         ServiceEndpoint endpoint;
-        std::chrono::milliseconds avg_response_time{0};
+        // P8 S1: exponential moving average (s = α·x + (1−α)·s), replacing
+        // the misleadingly-named latest-sample "avg_response_time".
+        std::chrono::milliseconds ema_response_time_ms{0};
         int request_count{0};
         std::chrono::steady_clock::time_point last_update;
     };
 
     mutable std::mutex stats_mutex_;
     std::map<std::string, EndpointStats> endpoint_stats_;
+    double ema_alpha_;
     std::chrono::milliseconds calculateAverageResponseTime(const std::string& endpoint_id);
 };
 
@@ -202,6 +217,11 @@ public:
     void updateEndpoints(const std::vector<ServiceEndpoint>& endpoints);
 
     void markEndpointStatus(const std::string& endpoint_id, bool healthy);
+
+    // P8 S2: feed a completed call's latency to the active strategy
+    // (thread-safe; no-op for strategies that do not consume latencies).
+    void recordResponseTime(const std::string& endpoint_id,
+                            std::chrono::milliseconds response_time);
 
 private:
     mutable std::mutex mutex_;

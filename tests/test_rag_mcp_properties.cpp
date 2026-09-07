@@ -17,9 +17,9 @@
 #include <rapidcheck.h>
 #include <rapidcheck/gtest.h>
 
-#include "agent_rpc/mcp/rag/embedding_service.h"
-#include "agent_rpc/mcp/rag/embedding_cache.h"
-#include "agent_rpc/mcp/rag/vector_index.h"
+#include "agent_rpc/common/rag/embedding_service.h"
+#include "agent_rpc/common/rag/embedding_cache.h"
+#include "agent_rpc/common/rag/vector_index.h"
 #include "agent_rpc/mcp/rag/tool_retriever.h"
 #include "agent_rpc/mcp/rag/tool_validator.h"
 #include "agent_rpc/mcp/mcp_agent_integration.h"
@@ -31,7 +31,16 @@
 
 namespace {
 
-using namespace agent_rpc::mcp::rag;
+// P7 (批次十一): the vector building blocks now live in agent_rpc::common::rag
+// (unconditional); the tool-integration layer stays in agent_rpc::mcp::rag.
+// Explicit using-declarations win over the namespace using-directive, so the
+// shared type names resolve to the common ones without ambiguity.
+using namespace agent_rpc::mcp::rag;  // ToolRetriever / validation types
+using agent_rpc::common::rag::EmbeddingService;
+using agent_rpc::common::rag::EmbeddingCache;
+using agent_rpc::common::rag::VectorIndex;
+using agent_rpc::common::rag::EmbeddingConfig;
+using agent_rpc::common::rag::CacheConfig;
 using agent_rpc::mcp::ToolCallResult;
 using agent_rpc::mcp::ToolInfo;
 

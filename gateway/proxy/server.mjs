@@ -10,9 +10,11 @@
 
 import http from 'node:http';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import grpc from '@grpc/grpc-js';
 import protoLoader from '@grpc/proto-loader';
+import { createClient } from 'redis';
 
 // Config
 const PROXY_PORT = parseInt(process.env.PROXY_PORT || '8081', 10);
@@ -21,6 +23,23 @@ const PROTO_DIR = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   '../../proto'
 );
+
+// P26 T3 (trusted proxy): when NEXUSAI_TRUST_PROXY=1 the proxy performs the
+// session check locally against Redis (deny/epoch/session keys, the same
+// semantics as the backend AuthCache) and injects HMAC-signed identity
+// headers instead of forwarding the raw Bearer. The shared secret is
+// mandatory in trust mode — missing/too short refuses startup (fail-fast).
+const REDIS_HOST = process.env.REDIS_HOST || '127.0.0.1';
+const REDIS_PORT = parseInt(process.env.REDIS_PORT || '6379', 10);
+const TRUST_PROXY = process.env.NEXUSAI_TRUST_PROXY === '1';
+const PROXY_HMAC_SECRET = process.env.NEXUSAI_PROXY_HMAC_SECRET || '';
+if (TRUST_PROXY && PROXY_HMAC_SECRET.length < 32) {
+  console.error(
+    '[proxy] NEXUSAI_TRUST_PROXY=1 requires NEXUSAI_PROXY_HMAC_SECRET ' +
+    '(>= 32 chars); refusing to start in trust mode',
+  );
+  process.exit(1);
+}
 
 // Load Proto Definitions
 const loaderOptions = {
@@ -151,6 +170,180 @@ function buildMetadata(headers) {
   if (auth) {
     meta.add('authorization', auth);
   }
+  return meta;
+}
+
+// ============================================================================
+// P26 T3 trusted-proxy local authentication (only active when
+// NEXUSAI_TRUST_PROXY=1; default-off keeps the legacy passthrough exactly)
+// ============================================================================
+
+// RPCs the proxy forwards WITHOUT local authentication (must mirror the
+// backend whitelist): auth bootstrap + the restricted public share read +
+// liveness probes (never carry a Bearer).
+const AUTH_BYPASS_RPCS = new Set([
+  'agent_communication.auth.UserService/Register',
+  'agent_communication.auth.UserService/Login',
+  'agent_communication.auth.UserService/ValidateToken',
+  'agent_communication.SharingService/ReadSharedConversation',
+  'agent_communication.HealthService/Check',
+  'agent_communication.HealthService/Watch',
+]);
+
+function sha256Hex(input) {
+  return crypto.createHash('sha256').update(input).digest('hex');
+}
+
+function hmacSha256Hex(canonical) {
+  return crypto
+    .createHmac('sha256', PROXY_HMAC_SECRET)
+    .update(canonical)
+    .digest('hex');
+}
+
+// The backend Bearer grammar: 64–256 lowercase/uppercase hex after "Bearer ".
+function bearerTokenFrom(headers) {
+  const authorization = headers['authorization'];
+  if (typeof authorization !== 'string') return '';
+  const match = /^Bearer\s+([0-9a-fA-F]{64,256})$/.exec(authorization.trim());
+  return match ? match[1] : '';
+}
+
+// Redis access is abstracted behind a lazy singleton so contract tests can
+// inject an in-memory stub (__setAuthCacheBackendForTest) without a real
+// Redis; production uses the shared instance the backend also reads.
+let lazyRedis = null;
+let injectedBackend = null;
+
+function authCacheBackend() {
+  if (injectedBackend) return injectedBackend;
+  if (!lazyRedis) {
+    lazyRedis = createClient({
+      url: `redis://${REDIS_HOST}:${REDIS_PORT}`,
+      socket: { connectTimeout: 1000, reconnectStrategy: false },
+    });
+    lazyRedis.on('error', (err) => {
+      // Backend degrades to the ValidateToken fallback on Redis errors.
+      console.warn(`[proxy] auth-cache Redis error: ${err.message}`);
+    });
+  }
+  return lazyRedis;
+}
+
+export function __setAuthCacheBackendForTest(backend) {
+  injectedBackend = backend;
+}
+
+async function redisGet(key) {
+  const client = authCacheBackend();
+  if (!client) return null;
+  try {
+    if (typeof client.isReady === 'boolean' && !client.isReady) {
+      await client.connect();
+    }
+    return await client.get(key);
+  } catch {
+    return null;  // Redis unavailable → caller falls back to ValidateToken
+  }
+}
+
+// Miss-fallback: authoritative backend ValidateToken RPC (whitelisted, so no
+// auth metadata is needed). The backend refills the session cache on success
+// (AuthCache::validateTokenCached), so the next request hits Redis again.
+function validateTokenViaRpc(token, tokenHash) {
+  return new Promise((resolve) => {
+    const client = clients['agent_communication.auth.UserService'];
+    if (!client) {
+      return resolve({ ok: false, reason: 'UserService unavailable' });
+    }
+    client.validateToken({ token }, new grpc.Metadata(), (err, resp) => {
+      if (err || !resp || !resp.valid || !resp.user_id) {
+        return resolve({ ok: false, reason: 'Token invalid or expired' });
+      }
+      resolve({
+        ok: true,
+        identity: {
+          user_id: resp.user_id,
+          username: resp.username || '',
+          role: resp.role || 'USER',
+          token_hash: tokenHash,
+        },
+      });
+    });
+  });
+}
+
+// Local auth check with the SAME fail-safe semantics as the backend cache:
+// deny hit → refuse; session hit with matching epoch and unexpired payload →
+// accept with zero backend calls; anything else → ValidateToken fallback.
+// Only false negatives (a valid user refused once) are allowed.
+async function authenticateRequest(headers) {
+  const token = bearerTokenFrom(headers);
+  if (!token) {
+    return { ok: false, reason: 'Missing bearer token' };
+  }
+  const tokenHash = sha256Hex(token);
+
+  const deny = await redisGet(`auth:deny:${tokenHash}`);
+  if (deny) {
+    return { ok: false, reason: 'Session revoked' };
+  }
+
+  const session = await redisGet(`auth:session:${tokenHash}`);
+  if (session) {
+    try {
+      const payload = JSON.parse(session);
+      const now = Math.floor(Date.now() / 1000);
+      let epoch = 0;
+      if (payload.user_id) {
+        const raw = await redisGet(`auth:epoch:${payload.user_id}`);
+        const parsed = raw != null ? Number(raw) : 0;
+        epoch = Number.isFinite(parsed) ? parsed : 0;
+      }
+      const notExpired = Number(payload.expires_at) > now;
+      if (
+        payload.user_id && payload.username && payload.role &&
+        Number(payload.epoch) === epoch && notExpired
+      ) {
+        return {
+          ok: true,
+          identity: {
+            user_id: payload.user_id,
+            username: payload.username,
+            role: payload.role,
+            token_hash: tokenHash,
+          },
+        };
+      }
+      // Epoch mismatch / stale payload → authoritative re-validation below.
+    } catch {
+      // Corrupt payload → authoritative re-validation below.
+    }
+  }
+
+  return validateTokenViaRpc(token, tokenHash);
+}
+
+// Strip any client-supplied x-nexusai-* headers (never forwarded) and inject
+// the five identity headers + HMAC. canonical excludes the HTTP method by
+// design: Bearer leakage already allows cross-method impersonation and the
+// 60s exp is tighter than the status quo.
+function trustedMetadata(identity) {
+  const meta = new grpc.Metadata();
+  const exp = Math.floor(Date.now() / 1000) + 60;
+  const canonical = [
+    identity.user_id,
+    identity.username,
+    identity.role,
+    String(exp),
+    identity.token_hash,
+  ].join('|');
+  meta.add('x-nexusai-user-id', identity.user_id);
+  meta.add('x-nexusai-username', identity.username);
+  meta.add('x-nexusai-role', identity.role);
+  meta.add('x-nexusai-exp', String(exp));
+  meta.add('x-nexusai-token-hash', identity.token_hash);
+  meta.add('x-nexusai-signature', hmacSha256Hex(canonical));
   return meta;
 }
 
@@ -380,8 +573,6 @@ function handleRequest(req, res) {
       return res.end(JSON.stringify({ error: 'Invalid JSON' }));
     }
 
-    const metadata = buildMetadata(req.headers);
-
     // Classify RPC by streaming type
     const rpcPath = serviceName + '/' + methodName;
 
@@ -395,6 +586,33 @@ function handleRequest(req, res) {
         error: 'RPC streaming mode is not supported by the JSON proxy',
         rpc: rpcPath,
       }));
+    }
+
+    // P26 T3: in trust mode every non-bypass RPC is authenticated locally
+    // BEFORE any backend call (unary or stream — a failing check answers a
+    // plain 401, never a half-open SSE). The Bearer is consumed here and
+    // replaced by HMAC-signed identity headers; client-supplied x-nexusai-*
+    // headers are never forwarded (strip-before-inject). Default mode keeps
+    // the legacy passthrough (backend owns authentication).
+    let metadata;
+    if (TRUST_PROXY && !AUTH_BYPASS_RPCS.has(rpcPath)) {
+      const auth = await authenticateRequest(req.headers);
+      if (!auth.ok) {
+        const payload = {
+          error: `UNAUTHENTICATED: ${auth.reason}`,
+          code: grpc.status.UNAUTHENTICATED,
+          code_name: 'UNAUTHENTICATED',
+          details: auth.reason,
+        };
+        res.writeHead(401, {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+        });
+        return res.end(JSON.stringify(payload));
+      }
+      metadata = trustedMetadata(auth.identity);
+    } else {
+      metadata = buildMetadata(req.headers);
     }
 
     // Server-streaming → SSE

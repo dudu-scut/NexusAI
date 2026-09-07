@@ -3,10 +3,10 @@
  * @brief EmbeddingCache implementation
  */
 
-#include "agent_rpc/mcp/rag/embedding_cache.h"
+#include "agent_rpc/common/rag/embedding_cache.h"
 
 namespace agent_rpc {
-namespace mcp {
+namespace common {
 namespace rag {
 
 EmbeddingCache::EmbeddingCache(const CacheConfig& config)
@@ -165,5 +165,5 @@ void EmbeddingCache::moveToFront(CacheMap::iterator it) {
 }
 
 } // namespace rag
-} // namespace mcp
+} // namespace common
 } // namespace agent_rpc
