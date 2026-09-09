@@ -1096,7 +1096,15 @@ grpc::Status AIQueryServiceImpl::Query(
     // owner-scoped fact per query here; the multi-agent orchestrator path
     // records per-call facts inside MultiAgentHandler.
     if (!orchestrator_enabled_) {
-        recordInvocationFact(run.owner_id, request_id, response->agent_id(),
+        // Single-agent A2A direct path: the adapter never echoes a registry
+        // agent id, so the only honest attribution is an explicit client
+        // preference; chats without one record the "default" placeholder
+        // (no routing = no agent dimension for this traffic).
+        const std::string direct_agent =
+            request->preference().preferred_agents_size() > 0
+                ? request->preference().preferred_agents(0)
+                : std::string{};
+        recordInvocationFact(run.owner_id, request_id, direct_agent,
                              "", success ? "success" : "failed",
                              duration.count());
     }
@@ -1323,6 +1331,12 @@ grpc::Status AIQueryServiceImpl::QueryStream(
         writer->Write(terminal);
     };
 
+    // Attributed agent for agent_invocations: filled by the orchestrator
+    // path (real streamed agent id) or an explicit client preference on the
+    // direct A2A path; empty otherwise (recorded as the "default" placeholder
+    // — direct traffic has no registry agent dimension).
+    std::string acted_agent_id;
+
     // Multi-agent orchestrator path
     if (orchestrator_enabled_) {
         auto status = multi_agent_handler_->handleQueryStream(
@@ -1331,6 +1345,7 @@ grpc::Status AIQueryServiceImpl::QueryStream(
         std::string lower_error = takeMultiAgentStreamError();
         std::string stream_agent_id = takeMultiAgentStreamedAgentId();
         std::string stream_agent_name = takeMultiAgentStreamedAgentName();
+        acted_agent_id = stream_agent_id;
 
         auto end_time = std::chrono::steady_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1400,6 +1415,13 @@ grpc::Status AIQueryServiceImpl::QueryStream(
     bool write_failed = false;
     std::string lower_error;
     std::string streamed_content;
+
+    // Single-agent A2A direct stream (no registry routing): the only honest
+    // attribution is an explicit client preference; chats without one stay
+    // unattributed and record the "default" placeholder downstream.
+    if (request->preference().preferred_agents_size() > 0) {
+        acted_agent_id = request->preference().preferred_agents(0);
+    }
 
     // A6 (批次十一): 直连流路径独立 deadline 收缩点——已越过则不再发起
     // 注定失败的 A2A 调用，向客户端发结构化 error 事件并落 failed 终态。
@@ -1482,7 +1504,7 @@ grpc::Status AIQueryServiceImpl::QueryStream(
         // Client/gRPC cancellation: persist the cancelled terminal state.
         finalizeDurableQuery(run, "cancelled", streamed_content, "Request cancelled");
         helpers_.updateTaskStatus(request_id, "cancelled");
-        recordInvocationFact(run.owner_id, request_id, "", "", "cancelled",
+        recordInvocationFact(run.owner_id, request_id, acted_agent_id, "", "cancelled",
                              duration.count());
         a2a_adapter_->cancelTask(request_id);
         return grpc::Status(grpc::StatusCode::CANCELLED, "Request cancelled");
@@ -1492,7 +1514,7 @@ grpc::Status AIQueryServiceImpl::QueryStream(
         emitTerminal("error", sanitizeErrorMessage(lower_error));
         finalizeDurableQuery(run, "failed", streamed_content, lower_error);
         helpers_.updateTaskStatus(request_id, "failed", "", "", lower_error);
-        recordInvocationFact(run.owner_id, request_id, "", "", "failed",
+        recordInvocationFact(run.owner_id, request_id, acted_agent_id, "", "failed",
                              duration.count());
         LOG_ERROR("Streaming AI query failed: " + request_id + " - " + lower_error);
         return grpc::Status(grpc::StatusCode::INTERNAL, sanitizeErrorMessage(lower_error));
@@ -1503,23 +1525,22 @@ grpc::Status AIQueryServiceImpl::QueryStream(
                              "Failed to write stream event");
         helpers_.updateTaskStatus(request_id, "failed", "", "",
                                   "Failed to write stream event");
-        recordInvocationFact(run.owner_id, request_id, "", "", "failed",
+        recordInvocationFact(run.owner_id, request_id, acted_agent_id, "", "failed",
                              duration.count());
         return grpc::Status(grpc::StatusCode::INTERNAL, "Failed to write stream event");
     }
 
-    // Memory cache: last_agent is recorded with the real agent id at the end
-    // of handleAgentSwitch (non-streaming Query path). The streaming paths
-    // cannot reliably surface an agent identity — the A2A adapter returns no
-    // agent id and the multi-agent stream only exposes the accumulated answer
-    // through a thread-local slot — so no fake "default" placeholder is
-    // written here anymore.
+    // The streamed agent identity is now attributed via acted_agent_id:
+    // the orchestrator path hands back the real acting agent; the direct
+    // path only records an explicit client preference. Unattributed traffic
+    // falls through to the repository's "default" placeholder (no routing =
+    // no agent dimension).
 
     // Step 6: single terminal event + exactly-once persistence.
     emitTerminal("complete", "");
     finalizeDurableQuery(run, "completed", streamed_content, "");
     helpers_.updateTaskStatus(request_id, "completed");
-    recordInvocationFact(run.owner_id, request_id, "", "", "success",
+    recordInvocationFact(run.owner_id, request_id, acted_agent_id, "", "success",
                          duration.count());
     auto* tc = common::TraceContext::current();
     // Estimate-only accounting (no provider usage passthrough yet): prompt =

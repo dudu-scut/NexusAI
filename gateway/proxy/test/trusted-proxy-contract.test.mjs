@@ -168,7 +168,15 @@ function assertTrustedHeaders(meta) {
   assert.equal(get('x-nexusai-role'), ROLE);
   assert.ok(!meta.get('authorization')?.length, 'Bearer must be consumed, never forwarded');
   const exp = Number(get('x-nexusai-exp'));
-  assert.ok(Number.isFinite(exp) && exp > NOW && exp <= NOW + 60, 'exp must be a fresh 60s window');
+  // deep-review C: assert against the CURRENT clock, not the module-load NOW
+  // constant — node --test schedules test FILES concurrently and a long queue
+  // delay pushed the frozen window more than 60s behind the proxy's fresh
+  // exp, failing spuriously (single-file runs always passed). exp is minted
+  // at request time as now+60; a generous ± window removes the race while
+  // still rejecting stale/forged values.
+  const now = Math.floor(Date.now() / 1000);
+  assert.ok(Number.isFinite(exp) && exp >= now - 10 && exp <= now + 120,
+            'exp must be a fresh 60s window');
   assert.equal(get('x-nexusai-token-hash'), TOKEN_HASH);
   const canonical = [USER_ID, USERNAME, ROLE, String(exp), TOKEN_HASH].join('|');
   assert.equal(get('x-nexusai-signature'), hmacHex(canonical), 'signature must cover all five fields');

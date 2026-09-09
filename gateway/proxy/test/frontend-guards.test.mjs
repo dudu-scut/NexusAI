@@ -73,13 +73,19 @@ test('Dashboard reads real observability/registry RPCs and shows honest states',
   assert.match(dashboard, /useFallbackData/, 'honest empty fallback required');
 });
 
-test('Monitor reads real trace/metrics RPCs and shows honest states', () => {
+test('Monitor reads real registry/metrics RPCs and shows honest states', () => {
   const monitor = fs.readFileSync(path.join(VIEWS, 'Monitor.vue'), 'utf8');
-  for (const rpc of ['getAgents', 'getAgentMetrics', 'getTraceDetail']) {
+  for (const rpc of ['getAgents', 'getAgentMetrics']) {
     assert.ok(monitor.includes(rpc), `Monitor must call ${rpc}`);
   }
   assert.match(monitor, /dataAvailable/, 'connection warning state required');
   assert.match(monitor, /EmptyState/, 'empty state required when no trace data');
+  // deep-review D-F1: trace-based latency/error panels have no backend
+  // enumeration RPC today (GetTraceDetail needs a trace id that nothing
+  // lists), so Monitor must NOT fabricate a trace call — the honest
+  // EmptyStates cover the missing channel until a recent-traces RPC exists.
+  assert.ok(!monitor.includes('getTraceDetail'),
+            'Monitor must not fake trace RPCs without a trace-list source');
 });
 
 // 3. Role gating (login role → admin entry points)

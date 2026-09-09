@@ -3,6 +3,7 @@
 #include "agent_rpc/common/postgres_store.h"
 
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -103,6 +104,9 @@ public:
     // so a registration-time PostgreSQL outage self-heals on the next heartbeat.
     bool updateAgentHeartbeat(const std::string& agent_id);
     bool markAgentStatus(const std::string& agent_id, const std::string& health_status);
+    // Latest health verdict per agent (agent_registry, deduplicated across
+    // owner rows) — the backing read for GetAgents' health_status field.
+    std::map<std::string, std::string> listAgentHealthStatus();
     std::optional<AgentRegistryRecord> getAgent(const std::string& agent_id);
     std::vector<AgentRegistryRecord> listAgents();
 

@@ -23,6 +23,10 @@ message ServiceInfo {
     bool cacheable = 10;                 // Semantically cacheable responses
     string deployment_stage = 11;        // STABLE / CANARY / DEPRECATED
     string a2a_version = 12;             // A2A protocol version (e.g. "1.0", "1.1")
+    // Live health verdict from agent_registry (health evaluation task).
+    // Values: HEALTHY / DEGRADED / UNHEALTHY / UNKNOWN; empty when the agent
+    // has no registry row (e.g. transient in-memory registrations).
+    string health_status = 13;
 }
 
 // Health check request

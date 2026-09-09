@@ -318,6 +318,19 @@ grpc::Status AgentCommunicationServiceImpl::GetAgents(
     }
     response->set_total_count(static_cast<int>(matches.size()));
 
+    // Live health verdicts come from the durable agent_registry (written by
+    // the health-evaluation task every 30s), not the in-memory liveness map.
+    // A registry/DB failure degrades to empty health fields, never a failed
+    // listing. The composite key matches RegisterAgent's agent_id exactly.
+    std::map<std::string, std::string> health;
+    if (runtime_repository_ != nullptr) {
+        try {
+            health = runtime_repository_->listAgentHealthStatus();
+        } catch (const std::exception& error) {
+            LOG_WARN(std::string("GetAgents health lookup failed: ") + error.what());
+        }
+    }
+
     int added = 0;
     for (size_t i = static_cast<size_t>(offset); i < matches.size(); ++i) {
         if (added >= limit) break;
@@ -338,6 +351,12 @@ grpc::Status AgentCommunicationServiceImpl::GetAgents(
             info->add_skills(s);
         }
         info->set_agent_card(ep.agent_card);
+        const std::string agent_key =
+            ep.service_name + "-" + ep.host + "-" + std::to_string(ep.port);
+        const auto health_it = health.find(agent_key);
+        if (health_it != health.end()) {
+            info->set_health_status(health_it->second);
+        }
         added++;
     }
 

@@ -572,7 +572,13 @@ protected:
     };
 
     static int nextPort() {
-        static std::atomic<int> port{52160};
+        // Per-process randomized base (52160..53759): repeated full gates
+        // within the same TIME_WAIT window used to re-bind the same static
+        // ports and hit EADDRINUSE on the RpcServer listener (flaky Durable
+        // runs under full ctest). Varying the base per process keeps each
+        // test run clear of the previous process's TIME_WAIT sockets.
+        static const int base = 52160 + (static_cast<int>(::getpid()) % 1600);
+        static std::atomic<int> port{base};
         return port.fetch_add(1);
     }
 

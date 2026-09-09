@@ -1,0 +1,12 @@
+fix(health): A/B/C/D 四项拍板推进——GetAgents 健康三态真实化/直连 agent 归因/网关测试竞态/plan_only candidates
+
+A 健康三态后端化: common.ServiceInfo 加 health_status(13) 字段、repo 加 listAgentHealthStatus
+(DISTINCT ON agent_registry 最新 verdict)、GetAgents 按复合键合并; 前端 proto.ts/agents.ts
+(healthStatus 派生 healthy=非 UNHEALTHY)/AdminView 恢复 Healthy/Degraded/Offline 三卡与四态状态列
+B 直连/流式 agent_id 归因: QueryStream acted_agent_id(编排真实 streamed id; 直连仅客户端
+preference 可归因) 替代 4 处恒空落 default; Query 直连同理; 修正矛盾注释
+C 网关测试: trusted-proxy exp 断言改动态时钟(消除冻结 NOW + node --test 并发排队竞态);
+frontend-guards Monitor 守卫同步诚实终局(无 trace-list RPC 禁止伪造 getTraceDetail 调用)
+D plan_only candidates: sync/stream 两处序列化补 routing-candidate provenance(与执行事件对齐)
+测试基建: DurableQueryPipelineTest nextPort 改进程级随机基址(52160..53759), 消除跨 gate
+进程 TIME_WAIT 端口重用 EADDRINUSE(全量 ctest 偶发根因); 验证 37/37 x2 + 网关 126/126 + redline

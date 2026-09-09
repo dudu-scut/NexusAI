@@ -138,6 +138,25 @@ bool AgentRuntimeRepository::markAgentStatus(const std::string& agent_id,
     return ok;
 }
 
+std::map<std::string, std::string> AgentRuntimeRepository::listAgentHealthStatus() {
+    std::map<std::string, std::string> health;
+    store_.executeTransaction([&](pqxx::work& transaction) {
+        // Latest verdict per agent id. Health evaluation writes the same
+        // status to every owner row of an agent (markAgentStatus is
+        // owner-less), so DISTINCT ON only de-duplicates multi-owner rows.
+        const auto result = execParams(
+            transaction,
+            "SELECT DISTINCT ON (agent_id) agent_id, health_status "
+            "FROM agent_registry ORDER BY agent_id, updated_at DESC");
+        for (const auto& row : result) {
+            const auto& field = row["health_status"];
+            health[row["agent_id"].template as<std::string>()] =
+                field.is_null() ? std::string{} : field.template as<std::string>();
+        }
+    });
+    return health;
+}
+
 std::optional<AgentRegistryRecord> AgentRuntimeRepository::getAgent(const std::string& agent_id) {
     std::optional<AgentRegistryRecord> record;
     store_.executeTransaction([&](pqxx::work& transaction) {

@@ -24,6 +24,9 @@ export interface ServiceInfo {
   cacheable?: boolean
   deployment_stage?: string
   a2a_version?: string
+  // Live health verdict (agent_registry): HEALTHY / DEGRADED / UNHEALTHY /
+  // UNKNOWN; absent when the agent has no registry row.
+  health_status?: string
 }
 
 // ai_query.proto
@@ -415,6 +418,9 @@ export interface AgentDisplayInfo {
   tags: string[]
   skills: string[]
   healthy: boolean
+  // Real health verdict from agent_registry (see ServiceInfo.health_status);
+  // 'UNKNOWN' when no verdict has been written yet.
+  healthStatus?: string
   metrics?: AgentMetrics
 }
 

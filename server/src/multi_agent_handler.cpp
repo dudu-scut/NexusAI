@@ -504,6 +504,19 @@ grpc::Status MultiAgentHandler::handleQuery(
                 tj["depends_on"] = t.depends_on;
                 tj["agent_id"] = t.preferred_agent_id;
                 tj["agent_name"] = t.preferred_agent_name;
+                // P12(a) parity with the executing-plan event: routing-
+                // candidate provenance is part of the plan contract, so the
+                // confirmation flow shows the same route info the user will
+                // get after execution.
+                tj["candidates"] = nlohmann::json::array();
+                for (const auto& cand : t.candidate_agents) {
+                    nlohmann::json cj;
+                    cj["agent_id"] = cand.agent_id;
+                    cj["agent_name"] = cand.agent_name;
+                    cj["confidence"] = cand.confidence;
+                    cj["confidence_source"] = cand.confidence_source;
+                    tj["candidates"].push_back(std::move(cj));
+                }
                 plan_only_json["tasks"].push_back(std::move(tj));
             }
         }
@@ -815,6 +828,19 @@ grpc::Status MultiAgentHandler::handleQueryStream(
                 tj["depends_on"] = t.depends_on;
                 tj["agent_id"] = t.preferred_agent_id;
                 tj["agent_name"] = t.preferred_agent_name;
+                // P12(a) parity with the executing-plan event: routing-
+                // candidate provenance is part of the plan contract, so the
+                // confirmation flow shows the same route info the user will
+                // get after execution.
+                tj["candidates"] = nlohmann::json::array();
+                for (const auto& cand : t.candidate_agents) {
+                    nlohmann::json cj;
+                    cj["agent_id"] = cand.agent_id;
+                    cj["agent_name"] = cand.agent_name;
+                    cj["confidence"] = cand.confidence;
+                    cj["confidence_source"] = cand.confidence_source;
+                    tj["candidates"].push_back(std::move(cj));
+                }
                 plan_only_json["tasks"].push_back(std::move(tj));
             }
         }

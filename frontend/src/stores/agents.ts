@@ -63,6 +63,7 @@ export const useAgentsStore = defineStore('agents', () => {
       // agent_card JSON parse failed, fallback to skills field
     }
 
+    const status = info.health_status || ''
     return {
       id: info.service_name,
       name: info.service_name,
@@ -71,7 +72,11 @@ export const useAgentsStore = defineStore('agents', () => {
       version: info.version,
       tags: info.tags || [],
       skills: cardSkills.length > 0 ? cardSkills : info.skills || [],
-      healthy: true, // Agent returned from GetAgents = currently registered and reachable
+      // Registered via GetAgents = currently reachable; the health verdict
+      // decides routability: UNHEALTHY/offline are excluded from routing,
+      // DEGRADED stays routable (observability-only signal).
+      healthStatus: status || 'UNKNOWN',
+      healthy: status !== 'UNHEALTHY' && status !== 'offline',
     }
   }
 

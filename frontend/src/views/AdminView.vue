@@ -50,6 +50,24 @@
               <span class="stat-label">Healthy</span>
             </div>
           </div>
+          <div class="stat-card">
+            <div class="stat-icon" style="background:rgba(245,158,11,0.12);color:#f59e0b;">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+            </div>
+            <div class="stat-info">
+              <span class="stat-value">{{ degradedCount }}</span>
+              <span class="stat-label">Degraded</span>
+            </div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon" style="background:rgba(239,68,68,0.12);color:#ef4444;">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
+            </div>
+            <div class="stat-info">
+              <span class="stat-value">{{ offlineCount }}</span>
+              <span class="stat-label">Offline</span>
+            </div>
+          </div>
         </div>
 
         <!-- Agent Health Table -->
@@ -186,19 +204,33 @@ const tabs = [
 ]
 
 const agents = computed(() => agentsStore.agents)
-// deep-review fr-*: GetAgents returns the live in-memory registry, so every
-// listed agent is reachable — the former Degraded/Offline stat cards read
-// the same !healthy bucket (always zero) and were removed. A real
-// HEALTHY/DEGRADED/UNHEALTHY breakdown needs the agent_registry
-// health_status surfaced on GetAgents (tracked separately).
-const healthyCount = computed(() => agents.value.filter(a => a.healthy).length)
+// Health verdicts come from agent_registry via GetAgents.health_status
+// (written by the 30s health-evaluation task); agents without a verdict yet
+// count nowhere and show as Unknown in the table.
+const healthyCount = computed(() => agents.value.filter(a => a.healthStatus === 'HEALTHY').length)
+const degradedCount = computed(() => agents.value.filter(a => a.healthStatus === 'DEGRADED').length)
+const offlineCount = computed(() =>
+  agents.value.filter(a => a.healthStatus === 'UNHEALTHY' || a.healthStatus === 'offline').length,
+)
 
 function getHealthClass(a: AgentDisplayInfo): string {
-  return a.healthy ? 'healthy' : 'unhealthy'
+  switch (a.healthStatus) {
+    case 'HEALTHY': return 'healthy'
+    case 'DEGRADED': return 'degraded'
+    case 'UNHEALTHY':
+    case 'offline': return 'unhealthy'
+    default: return 'unknown'
+  }
 }
 
 function getHealthLabel(a: AgentDisplayInfo): string {
-  return a.healthy ? 'Healthy' : 'Offline'
+  switch (a.healthStatus) {
+    case 'HEALTHY': return 'Healthy'
+    case 'DEGRADED': return 'Degraded'
+    case 'UNHEALTHY':
+    case 'offline': return 'Offline'
+    default: return 'Unknown'
+  }
 }
 
 function getSuccessRate(a: AgentDisplayInfo): number {
@@ -507,6 +539,7 @@ onUnmounted(() => {
 .status-light.healthy { background: var(--color-success); box-shadow: 0 0 4px rgba(34,197,94,0.4); }
 .status-light.degraded { background: var(--color-warning); }
 .status-light.unhealthy { background: var(--text-muted); }
+.status-light.unknown { background: var(--text-tertiary); }
 
 .bar-cell { display: flex; align-items: center; gap: 8px; min-width: 80px; }
 .bar-bg { flex: 1; height: 6px; border-radius: 3px; background: var(--bg-surface); overflow: hidden; }
