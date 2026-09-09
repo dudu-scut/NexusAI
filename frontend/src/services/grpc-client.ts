@@ -23,6 +23,8 @@ import type {
   LogoutResponse,
   GetTraceDetailResponse,
   GetCostReportResponse,
+  GetBudgetSummaryRequest,
+  GetBudgetSummaryResponse,
   ReplayQueryRequest,
   ReplayQueryResponse,
   ExportConversationRequest,
@@ -387,6 +389,21 @@ export async function getCostReport(
     )
   } catch (e) {
     console.warn('Failed to get cost report:', e)
+    return null
+  }
+}
+
+/**
+ * Fetch the authenticated owner's budget usage vs limits (PG budget_counters
+ * + owner policy / environment defaults).
+ */
+export async function getBudgetSummary(): Promise<GetBudgetSummaryResponse | null> {
+  try {
+    return await unaryCall<GetBudgetSummaryRequest, GetBudgetSummaryResponse>(
+      OBSERVABILITY, 'GetBudgetSummary', {}
+    )
+  } catch (e) {
+    console.warn('Failed to get budget summary:', e)
     return null
   }
 }

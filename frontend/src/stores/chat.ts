@@ -1,14 +1,13 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { queryStream } from '../services/grpc-client'
-import type { ChatMessage, AIStreamEvent, TraceInfo, ActivityEntry } from '../types/proto'
+import type { ChatMessage, AIStreamEvent, ActivityEntry } from '../types/proto'
 
 export const useChatStore = defineStore('chat', () => {
   const messages = ref<ChatMessage[]>([])
   const isStreaming = ref(false)
   const contextId = ref(generateContextId())
   const abortController = ref<AbortController | null>(null)
-  const traceInfo = ref<TraceInfo | null>(null)
   const activityEntries = ref<ActivityEntry[]>([])
 
   const lastAgentName = computed(() => {
@@ -67,7 +66,6 @@ export const useChatStore = defineStore('chat', () => {
     messages.value.push(agentMsg)
     const reactiveMsg = messages.value[messages.value.length - 1]
     isStreaming.value = true
-    traceInfo.value = null
 
     const ac = new AbortController()
     abortController.value = ac
@@ -170,6 +168,10 @@ export const useChatStore = defineStore('chat', () => {
               status: 'pending' as const,
               agent_id: t.agent_id,
               agent_name: t.agent_name,
+              // P12(a): routing-candidate provenance rides the plan JSON;
+              // embedding confidence is a real cosine similarity while
+              // ranking values are labelled placeholders in the UI.
+              candidates: t.candidates || undefined,
             })),
           }
           addActivity('thinking', `Execution plan: ${plan.tasks?.length || 0} subtask(s)`)
@@ -219,6 +221,13 @@ export const useChatStore = defineStore('chat', () => {
         // longer synthesizes a complete frame for awaiting_confirmation
         // streams — gateway contract).
         msg.processingTimeMs = Date.now() - msg.timestamp
+        // deep-review fr-*: the pipeline fills trace_summary on this event
+        // (span_name Xms -> ...) and the gateway relays it verbatim — it
+        // was received and dropped before. The structured TraceInfo UI has
+        // no backend channel, so this text is the real trace record.
+        if (event.trace_summary) {
+          msg.traceSummaryText = event.trace_summary
+        }
         isStreaming.value = false
         abortController.value = null
         addActivity('complete', 'Query completed', {
@@ -267,7 +276,6 @@ export const useChatStore = defineStore('chat', () => {
     stopStreaming()
     messages.value = []
     contextId.value = generateContextId()
-    traceInfo.value = null
     activityEntries.value = []
   }
 
@@ -276,7 +284,6 @@ export const useChatStore = defineStore('chat', () => {
     isStreaming,
     contextId,
     lastAgentName,
-    traceInfo,
     activityEntries,
     sendQuestion,
     retryLast,

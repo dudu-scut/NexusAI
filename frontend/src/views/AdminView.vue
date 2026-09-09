@@ -50,24 +50,6 @@
               <span class="stat-label">Healthy</span>
             </div>
           </div>
-          <div class="stat-card">
-            <div class="stat-icon" style="background:rgba(245,158,11,0.12);color:#f59e0b;">
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
-            </div>
-            <div class="stat-info">
-              <span class="stat-value">{{ degradedCount }}</span>
-              <span class="stat-label">Degraded</span>
-            </div>
-          </div>
-          <div class="stat-card">
-            <div class="stat-icon" style="background:rgba(239,68,68,0.12);color:#ef4444;">
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
-            </div>
-            <div class="stat-info">
-              <span class="stat-value">{{ unhealthyCount }}</span>
-              <span class="stat-label">Offline</span>
-            </div>
-          </div>
         </div>
 
         <!-- Agent Health Table -->
@@ -111,6 +93,16 @@
       <div v-if="activeTab === 'budget'" class="tab-content">
         <div class="section">
           <h3>Token Budget Overview</h3>
+          <!-- Global shared bucket: only rendered when a global cap exists or
+               tokens were consumed; 0 limit means unlimited. -->
+          <div v-if="globalLimit > 0 || globalUsed > 0" class="budget-global">
+            <span class="budget-global-label">Global (shared across users)</span>
+            <span class="budget-global-values">
+              limit <strong>{{ formatLimit(globalLimit) }}</strong>
+              · used <strong>{{ formatTokens(globalUsed) }}</strong>
+              <span v-if="globalLimit > 0">· remaining <strong>{{ formatTokens(globalRemaining) }}</strong></span>
+            </span>
+          </div>
           <div class="budget-cards">
             <div class="budget-card">
               <div class="budget-ring">
@@ -124,14 +116,14 @@
                 </div>
               </div>
               <div class="budget-details">
-                <div class="budget-row"><span>Daily Limit</span><span>{{ formatTokens(dailyLimit) }}</span></div>
+                <div class="budget-row"><span>Daily Limit</span><span>{{ formatLimit(dailyLimit) }}</span></div>
                 <div class="budget-row"><span>Used</span><span>{{ formatTokens(dailyUsed) }}</span></div>
                 <div class="budget-row"><span>Remaining</span><span class="remaining">{{ formatTokens(dailyRemaining) }}</span></div>
               </div>
             </div>
             <div class="budget-card">
               <div class="budget-details full-width">
-                <div class="budget-row"><span>Monthly Limit</span><span>{{ formatTokens(monthlyLimit) }}</span></div>
+                <div class="budget-row"><span>Monthly Limit</span><span>{{ formatLimit(monthlyLimit) }}</span></div>
                 <div class="budget-row"><span>Used</span><span>{{ formatTokens(monthlyUsed) }}</span></div>
                 <div class="budget-row"><span>Remaining</span><span class="remaining">{{ formatTokens(monthlyRemaining) }}</span></div>
                 <div class="budget-row muted"><span>Reset Time</span><span>{{ resetTime }}</span></div>
@@ -180,7 +172,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useAgentsStore } from '../stores/agents'
-import { replayQuery as replayQueryRpc } from '../services/grpc-client'
+import { replayQuery as replayQueryRpc, getBudgetSummary } from '../services/grpc-client'
 import type { AgentDisplayInfo } from '../types/proto'
 
 const agentsStore = useAgentsStore()
@@ -194,9 +186,12 @@ const tabs = [
 ]
 
 const agents = computed(() => agentsStore.agents)
+// deep-review fr-*: GetAgents returns the live in-memory registry, so every
+// listed agent is reachable — the former Degraded/Offline stat cards read
+// the same !healthy bucket (always zero) and were removed. A real
+// HEALTHY/DEGRADED/UNHEALTHY breakdown needs the agent_registry
+// health_status surfaced on GetAgents (tracked separately).
 const healthyCount = computed(() => agents.value.filter(a => a.healthy).length)
-const degradedCount = computed(() => agents.value.filter(a => !a.healthy).length)
-const unhealthyCount = computed(() => agents.value.filter(a => !a.healthy).length)
 
 function getHealthClass(a: AgentDisplayInfo): string {
   return a.healthy ? 'healthy' : 'unhealthy'
@@ -214,12 +209,18 @@ function getAvgLatency(a: AgentDisplayInfo): number | string {
   return a.metrics?.avg_latency_ms ?? '--'
 }
 
-// Budget
+// Budget — real values arrive via GetBudgetSummary (owner-scoped PG read of
+// budget_counters + policy/env limits); these refs used to stay 0 forever on
+// a mock-only page (deep-review fr-*).
+const globalLimit = ref(0)
+const globalUsed = ref(0)
 const dailyLimit = ref(0)
 const dailyUsed = ref(0)
 const monthlyLimit = ref(0)
 const monthlyUsed = ref(0)
+const budgetLoading = ref(false)
 
+const globalRemaining = computed(() => Math.max(0, globalLimit.value - globalUsed.value))
 const dailyRemaining = computed(() => dailyLimit.value - dailyUsed.value)
 const monthlyRemaining = computed(() => monthlyLimit.value - monthlyUsed.value)
 const dailyUsedPercent = computed(() => dailyLimit.value > 0 ? Math.round((dailyUsed.value / dailyLimit.value) * 100) : 0)
@@ -245,6 +246,27 @@ function formatTokens(n: number): string {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M'
   if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K'
   return n.toString()
+}
+
+// limit 0 means unlimited (the global default) and renders as such.
+function formatLimit(n: number): string {
+  return n === 0 ? 'Unlimited' : formatTokens(n)
+}
+
+async function loadBudget() {
+  budgetLoading.value = true
+  try {
+    const resp = await getBudgetSummary()
+    if (!resp) return
+    globalLimit.value = Number(resp.global?.limit ?? 0)
+    globalUsed.value = Number(resp.global?.used ?? 0)
+    dailyLimit.value = Number(resp.daily?.limit ?? 0)
+    dailyUsed.value = Number(resp.daily?.used ?? 0)
+    monthlyLimit.value = Number(resp.monthly?.limit ?? 0)
+    monthlyUsed.value = Number(resp.monthly?.used ?? 0)
+  } finally {
+    budgetLoading.value = false
+  }
 }
 
 // Replay
@@ -282,6 +304,7 @@ async function refreshAll() {
 
 onMounted(() => {
   agentsStore.startPolling(15000)
+  loadBudget()
 })
 
 onUnmounted(() => {
@@ -497,6 +520,19 @@ onUnmounted(() => {
 
 /* Budget */
 .budget-cards { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.budget-global {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 16px;
+  margin-bottom: 12px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+.budget-global-values { display: inline-flex; gap: 8px; align-items: center; }
 .budget-card { padding: 20px; background: var(--bg-surface); border-radius: var(--radius-md); display: flex; align-items: center; gap: 24px; border: 1px solid var(--border-subtle); }
 .budget-ring { position: relative; flex-shrink: 0; }
 .ring-text { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; }

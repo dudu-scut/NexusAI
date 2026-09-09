@@ -346,6 +346,42 @@ std::vector<InvocationMetricsRecord> AgentRuntimeRepository::aggregateInvocation
     return records;
 }
 
+std::optional<InvocationMetricsRecord> AgentRuntimeRepository::metricsForAgent(
+    const std::string& owner_id, const std::string& agent_id) {
+    std::optional<InvocationMetricsRecord> record;
+    store_.executeTransaction([&](pqxx::work& transaction) {
+        // Owner-scoped single-agent aggregates with a real 95th-percentile
+        // latency (PERCENTILE_CONT over the recorded latency_ms samples).
+        // No Redis fallback: the legacy agent_metrics cache carried no owner
+        // dimension and a cross-tenant read would leak aggregates.
+        const auto result = execParams(
+            transaction,
+            "SELECT COUNT(*) AS total_requests, "
+            "ROUND(100.0 * COUNT(*) FILTER (WHERE status = 'success') / "
+            "NULLIF(COUNT(*), 0), 2)::text AS success_rate, "
+            "ROUND(AVG(latency_ms), 2)::text AS avg_latency_ms, "
+            "ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY latency_ms), "
+            "2)::text AS p95_latency_ms "
+            "FROM agent_invocations WHERE owner_id = $1 AND agent_id = $2",
+            owner_id, agent_id);
+        if (result.empty() || result[0]["total_requests"].as<std::int64_t>() == 0) {
+            return;
+        }
+        const auto& row = result[0];
+        const auto text_or_empty = [](const pqxx::field& field) {
+            return field.is_null() ? std::string{} : field.as<std::string>();
+        };
+        record = InvocationMetricsRecord{
+            .agent_id = agent_id,
+            .total_requests = row["total_requests"].as<std::int64_t>(),
+            .success_rate = text_or_empty(row["success_rate"]),
+            .avg_latency_ms = text_or_empty(row["avg_latency_ms"]),
+            .p95_latency_ms = text_or_empty(row["p95_latency_ms"]),
+        };
+    });
+    return record;
+}
+
 std::vector<DailyCostRecord> AgentRuntimeRepository::dailyCostReport(
     const std::string& owner_id, const std::string& start_date, const std::string& end_date) {
     std::vector<DailyCostRecord> records;

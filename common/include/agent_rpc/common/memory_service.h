@@ -128,7 +128,8 @@ private:
     //         TTL = 会话真实剩余（P26 T2），PG auth_sessions 为事实源）
     //       trace:spans:<trace_id>（span 批量冗余，PG 兜底读取，
     //         main.cpp 写 / observability 读，TTL 24h）
-    //       agent_metrics:<aid>（feedback_aggregator 写 / GetAgentMetrics 读）
+    //       （agent_metrics:<aid> 已退役 2026-09-09：无 owner 维度的跨租户
+    //         缓存被 GetAgentMetrics owner 视图重写取代，读方与写方同批移除）
     //   - [transient]（无业务后果的瞬态/协调键）——
     //       nexusai:last_agent:*、限流计数、分布式短锁、预算实时计数面、
     //       auth:deny:<token_hash>（P26 会话级撤销短锁，Logout 写点，TTL 60s）、

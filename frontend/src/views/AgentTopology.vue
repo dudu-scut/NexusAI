@@ -56,6 +56,10 @@ let refreshTimer: ReturnType<typeof setInterval> | null = null
 // Active Agent State (real-time topology)
 const activeAgents = ref<Set<string>>(new Set())
 const activeTimers = new Map<string, ReturnType<typeof setTimeout>>()
+// Single all-agent reset timer for terminal entries (deep-review: the reset
+// used to spawn one unregistered 5s timeout per complete/error entry — they
+// stacked under rapid traffic and kept firing after unmount).
+let activeResetTimer: ReturnType<typeof setTimeout> | null = null
 
 // Computed
 const filteredAgents = computed(() => {
@@ -249,7 +253,11 @@ watch(() => chatStore.activityEntries.length, (newLen, oldLen) => {
       markAgentActive(entry.agent_name)
     }
     if (entry.type === 'complete' || entry.type === 'error') {
-      setTimeout(() => { activeAgents.value = new Set() }, 5000)
+      if (activeResetTimer) clearTimeout(activeResetTimer)
+      activeResetTimer = setTimeout(() => {
+        activeAgents.value = new Set()
+        activeResetTimer = null
+      }, 5000)
     }
   }
 })
@@ -407,6 +415,10 @@ onUnmounted(() => {
     clearTimeout(timer)
   }
   activeTimers.clear()
+  if (activeResetTimer) {
+    clearTimeout(activeResetTimer)
+    activeResetTimer = null
+  }
 })
 </script>
 

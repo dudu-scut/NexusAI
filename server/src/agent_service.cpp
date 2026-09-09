@@ -72,6 +72,11 @@ namespace {
 // Liveness cache TTL: three missed heartbeats, never below 5 minutes.
 constexpr int kDefaultLivenessTtlSeconds = 300;
 
+// Per-agent inbox cap (deep-review): an offline agent must not grow an
+// unbounded in-memory queue. New messages are rejected once the cap is hit;
+// dropping old messages could discard commands the agent never consumed.
+constexpr size_t kMaxInboxMessages = 5000;
+
 int livenessTtlSeconds(int heartbeat_interval) {
     if (heartbeat_interval <= 0) {
         return kDefaultLivenessTtlSeconds;
@@ -154,7 +159,15 @@ grpc::Status AgentCommunicationServiceImpl::SendMessage(
 
     std::lock_guard<std::mutex> lock(agents_mutex_);
     auto it = agent_message_queues_.find(target);
-    if (it != agent_message_queues_.end()) {
+    if (it != agent_message_queues_.end() &&
+        it->second.size() >= kMaxInboxMessages) {
+        // Bounded inbox (deep-review): reject new messages once the cap is
+        // hit; dropping old messages could discard commands the agent never
+        // consumed while it was offline.
+        auto* status = response->mutable_status();
+        status->set_code(1);
+        status->set_message("Target agent inbox full: " + target);
+    } else if (it != agent_message_queues_.end()) {
         // Stamp the authenticated sender so the receiving side can attribute
         // messages (the Message proto has no dedicated sender field; headers
         // keep the proto contract untouched).
@@ -242,18 +255,26 @@ grpc::Status AgentCommunicationServiceImpl::BroadcastMessage(
 
     if (request->target_agents_size() == 0) {
         for (auto& pair : agent_message_queues_) {
+            if (pair.second.size() >= kMaxInboxMessages) {
+                // Full inboxes are reported as undelivered, like missing
+                // targets; the message must not be silently dropped.
+                failure_count++;
+                response->add_failed_agents(pair.first);
+                continue;
+            }
             pair.second.push(request->message());
             success_count++;
         }
     } else {
         for (const auto& agent_id : request->target_agents()) {
             auto it = agent_message_queues_.find(agent_id);
-            if (it != agent_message_queues_.end()) {
-                it->second.push(request->message());
-                success_count++;
-            } else {
+            if (it == agent_message_queues_.end() ||
+                it->second.size() >= kMaxInboxMessages) {
                 failure_count++;
                 response->add_failed_agents(agent_id);
+            } else {
+                it->second.push(request->message());
+                success_count++;
             }
         }
     }
@@ -277,39 +298,49 @@ grpc::Status AgentCommunicationServiceImpl::GetAgents(
 
     std::lock_guard<std::mutex> lock(agents_mutex_);
     int offset = request->offset();
+    if (offset < 0) offset = 0;
     int limit = request->limit();
     if (limit <= 0) limit = 100;
 
-    int index = 0;
-    int added = 0;
+    // deep-review: apply the filter before offset/limit and report the
+    // filtered total. The legacy loop consumed offset inside the filter scan
+    // (filtered-out agents still advanced the page) and set total_count to
+    // the unfiltered registry size, which broke paging whenever a filter was
+    // active.
+    std::vector<const common::ServiceEndpoint*> matches;
+    matches.reserve(agents_.size());
     for (const auto& pair : agents_) {
-        if (index++ < offset) continue;
-        if (added >= limit) break;
-
         if (!request->filter().empty() &&
             pair.second.service_name.find(request->filter()) == std::string::npos) {
             continue;
         }
+        matches.push_back(&pair.second);
+    }
+    response->set_total_count(static_cast<int>(matches.size()));
+
+    int added = 0;
+    for (size_t i = static_cast<size_t>(offset); i < matches.size(); ++i) {
+        if (added >= limit) break;
+        const auto& ep = *matches[i];
 
         auto* info = response->add_agents();
-        info->set_service_name(pair.second.service_name);
-        info->set_version(pair.second.version);
-        info->set_host(pair.second.host);
-        info->set_port(pair.second.port);
-        for (const auto& t : pair.second.tags) {
+        info->set_service_name(ep.service_name);
+        info->set_version(ep.version);
+        info->set_host(ep.host);
+        info->set_port(ep.port);
+        for (const auto& t : ep.tags) {
             info->add_tags(t);
         }
-        for (const auto& m : pair.second.metadata) {
+        for (const auto& m : ep.metadata) {
             (*info->mutable_metadata())[m.first] = m.second;
         }
-        for (const auto& s : pair.second.skills) {
+        for (const auto& s : ep.skills) {
             info->add_skills(s);
         }
-        info->set_agent_card(pair.second.agent_card);
+        info->set_agent_card(ep.agent_card);
         added++;
     }
 
-    response->set_total_count(static_cast<int>(agents_.size()));
     auto* status = response->mutable_status();
     status->set_code(0);
     status->set_message("OK");
@@ -658,7 +689,8 @@ grpc::Status AgentCommunicationServiceImpl::BatchSendMessages(
     while (reader->Read(&req)) {
         std::lock_guard<std::mutex> lock(agents_mutex_);
         auto it = agent_message_queues_.find(req.target_agent());
-        if (it != agent_message_queues_.end()) {
+        if (it != agent_message_queues_.end() &&
+            it->second.size() < kMaxInboxMessages) {
             it->second.push(req.message());
             count++;
         }

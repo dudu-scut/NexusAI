@@ -89,6 +89,16 @@ function userInitial(): string {
           <span v-if="!collapsed" class="nav-label">{{ item.label }}</span>
         </Transition>
       </div>
+
+      <!-- Mobile logout (deep-review fr-*): the desktop user-area is hidden
+           below 768px, which left ChatView's header button as the only
+           reachable logout on the other seven pages. -->
+      <div class="nav-item mobile-logout" @click="handleLogout" title="登出">
+        <Icon icon="mdi:logout" :width="22" class="nav-icon" />
+        <Transition name="fade">
+          <span v-if="!collapsed" class="nav-label">登出</span>
+        </Transition>
+      </div>
     </nav>
 
     <!-- Bottom section -->
@@ -438,6 +448,22 @@ function userInitial(): string {
 
   .bottom-section {
     display: none;
+  }
+}
+
+/* Mobile logout entry: hidden on desktop, appended to the bottom tab bar. */
+.mobile-logout {
+  display: none;
+}
+
+@media (max-width: 768px) {
+  .mobile-logout {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: var(--space-1) var(--space-2);
+    font-size: 10px;
+    color: var(--text-muted);
   }
 }
 </style>

@@ -30,20 +30,16 @@
         </template>
       </div>
 
-      <!-- Trace summary -->
-      <div v-if="message.traceInfo" class="trace-summary">
-        <span class="trace-badge" :title="'Trace ID: ' + message.traceInfo.trace_id">
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
-          Route {{ message.traceInfo.route_time_ms }}ms
-        </span>
-        <span class="trace-arrow">→</span>
-        <span class="trace-agent">{{ message.traceInfo.agent_name }}</span>
-        <span class="trace-arrow">→</span>
+      <!-- Trace summary: the durable pipeline's human-readable record
+           (span_name Xms -> ...) relayed on the complete event. The former
+           structured route/agent/total badges read TraceInfo fields that no
+           backend channel ever produced. -->
+      <div v-if="message.traceSummaryText" class="trace-summary">
         <span class="trace-badge">
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
-          Agent {{ message.traceInfo.agent_time_ms }}ms
+          Trace
         </span>
-        <span class="trace-total">{{ message.traceInfo.total_time_ms }}ms total</span>
+        <span class="trace-total" :title="message.traceSummaryText">{{ message.traceSummaryText }}</span>
       </div>
 
       <!-- Feedback buttons -->

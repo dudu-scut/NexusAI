@@ -19,7 +19,7 @@ NexusAI 的分享与资产能力覆盖四类场景：把一次会话以只读链
 | 公共读白名单脱敏 | ReadSharedConversation 无需登录，但消息体不含任何身份信息 |
 | 双模式重放 | ReplayQuery 支持 exact（完整复现）与 route（只复现路由） |
 | 双格式导出 | ExportConversation 输出 Markdown / HTML |
-| 模板版本化 | Template 以 JSONB 存储经验证的 DAG 定义，带版本号 |
+| 命名模板资产 | Template 以 JSONB 存储服务端校验过的 DAG 定义；同名唯一，无版本历史（workflow_templates.version 列存在但恒为默认值） |
 
 ## 机制一：Share 分享（TTL + 撤销）
 
@@ -84,10 +84,10 @@ owner 从认证上下文解析（`AuthInterceptor::currentUserId()`）。失败�
 |------|------|
 | `SaveTemplate` | 保存模板（name / description / dag_json），定义经服务端校验后以 JSONB 存储 |
 | `UseTemplate` | 用模板实例化一个新会话（返回 `context_id`） |
-| `ListTemplates` | 列出当前 owner 的模板（含版本号） |
+| `ListTemplates` | 列出当前 owner 的模板 |
 | `GetTemplate` | 读取单个模板详情 |
 
-模板带 `version` 字段，修改即新版本，历史定义不被覆盖。
+模板以 `name` 唯一：`SaveTemplate` 对同名模板返回 `ALREADY_EXISTS`，不存在“修改即新版本、历史不被覆盖”的更新或版本递增路径。`workflow_templates.version` 列保留供未来版本化，当前恒为默认值——面试/文档口径请按“命名唯一、无版本管理”表述。
 
 ## 使用示例
 

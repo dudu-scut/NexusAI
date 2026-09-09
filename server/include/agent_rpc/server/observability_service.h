@@ -27,6 +27,7 @@
 namespace agent_rpc::common {
 class AgentRuntimeRepository;
 class QueryDomainRepository;
+class PostgresBudgetRepository;
 }  // namespace agent_rpc::common
 
 namespace agent_rpc {
@@ -42,6 +43,8 @@ public:
     // RPCs report UNAVAILABLE instead of falling back to owner-less caches.
     void setAgentRuntimeRepository(common::AgentRuntimeRepository* repository);
     void setQueryDomainRepository(common::QueryDomainRepository* repository);
+    // Durable budget counters + owner policies (backing GetBudgetSummary).
+    void setBudgetRepository(common::PostgresBudgetRepository* repository);
 
     grpc::Status GetTraceDetail(
         grpc::ServerContext* context,
@@ -52,6 +55,11 @@ public:
         grpc::ServerContext* context,
         const agent_communication::GetCostReportRequest* request,
         agent_communication::GetCostReportResponse* response) override;
+
+    grpc::Status GetBudgetSummary(
+        grpc::ServerContext* context,
+        const agent_communication::GetBudgetSummaryRequest* request,
+        agent_communication::GetBudgetSummaryResponse* response) override;
 
 private:
     // P6 遗留收口：PG 无记录时的 Redis 批量键兜底读（PG 主、Redis 兜底）。
@@ -64,6 +72,7 @@ private:
     common::RedisClient* redis_client_;
     common::AgentRuntimeRepository* runtime_repository_ = nullptr;
     common::QueryDomainRepository* query_repository_ = nullptr;
+    common::PostgresBudgetRepository* budget_repository_ = nullptr;
 };
 
 } // namespace server

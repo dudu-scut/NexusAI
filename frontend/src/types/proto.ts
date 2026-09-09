@@ -166,6 +166,15 @@ export interface SubTaskInfo {
   result?: string
   agent_id?: string      // backend plan event field (multi_agent_handler)
   agent_name?: string
+  // P12(a): routing candidates with provenance. confidence is a real cosine
+  // similarity ONLY when confidence_source === 'embedding'; 'ranking' values
+  // are placeholders and are labelled as such in the UI.
+  candidates?: Array<{
+    agent_id: string
+    agent_name?: string
+    confidence: number
+    confidence_source: string
+  }>
 }
 
 export interface ExecutionPlan {
@@ -399,6 +408,10 @@ export interface ChatMessage {
   executionPlan?: ExecutionPlan
   activityFeed?: ActivityEntry[]
   traceInfo?: TraceInfo
+  // deep-review fr-*: the durable pipeline emits a human-readable trace
+  // summary on the 'complete' stream event (span_name Xms -> ...); the
+  // structured TraceInfo above has no backend channel and stays unused.
+  traceSummaryText?: string
   feedbackGiven?: 'like' | 'dislike' | null
   timestamp: number
   // B1/U4 two-phase: set when a plan-only stream ends with
@@ -467,6 +480,24 @@ export interface GetCostReportResponse {
   status: Status
   records: CostRecord[]
   total_cost_usd: number
+}
+
+// GetBudgetSummary (observability.proto) — owner-scoped budget usage vs
+// configured limits. limit === 0 means unlimited.
+export interface BudgetSummaryItem {
+  limit: number
+  used: number
+}
+
+export interface GetBudgetSummaryRequest {
+  // empty — the owner comes from the authenticated session
+}
+
+export interface GetBudgetSummaryResponse {
+  status: Status
+  global: BudgetSummaryItem
+  daily: BudgetSummaryItem
+  monthly: BudgetSummaryItem
 }
 
 // Sandbox & Intervention (user_experience.proto)

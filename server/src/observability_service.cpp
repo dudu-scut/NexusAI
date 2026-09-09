@@ -12,7 +12,9 @@
 
 #include "agent_rpc/server/observability_service.h"
 #include "agent_rpc/server/auth_interceptor.h"
+#include "agent_rpc/server/ai_query_service.h"
 #include "agent_rpc/common/agent_runtime_repository.h"
+#include "agent_rpc/common/postgres_budget_repository.h"
 #include "agent_rpc/common/query_domain_repository.h"
 #include "agent_rpc/common/logger.h"
 
@@ -40,6 +42,11 @@ void ObservabilityServiceImpl::setAgentRuntimeRepository(
 void ObservabilityServiceImpl::setQueryDomainRepository(
     common::QueryDomainRepository* repository) {
     query_repository_ = repository;
+}
+
+void ObservabilityServiceImpl::setBudgetRepository(
+    common::PostgresBudgetRepository* repository) {
+    budget_repository_ = repository;
 }
 
 namespace {
@@ -341,6 +348,60 @@ grpc::Status ObservabilityServiceImpl::GetCostReport(
 
     LOG_INFO("GetCostReport returned " + std::to_string(response->records_size()) +
              " records, total=$" + std::to_string(total_cost_usd));
+    return grpc::Status::OK;
+}
+
+grpc::Status ObservabilityServiceImpl::GetBudgetSummary(
+    grpc::ServerContext* context,
+    const agent_communication::GetBudgetSummaryRequest* request,
+    agent_communication::GetBudgetSummaryResponse* response) {
+
+    (void)context;
+
+    if (!request || !response) {
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                            "Invalid request or response");
+    }
+    if (!AuthInterceptor::isAuthenticated()) {
+        return grpc::Status(grpc::StatusCode::UNAUTHENTICATED,
+                            "Valid authentication token required");
+    }
+    if (budget_repository_ == nullptr) {
+        return grpc::Status(grpc::StatusCode::UNAVAILABLE,
+                            "Budget storage not available");
+    }
+
+    // Owner-scoped by construction: limits come from the owner policy when
+    // one exists, otherwise the environment defaults (global 0 = unlimited).
+    // Used counters are read live from PG budget_counters — the same buckets
+    // the reserve path checks — never from a cache.
+    const std::string user_id = AuthInterceptor::currentUserId();
+    try {
+        auto limits = AIQueryServiceImpl::budgetLimitsFromEnvironment();
+        const auto policy = budget_repository_->getOwnerPolicy(user_id);
+        if (policy.has_value()) {
+            limits = *policy;
+        }
+        const auto used = budget_repository_->usageForOwner(user_id);
+
+        auto fill = [](agent_communication::BudgetSummaryItem* item,
+                       std::int64_t limit, std::int64_t used_tokens) {
+            item->set_limit(limit);
+            item->set_used(used_tokens);
+        };
+        fill(response->mutable_global(), limits.global, used.global);
+        fill(response->mutable_daily(), limits.user_daily, used.user_daily);
+        fill(response->mutable_monthly(), limits.user_monthly, used.user_monthly);
+    } catch (const std::exception& e) {
+        LOG_WARN(std::string("GetBudgetSummary failed: ") + e.what());
+        return grpc::Status(grpc::StatusCode::INTERNAL,
+                            "Failed to read budget summary");
+    }
+
+    auto* status = response->mutable_status();
+    status->set_code(0);
+    status->set_message("OK");
+    LOG_INFO("GetBudgetSummary for owner=" + user_id);
     return grpc::Status::OK;
 }
 

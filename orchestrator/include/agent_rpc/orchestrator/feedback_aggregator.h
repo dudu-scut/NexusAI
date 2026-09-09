@@ -23,12 +23,6 @@ namespace orchestrator {
 class FeedbackAggregator {
 public:
     /**
-     * @brief Initialize the aggregator with a Redis client (cache only).
-     * @param redis Pointer to the shared RedisClient instance (may be null)
-     */
-    static void initialize(agent_rpc::common::RedisClient* redis);
-
-    /**
      * @brief Attach the durable PostgreSQL runtime repository.
      * @param repository Pointer owned by the caller (RpcServer)
      */
@@ -43,19 +37,7 @@ public:
      */
     static void recalculate();
 
-    /**
-     * @brief Recompute per-agent invocation metrics from agent_invocations.
-     *
-     * Aggregates success_rate / avg_latency / total_requests in PostgreSQL
-     * and refreshes the "agent_metrics:{agent_id}" Redis cache used by the
-     * compare/dashboard views. Scheduled to run hourly.
-     */
-    static void recalculateMetrics();
-
 private:
-    /** Shared Redis client pointer (set once via initialize). */
-    static agent_rpc::common::RedisClient* redis_;
-
     /** Durable runtime repository (set once via setRuntimeRepository). */
     static agent_rpc::common::AgentRuntimeRepository* runtime_repository_;
 };

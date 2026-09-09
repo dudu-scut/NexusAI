@@ -106,7 +106,9 @@ onMounted(async () => {
 })
 
 async function runCompare() {
-  const agentIds = selectedAgents.value.filter(a => a !== '')
+  // Deduplicate before sending: the backend rejects repeated agent_ids with
+  // "agent_ids must be unique" (deep-review fr-*).
+  const agentIds = [...new Set(selectedAgents.value.filter(a => a !== ''))]
   if (!compareQuery.value.trim() || agentIds.length === 0) return
   comparing.value = true
   compareError.value = ''

@@ -143,7 +143,10 @@ onMounted(async () => {
   try {
     const resp = await getAgents()
     sandboxAgents.value = resp.agents.map(a => ({
-      id: a.service_name,
+      // deep-review fr-*: the backend keys agents by their COMPOSITE
+      // registration key (service_name-host-port); the bare service_name
+      // silently mismatched every autonomy-setting/intervention lookup.
+      id: `${a.service_name}-${a.host}-${a.port}`,
       name: a.service_name,
       description: a.metadata?.description || '',
       tags: a.tags || [],

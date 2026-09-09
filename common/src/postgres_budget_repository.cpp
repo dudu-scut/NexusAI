@@ -259,4 +259,45 @@ BudgetUsage PostgresBudgetRepository::usage(const std::string& owner_id, const s
     return result;
 }
 
+BudgetUsage PostgresBudgetRepository::usageForOwner(const std::string& owner_id) {
+    validateId(owner_id, "owner_id");
+    BudgetUsage result;
+    store_.executeTransaction([&](pqxx::work& transaction) {
+        const auto date_result = transaction.exec(
+            "SELECT CURRENT_DATE::text AS day, "
+            "date_trunc('month', CURRENT_DATE)::date::text AS month");
+        const std::string day = date_result.front()["day"].template as<std::string>();
+        const std::string month = date_result.front()["month"].template as<std::string>();
+        const auto buckets = bucketsFor(owner_id, "", day, month);
+        result.global = readCounter(transaction, buckets[0], false);
+        result.user_daily = readCounter(transaction, buckets[1], false);
+        result.user_monthly = readCounter(transaction, buckets[2], false);
+        // session stays 0: the counter is context-bound, not account-level.
+    });
+    return result;
+}
+
+std::optional<BudgetLimits> PostgresBudgetRepository::getOwnerPolicy(
+    const std::string& owner_id) {
+    validateId(owner_id, "owner_id");
+    std::optional<BudgetLimits> policy;
+    store_.executeTransaction([&](pqxx::work& transaction) {
+        const auto result = execParams(
+            transaction,
+            "SELECT global_limit, user_daily_limit, user_monthly_limit, session_limit "
+            "FROM budget_policies WHERE owner_id = $1",
+            owner_id);
+        if (!result.empty()) {
+            const auto& row = result.front();
+            BudgetLimits limits;
+            limits.global = row["global_limit"].template as<std::int64_t>();
+            limits.user_daily = row["user_daily_limit"].template as<std::int64_t>();
+            limits.user_monthly = row["user_monthly_limit"].template as<std::int64_t>();
+            limits.session = row["session_limit"].template as<std::int64_t>();
+            policy = limits;
+        }
+    });
+    return policy;
+}
+
 }  // namespace agent_rpc::common

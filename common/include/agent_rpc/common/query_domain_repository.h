@@ -388,6 +388,14 @@ public:
                                                    const std::string& intervention_id,
                                                    const std::string& decision,
                                                    const std::string& edited_request);
+    // Compensating write for a resolve whose undo record could not be
+    // persisted: restores the intervention to pending ONLY while it still
+    // carries expected_state (the just-written decision), so a concurrent
+    // undo or later resolve is never clobbered. Returns false when nothing
+    // was restored (nothing to do, or the state already moved on).
+    bool restoreInterventionToPending(const std::string& owner_id,
+                                      const std::string& intervention_id,
+                                      const std::string& expected_state);
     // The expiry window (24 hours) is assigned by SQL at insert time.
     bool createUndoAction(const UndoActionRecord& action);
     std::optional<UndoActionRecord> getUndoActionById(const std::string& owner_id,

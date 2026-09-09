@@ -80,6 +80,7 @@ struct InvocationMetricsRecord {
     std::int64_t total_requests = 0;
     std::string success_rate;    // percent, two decimals, as text
     std::string avg_latency_ms;  // two decimals, as text
+    std::string p95_latency_ms;  // two decimals, as text; empty when no latency samples
 };
 
 struct FeedbackKey {
@@ -134,6 +135,15 @@ public:
     bool recordInvocation(const AgentInvocationRecord& invocation);
     std::vector<AgentInvocationRecord> listInvocationsByOwner(const std::string& owner_id);
     std::vector<InvocationMetricsRecord> aggregateInvocationMetrics();
+
+    // Owner-scoped point metrics for a single agent — the backing query for
+    // GetAgentMetrics. deep-review: the legacy Redis agent_metrics cache was
+    // written without an owner dimension, so any cross-tenant read of it
+    // leaked another user's invocation aggregates; PostgreSQL is the sole
+    // source here and there is deliberately no Redis fallback.
+    // Returns nullopt when the owner has no invocations for the agent.
+    std::optional<InvocationMetricsRecord> metricsForAgent(
+        const std::string& owner_id, const std::string& agent_id);
 
     std::vector<DailyCostRecord> dailyCostReport(const std::string& owner_id,
                                                  const std::string& start_date,

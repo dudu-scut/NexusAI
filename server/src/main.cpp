@@ -331,21 +331,14 @@ int main(int argc, char* argv[]) {
     // Start BackgroundScheduler for periodic tasks
     agent_rpc::common::BackgroundScheduler::instance().start(2);
 
-    // Register feedback aggregation and metrics aggregation tasks (hourly)
+    // Register feedback aggregation task (hourly)
     agent_rpc::common::BackgroundScheduler::instance().scheduleAtFixedRate(
         "feedback_aggregation",
         []() { agent_rpc::orchestrator::FeedbackAggregator::recalculate(); },
         std::chrono::seconds(3600));
-    // NOTE: the production writer for agent_invocations is the
-    // Query/QueryStream pipeline (AIQueryServiceImpl for the single-agent
-    // A2A path, MultiAgentHandler for the orchestrator path — wired in
-    // RpcServer::initialize, final wrap-up). This hourly task therefore
-    // aggregates real invocation facts and refreshes the Redis
-    // agent_metrics cache whenever rows exist.
-    agent_rpc::common::BackgroundScheduler::instance().scheduleAtFixedRate(
-        "agent_metrics_aggregation",
-        []() { agent_rpc::orchestrator::FeedbackAggregator::recalculateMetrics(); },
-        std::chrono::seconds(3600));
+    // The hourly agent_metrics_aggregation Redis cache task was retired
+    // with the owner-scoped GetAgentMetrics rewrite — invocation metrics are
+    // now read straight from PostgreSQL agent_invocations on demand.
 
 
     // Register profile extraction task (every 5 minutes)

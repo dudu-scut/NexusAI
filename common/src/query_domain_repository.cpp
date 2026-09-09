@@ -1211,6 +1211,25 @@ InterventionResolveOutcome QueryDomainRepository::resolveIntervention(
     return outcome;
 }
 
+bool QueryDomainRepository::restoreInterventionToPending(
+    const std::string& owner_id, const std::string& intervention_id,
+    const std::string& expected_state) {
+    bool restored = false;
+    store_.executeTransaction([&](pqxx::work& transaction) {
+        // Compensation for a resolve whose undo record could not be written:
+        // only a row still carrying the just-written decision is restored, so
+        // an undo or a later state change is never clobbered.
+        const auto result = execParams(
+            transaction,
+            "UPDATE interventions SET state = 'pending', decision = '', "
+            "updated_at = NOW() "
+            "WHERE id = $1 AND owner_id = $2 AND state = $3 RETURNING id",
+            intervention_id, owner_id, expected_state);
+        restored = !result.empty();
+    });
+    return restored;
+}
+
 bool QueryDomainRepository::createUndoAction(const UndoActionRecord& action) {
     bool inserted = false;
     store_.executeTransaction([&](pqxx::work& transaction) {

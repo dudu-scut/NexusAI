@@ -56,6 +56,24 @@
 
         <div class="task-description">{{ task.description }}</div>
 
+        <!-- P12(a): routing-candidate provenance. embedding confidence is a
+             real cosine similarity; ranking values are labelled placeholders
+             (est.) and must never read as a measured score. -->
+        <div v-if="task.candidates && task.candidates.length > 1" class="task-candidates">
+          <span class="cand-label">route:</span>
+          <span
+            v-for="cand in task.candidates"
+            :key="cand.agent_id"
+            class="cand-tag"
+            :class="{ chosen: cand.agent_id === task.agent_id }"
+            :title="cand.confidence_source === 'embedding' ? 'cosine similarity ' + cand.confidence.toFixed(3) : 'estimated (ranking)'"
+          >
+            {{ cand.agent_name || cand.agent_id }}
+            <em v-if="cand.confidence_source === 'embedding'">{{ cand.confidence.toFixed(2) }}</em>
+            <em v-else>est.</em>
+          </span>
+        </div>
+
         <div v-if="task.depends_on.length > 0" class="task-deps">
           <span v-for="dep in task.depends_on" :key="dep" class="dep-tag">
             ← {{ dep }}
@@ -357,6 +375,42 @@ function truncate(text: string, max: number): string {
 .dep-tag {
   font-size: 11px;
   color: var(--text-muted);
+}
+
+.task-candidates {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  margin-top: var(--space-1);
+  flex-wrap: wrap;
+}
+
+.cand-label {
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+.cand-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 10px;
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-subtle);
+}
+
+.cand-tag em {
+  font-style: normal;
+  font-size: 10px;
+  color: var(--text-tertiary);
+}
+
+.cand-tag.chosen {
+  border-color: var(--brand-primary);
+  color: var(--brand-primary);
 }
 
 .task-result {

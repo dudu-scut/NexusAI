@@ -3,6 +3,7 @@
 #include "agent_rpc/common/postgres_store.h"
 
 #include <cstdint>
+#include <optional>
 #include <string>
 
 namespace agent_rpc::common {
@@ -53,6 +54,15 @@ public:
     BudgetUsage getUsage(const std::string& owner_id, const std::string& context_id) {
         return usage(owner_id, context_id);
     }
+
+    // Owner-scoped read for budget dashboards: global/daily/monthly buckets
+    // only — the session counter is context-bound and not part of an
+    // account overview (it stays 0 here).
+    BudgetUsage usageForOwner(const std::string& owner_id);
+
+    // Returns the owner policy when one exists; nullopt means the caller
+    // falls back to the environment defaults.
+    std::optional<BudgetLimits> getOwnerPolicy(const std::string& owner_id);
 
 private:
     PostgresStore& store_;

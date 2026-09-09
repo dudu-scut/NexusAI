@@ -169,9 +169,9 @@ bool RpcServer::initialize(const common::RpcConfig& config) {
     // Initialize CostTracker with Redis for budget counters
     agent_rpc::common::CostTracker::instance().initialize(redis_client_.get());
 
-    // Initialize FeedbackAggregator: Redis is only a metrics cache; the
-    // durable facts live in PostgreSQL.
-    agent_rpc::orchestrator::FeedbackAggregator::initialize(redis_client_.get());
+    // Initialize FeedbackAggregator: durable route-quality facts live in
+    // PostgreSQL; the Redis agent_metrics cache was retired with the
+    // owner-scoped GetAgentMetrics rewrite (no cross-tenant cache keys).
     agent_rpc::orchestrator::FeedbackAggregator::setRuntimeRepository(runtime_repository_.get());
 
     // Initialize lifecycle service AFTER Redis is connected; feedback itself
@@ -184,6 +184,8 @@ bool RpcServer::initialize(const common::RpcConfig& config) {
     observability_service_impl_ = std::make_unique<ObservabilityServiceImpl>(redis_client_.get());
     observability_service_impl_->setAgentRuntimeRepository(runtime_repository_.get());
     observability_service_impl_->setQueryDomainRepository(query_domain_repository_.get());
+    // GetBudgetSummary reads the durable PG budget_counters + owner policies.
+    observability_service_impl_->setBudgetRepository(budget_repository_.get());
 
     service_impl_ = std::make_shared<AgentCommunicationServiceImpl>();
     // Agent registration/heartbeat writes the durable registry to PostgreSQL
@@ -523,6 +525,9 @@ void RpcServer::setupServer() {
     grpc::ServerBuilder builder;
     // The local WSL/Compose deployment intentionally uses plaintext gRPC.
     // Authentication is handled by the RPC interceptor, not transport TLS.
+    // Note: AddListeningPort returns the builder (chainable), NOT a bound-
+    // port count — a taken/malformed address surfaces as a null server from
+    // BuildAndStart below, which already throws with the address attached.
     builder.AddListeningPort(address_, grpc::InsecureServerCredentials());
     LOG_INFO("RPC server listening on " + address_ + " (local transport)");
     builder.SetMaxReceiveMessageSize(config_.max_receive_message_size);

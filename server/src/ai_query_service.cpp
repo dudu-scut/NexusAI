@@ -1659,48 +1659,47 @@ grpc::Status AIQueryServiceImpl::GetAgentMetrics(
         return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "agent_id is required");
     }
 
-    LOG_INFO("GetAgentMetrics for agent: " + agent_id);
+    // deep-review: owner-scoped metrics view. PostgreSQL agent_invocations
+    // is the only source — every invocation row is stamped with the
+    // authenticated session owner by the durable pipeline, so filtering by
+    // the current user returns exactly what this user observed for this
+    // agent and can never leak another tenant's aggregates. The legacy
+    // Redis "agent_metrics:<agent_id>" cache carried no owner dimension
+    // (its hourly writer is retired together with the key); there is
+    // deliberately no cross-tenant fallback.
+    auto* metrics = response->mutable_metrics();
+    metrics->set_agent_id(agent_id);
+    auto* status = response->mutable_status();
 
-    std::string redis_key = "agent_metrics:" + agent_id;
-    std::map<std::string, std::string> metrics_data;
-
-    if (!redis_client_ || !redis_client_->hgetall(redis_key, metrics_data)) {
-        LOG_WARN("No metrics found for agent: " + agent_id);
-        auto* status = response->mutable_status();
+    if (invocation_repository_ == nullptr) {
         status->set_code(0);
         status->set_message("No metrics available for this agent");
-        auto* metrics = response->mutable_metrics();
-        metrics->set_agent_id(agent_id);
         return grpc::Status::OK;
     }
 
-    auto* metrics = response->mutable_metrics();
-    metrics->set_agent_id(agent_id);
-
-    auto get_double = [&](const std::string& field) -> double {
-        auto it = metrics_data.find(field);
-        if (it != metrics_data.end() && !it->second.empty()) {
-            try { return std::stod(it->second); } catch (...) {}
+    try {
+        const std::string owner_id = AuthInterceptor::currentUserId();
+        const auto record = invocation_repository_->metricsForAgent(owner_id, agent_id);
+        if (!record.has_value()) {
+            status->set_code(0);
+            status->set_message("No metrics available for this agent");
+            return grpc::Status::OK;
         }
-        return 0.0;
-    };
-    auto get_int = [&](const std::string& field) -> int32_t {
-        auto it = metrics_data.find(field);
-        if (it != metrics_data.end() && !it->second.empty()) {
-            try { return std::stoi(it->second); } catch (...) {}
-        }
-        return 0;
-    };
-
-    metrics->set_success_rate(get_double("success_rate"));
-    metrics->set_avg_latency_ms(get_double("avg_latency_ms"));
-    metrics->set_p95_latency_ms(get_double("p95_latency_ms"));
-    metrics->set_total_requests(get_int("total_requests"));
-    metrics->set_approval_rate(get_double("approval_rate"));
-
-    auto* status = response->mutable_status();
-    status->set_code(0);
-    status->set_message("OK");
+        metrics->set_success_rate(std::stod(record->success_rate));
+        metrics->set_avg_latency_ms(std::stod(record->avg_latency_ms));
+        metrics->set_p95_latency_ms(
+            record->p95_latency_ms.empty() ? 0.0 : std::stod(record->p95_latency_ms));
+        metrics->set_total_requests(static_cast<int32_t>(record->total_requests));
+        // approval_rate has no production source (route quality is per
+        // owner/agent/skill, not per invocation) — it stays 0 by design.
+        status->set_code(0);
+        status->set_message("OK");
+    } catch (const std::exception& error) {
+        LOG_WARN(std::string("GetAgentMetrics query failed: ") + error.what());
+        status->set_code(-1);
+        status->set_message("Metrics query failed");
+        return grpc::Status(grpc::StatusCode::INTERNAL, "Metrics query failed");
+    }
     return grpc::Status::OK;
 }
 

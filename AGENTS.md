@@ -86,7 +86,7 @@ db/             → PostgreSQL 迁移 V001–V015（PostgreSQL 是唯一持久�
 - **TaskPlanner/TaskExecutor**：LLM 分解为 DAG → Kahn 拓扑分层 → 同层经固定 worker 线程池（SubtaskPool）并行，前置结果注入下游；全局超时；委派深度限制 5 层。
 - **MemoryService 三层记忆**：按 Agent 隔离的对话历史 + 用户长期记忆（Hash）+ 跨 Agent LLM 摘要，每次查询前注入 SystemContext。
 - **CircuitBreaker**：CLOSED→OPEN→HALF_OPEN 三态，按 Agent 粒度。
-- **BackgroundScheduler**：协调者 + Worker 池的周期任务（span 刷盘、反馈聚合、指标聚合、画像提取、健康评估、缓存清理）；Cron/Canary 已移除。
+- **BackgroundScheduler**：协调者 + Worker 池的周期任务（span 刷盘、反馈聚合、画像提取、健康评估）；指标聚合与缓存清理调度已退役（metrics 改 PG 即时查询，intent-cache 清理由 store 前懒清理承担）；Cron/Canary 已移除。
 
 ## 代码约定
 

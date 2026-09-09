@@ -71,9 +71,31 @@ message GetCostReportResponse {
     double total_cost_usd = 3;
 }
 
+// RPC: GetBudgetSummary — owner-scoped budget usage vs configured limits.
+// The owner always comes from the authenticated session; request bodies
+// carry no user id. `used` reads the durable PG budget_counters (the same
+// buckets the reserve path checks), `limit` reflects the owner policy when
+// present and the environment defaults otherwise. limit == 0 means
+// unlimited (global is unlimited by default) and the UI renders it so.
+
+message BudgetSummaryItem {
+    int64 limit = 1;        // configured limit in tokens; 0 = unlimited
+    int64 used = 2;         // consumed tokens in the current bucket
+}
+
+message GetBudgetSummaryRequest {}
+
+message GetBudgetSummaryResponse {
+    common.Status status = 1;
+    BudgetSummaryItem global = 2;    // NEXUSAI_BUDGET_GLOBAL_TOKENS (0 = unlimited)
+    BudgetSummaryItem daily = 3;     // per-user daily bucket (UTC day)
+    BudgetSummaryItem monthly = 4;   // per-user monthly bucket (UTC month)
+}
+
 // Observability Service
 
 service ObservabilityService {
     rpc GetTraceDetail(GetTraceDetailRequest) returns (GetTraceDetailResponse);
     rpc GetCostReport(GetCostReportRequest) returns (GetCostReportResponse);
+    rpc GetBudgetSummary(GetBudgetSummaryRequest) returns (GetBudgetSummaryResponse);
 }

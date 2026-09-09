@@ -74,7 +74,18 @@ bool runSandboxExecution(const UserExperienceServiceImpl::PipelineExecutor& exec
         return false;
     }
 
-    const bool ok = executor(request_id, context_id, question, answer, error);
+    bool ok = false;
+    try {
+        ok = executor(request_id, context_id, question, answer, error);
+    } catch (const std::exception& e) {
+        // deep-review: an executor exception must not leave the run stuck in
+        // "running" — the sandbox_runs row was already persisted above, so
+        // finalize it as failed before the handler maps this to INTERNAL.
+        ok = false;
+        error = std::string("executor exception: ") + e.what();
+        LOG_ERROR("Sandbox run executor threw: run=" + run.id +
+                  " error=" + error);
+    }
     run.status = ok ? "completed" : "failed";
     run.response_text = ok ? answer : error;
     if (!repository->updateSandboxRun(run)) {
@@ -156,6 +167,17 @@ grpc::Status UserExperienceServiceImpl::InterventionResponse(
                 request->intervention_id() + "\"}";
             action.version = 1;
             if (!query_repository_->createUndoAction(action)) {
+                // deep-review: the resolve committed in its own transaction
+                // above. Without its undo record the intervention would sit
+                // resolved-but-never-executable with no way to recover, so
+                // roll it back to pending (best-effort: only a row still
+                // carrying this decision is restored). If the compensation
+                // also fails the state stays visible for manual recovery.
+                if (!query_repository_->restoreInterventionToPending(
+                        owner, request->intervention_id(), request->decision())) {
+                    LOG_ERROR("Intervention left resolved without undo record: " +
+                              request->intervention_id());
+                }
                 return grpc::Status(grpc::StatusCode::INTERNAL,
                                     "Failed to persist undo action");
             }

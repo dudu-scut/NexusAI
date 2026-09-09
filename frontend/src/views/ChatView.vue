@@ -252,7 +252,7 @@
     <!-- Activity Panel Sidebar -->
     <transition name="slide">
       <div v-if="showActivityPanel" class="chat-sidebar glass">
-        <ActivityPanel :entries="activityEntries" />
+        <ActivityPanel :entries="chatStore.activityEntries" />
       </div>
     </transition>
   </div>
@@ -316,8 +316,10 @@ async function handleShare() {
   }
 }
 
-// Activity feed
-const activityEntries = ref<ActivityEntry[]>([])
+// Activity feed — single source of truth is chatStore.activityEntries
+// (deep-review: the panel used to render a ChatView-local synthetic queue
+// while the real stream-driven events lived in the store; both are now one
+// queue, and local user actions funnel into the store's addActivity).
 
 const quickPrompts = [
   'Explain microservices architecture',
@@ -358,16 +360,9 @@ function handleFeedback(msgId: string, type: 'like' | 'dislike') {
 }
 
 function addActivity(type: ActivityEntry['type'], message: string, extra?: Partial<ActivityEntry>) {
-  activityEntries.value = [...activityEntries.value, {
-    timestamp: Date.now(),
-    type,
-    message,
-    ...extra,
-  }]
-  // Keep last 50
-  if (activityEntries.value.length > 50) {
-    activityEntries.value = activityEntries.value.slice(-50)
-  }
+  // Local user actions (send/feedback/export/plan ops) share the store's
+  // stream-driven queue so the ActivityPanel shows one coherent feed.
+  chatStore.addActivity(type, message, extra)
 }
 
 function handleLogout() {
@@ -393,8 +388,8 @@ function exportMarkdown() {
   for (const msg of msgs) {
     const role = msg.role === 'user' ? '👤 **User**' : `🤖 **${msg.agentName || 'Agent'}**`
     md += `### ${role}\n\n`
-    if (msg.traceInfo) {
-      md += `> Route ${msg.traceInfo.route_time_ms}ms → ${msg.traceInfo.agent_name} ${msg.traceInfo.agent_time_ms}ms (total ${msg.traceInfo.total_time_ms}ms)\n\n`
+    if (msg.traceSummaryText) {
+      md += `> ${msg.traceSummaryText}\n\n`
     }
     md += `${msg.content}\n\n---\n\n`
   }
@@ -411,18 +406,9 @@ function exportMarkdown() {
   toast?.addToast({ type: 'success', message: '对话已导出为 Markdown' })
 }
 
-// Watch for streaming events to populate activity feed
-watch(
-  () => chatStore.messages[chatStore.messages.length - 1]?.executionPlan,
-  (plan) => {
-    if (plan) {
-      addActivity('thinking', `Execution plan: ${plan.tasks.length} subtask(s)`)
-      plan.tasks.forEach(t => {
-        addActivity('thinking', `Task [${t.id}]: ${t.description}`)
-      })
-    }
-  },
-)
+// Stream events already publish their own activity entries inside the store
+// (plan arrival / subtask execution / completion); the former local watch
+// duplicated the plan lines and is gone with the two-queue merge.
 
 // P15 P1(e): rerun the last rendered execution plan — posts the plan
 // verbatim (read-only confirmation form; DAG editing lands in the panel
