@@ -1685,10 +1685,16 @@ grpc::Status AIQueryServiceImpl::GetAgentMetrics(
             status->set_message("No metrics available for this agent");
             return grpc::Status::OK;
         }
-        metrics->set_success_rate(std::stod(record->success_rate));
-        metrics->set_avg_latency_ms(std::stod(record->avg_latency_ms));
-        metrics->set_p95_latency_ms(
-            record->p95_latency_ms.empty() ? 0.0 : std::stod(record->p95_latency_ms));
+        // Guard every text column symmetrically (deep-review D2): a row can
+        // exist with NULL latency samples on legacy data, and ROUND(...)::text
+        // then yields an empty string — an unguarded std::stod would turn a
+        // legal empty aggregate into a bogus INTERNAL failure.
+        const auto parse_or_zero = [](const std::string& value) {
+            return value.empty() ? 0.0 : std::stod(value);
+        };
+        metrics->set_success_rate(parse_or_zero(record->success_rate));
+        metrics->set_avg_latency_ms(parse_or_zero(record->avg_latency_ms));
+        metrics->set_p95_latency_ms(parse_or_zero(record->p95_latency_ms));
         metrics->set_total_requests(static_cast<int32_t>(record->total_requests));
         // approval_rate has no production source (route quality is per
         // owner/agent/skill, not per invocation) — it stays 0 by design.

@@ -686,6 +686,7 @@ grpc::Status AgentCommunicationServiceImpl::BatchSendMessages(
 
     agent_communication::SendMessageRequest req;
     int count = 0;
+    int dropped = 0;
     while (reader->Read(&req)) {
         std::lock_guard<std::mutex> lock(agents_mutex_);
         auto it = agent_message_queues_.find(req.target_agent());
@@ -693,12 +694,26 @@ grpc::Status AgentCommunicationServiceImpl::BatchSendMessages(
             it->second.size() < kMaxInboxMessages) {
             it->second.push(req.message());
             count++;
+        } else {
+            // deep-review D1: missing target or full inbox must be reported,
+            // not silently shrunk out of the acknowledged count — the cap
+            // contract says messages are never silently dropped.
+            dropped++;
         }
     }
 
     auto* status = response->mutable_status();
-    status->set_code(0);
-    status->set_message("Batch processed " + std::to_string(count) + " messages");
+    if (dropped > 0) {
+        status->set_code(1);
+        status->set_message("Batch processed " + std::to_string(count) + " of " +
+                            std::to_string(count + dropped) +
+                            " messages (" + std::to_string(dropped) +
+                            " dropped: target missing or inbox full)");
+    } else {
+        status->set_code(0);
+        status->set_message("Batch processed " + std::to_string(count) +
+                            " messages");
+    }
     response->set_message_id(generateMessageId());
     return grpc::Status::OK;
 }

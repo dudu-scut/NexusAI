@@ -194,18 +194,6 @@ export interface ActivityEntry {
   detail?: string
 }
 
-// Trace Info
-
-export interface TraceInfo {
-  trace_id: string
-  route_time_ms: number
-  agent_time_ms: number
-  total_time_ms: number
-  agent_name: string
-  agent_id: string
-  skill: string
-}
-
 // user.proto (auth)
 
 export interface RegisterRequest {
@@ -407,10 +395,8 @@ export interface ChatMessage {
   error?: string
   executionPlan?: ExecutionPlan
   activityFeed?: ActivityEntry[]
-  traceInfo?: TraceInfo
-  // deep-review fr-*: the durable pipeline emits a human-readable trace
-  // summary on the 'complete' stream event (span_name Xms -> ...); the
-  // structured TraceInfo above has no backend channel and stays unused.
+  // deep-review: the durable pipeline emits a human-readable trace summary
+  // on the 'complete' stream event (span_name Xms -> ...).
   traceSummaryText?: string
   feedbackGiven?: 'like' | 'dislike' | null
   timestamp: number

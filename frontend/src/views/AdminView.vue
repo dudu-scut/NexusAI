@@ -118,14 +118,14 @@
               <div class="budget-details">
                 <div class="budget-row"><span>Daily Limit</span><span>{{ formatLimit(dailyLimit) }}</span></div>
                 <div class="budget-row"><span>Used</span><span>{{ formatTokens(dailyUsed) }}</span></div>
-                <div class="budget-row"><span>Remaining</span><span class="remaining">{{ formatTokens(dailyRemaining) }}</span></div>
+                <div class="budget-row"><span>Remaining</span><span class="remaining">{{ dailyLimit === 0 ? '—' : formatTokens(Math.max(0, dailyLimit - dailyUsed)) }}</span></div>
               </div>
             </div>
             <div class="budget-card">
               <div class="budget-details full-width">
                 <div class="budget-row"><span>Monthly Limit</span><span>{{ formatLimit(monthlyLimit) }}</span></div>
                 <div class="budget-row"><span>Used</span><span>{{ formatTokens(monthlyUsed) }}</span></div>
-                <div class="budget-row"><span>Remaining</span><span class="remaining">{{ formatTokens(monthlyRemaining) }}</span></div>
+                <div class="budget-row"><span>Remaining</span><span class="remaining">{{ monthlyLimit === 0 ? '—' : formatTokens(Math.max(0, monthlyLimit - monthlyUsed)) }}</span></div>
                 <div class="budget-row muted"><span>Reset Time</span><span>{{ resetTime }}</span></div>
               </div>
             </div>
@@ -221,8 +221,7 @@ const monthlyUsed = ref(0)
 const budgetLoading = ref(false)
 
 const globalRemaining = computed(() => Math.max(0, globalLimit.value - globalUsed.value))
-const dailyRemaining = computed(() => dailyLimit.value - dailyUsed.value)
-const monthlyRemaining = computed(() => monthlyLimit.value - monthlyUsed.value)
+// daily/monthly remaining are rendered inline with a 0=unlimited guard.
 const dailyUsedPercent = computed(() => dailyLimit.value > 0 ? Math.round((dailyUsed.value / dailyLimit.value) * 100) : 0)
 const resetTime = computed(() => {
   const d = new Date()

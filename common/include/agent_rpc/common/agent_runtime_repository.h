@@ -134,6 +134,10 @@ public:
     // the orchestrator path (wired in RpcServer::initialize, final wrap-up).
     bool recordInvocation(const AgentInvocationRecord& invocation);
     std::vector<AgentInvocationRecord> listInvocationsByOwner(const std::string& owner_id);
+    // Retired cross-tenant aggregate (deep-review D4): the Redis cache it
+    // fed was removed with the owner-scoped GetAgentMetrics rewrite and no
+    // production caller remains — kept only for the repository contract
+    // tests. Prefer metricsForAgent (owner-scoped, real p95).
     std::vector<InvocationMetricsRecord> aggregateInvocationMetrics();
 
     // Owner-scoped point metrics for a single agent — the backing query for

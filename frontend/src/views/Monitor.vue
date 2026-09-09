@@ -69,7 +69,7 @@
           v-else
           icon="mdi:chart-timeline-variant"
           title="暂无延迟分布数据"
-          description="在对话中发送消息后将自动采集追踪数据"
+          description="延迟/错误采集面板暂未接入数据通道"
         />
       </GlassCard>
 
@@ -83,7 +83,7 @@
           v-else
           icon="mdi:chart-line-variant"
           title="暂无错误率趋势"
-          description="在对话中发送消息后将自动采集追踪数据"
+          description="延迟/错误采集面板暂未接入数据通道"
         />
       </GlassCard>
     </div>
@@ -163,9 +163,7 @@ import { BarChart, LineChart } from 'echarts/charts'
 import GlassCard from '../components/layout/GlassCard.vue'
 import EmptyState from '../components/feedback/EmptyState.vue'
 import { Icon } from '@iconify/vue'
-import { getAgents, getAgentMetrics, getTraceDetail } from '../services/grpc-client'
-import { useChatStore } from '../stores/chat'
-import type { TraceSpan } from '../types/proto'
+import { getAgents, getAgentMetrics } from '../services/grpc-client'
 
 use([CanvasRenderer, GaugeChart, BarChart, LineChart, GridComponent, TooltipComponent])
 
@@ -197,58 +195,13 @@ function useFallbackData() {
 }
 
 // Load trace data for latency/error panels
-async function loadTraceData() {
-  const chatStore = useChatStore()
-  // Extract recent trace_ids from chat messages
-  const traceIds = chatStore.messages
-    .filter(m => m.traceInfo?.trace_id)
-    .map(m => m.traceInfo!.trace_id)
-    .filter((id, idx, arr) => arr.indexOf(id) === idx) // unique
-    .slice(-10) // last 10 traces
-
-  if (traceIds.length === 0) return
-
-  const allSpans: TraceSpan[] = []
-  const results = await Promise.all(traceIds.map(id => getTraceDetail(id)))
-  for (const result of results) {
-    if (result?.spans) {
-      allSpans.push(...result.spans)
-    }
-  }
-
-  if (allSpans.length === 0) return
-
-  // Latency distribution buckets
-  const buckets: Record<string, number> = {
-    '0-50ms': 0, '50-100ms': 0, '100-500ms': 0,
-    '500ms-1s': 0, '1-5s': 0, '>5s': 0
-  }
-  for (const span of allSpans) {
-    const ms = Number(span.duration_ms) || 0
-    if (ms < 50) buckets['0-50ms']++
-    else if (ms < 100) buckets['50-100ms']++
-    else if (ms < 500) buckets['100-500ms']++
-    else if (ms < 1000) buckets['500ms-1s']++
-    else if (ms < 5000) buckets['1-5s']++
-    else buckets['>5s']++
-  }
-  latencyBuckets.value = Object.entries(buckets).map(([range, count]) => ({ range, count }))
-  latencyAvailable.value = true
-
-  // Error rate: group by component
-  const componentStats: Record<string, { total: number; errors: number }> = {}
-  for (const span of allSpans) {
-    const comp = span.component || 'unknown'
-    if (!componentStats[comp]) componentStats[comp] = { total: 0, errors: 0 }
-    componentStats[comp].total++
-    if (span.status === 'error') componentStats[comp].errors++
-  }
-  errorRateData.value = Object.entries(componentStats).map(([time, s]) => ({
-    time,
-    rate: s.total > 0 ? Math.round((s.errors / s.total) * 10000) / 100 : 0
-  }))
-  errorRateAvailable.value = errorRateData.value.length > 0
-}
+// deep-review D-F1: the former source (ChatMessage.traceInfo, which no code
+// path ever filled) was dead — the backend has no trace-list RPC, so there
+// is no way to enumerate trace ids from the dashboard today. The panels keep
+// their honest EmptyState until a trace-list channel exists.
+//
+// Latency/error aggregation over TraceSpan data resumes here once the
+// backend exposes a recent-traces listing (see GetTraceDetail input need).
 
 // Data loading
 async function loadMonitorData() {
@@ -293,13 +246,6 @@ async function loadMonitorData() {
         recoveryTime: '--',
       }
     })
-
-    // Load trace data for latency/error panels (non-blocking)
-    try {
-      await loadTraceData()
-    } catch (e) {
-      console.warn('Trace data loading failed', e)
-    }
 
     dataAvailable.value = true
   } catch (e) {

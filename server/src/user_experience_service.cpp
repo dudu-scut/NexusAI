@@ -85,6 +85,12 @@ bool runSandboxExecution(const UserExperienceServiceImpl::PipelineExecutor& exec
         error = std::string("executor exception: ") + e.what();
         LOG_ERROR("Sandbox run executor threw: run=" + run.id +
                   " error=" + error);
+    } catch (...) {
+        // deep-review D3: non-standard exceptions still finalize the run and
+        // degrade to a fixed message instead of escaping the handler.
+        ok = false;
+        error = "executor exception: unknown error";
+        LOG_ERROR("Sandbox run executor threw unknown error: run=" + run.id);
     }
     run.status = ok ? "completed" : "failed";
     run.response_text = ok ? answer : error;

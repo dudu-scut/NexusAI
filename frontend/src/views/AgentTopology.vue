@@ -241,9 +241,16 @@ const chartOption = computed(() => {
 })
 
 // Watch activityEntries for real-time topology
-watch(() => chatStore.activityEntries.length, (newLen, oldLen) => {
-  if (!oldLen || newLen <= oldLen) return
-  const newEntries = chatStore.activityEntries.slice(oldLen)
+watch(() => chatStore.activityEntries, (entries, prev) => {
+  const prevLen = prev?.length ?? 0
+  if (!prevLen) return
+  // deep-review F-C1: diff by array reference, not by length — the store
+  // caps the queue at 100 with a same-tick push+slice, so a length watcher
+  // freezes (newLen stays 100) once the cap is hit and the topology stops
+  // lighting up. When the cap replaced the tail, start one entry earlier so
+  // the newest entry is still processed.
+  const tailKept = entries[prevLen - 1] === prev[prevLen - 1]
+  const newEntries = entries.slice(tailKept ? prevLen : Math.max(0, prevLen - 1))
   for (const entry of newEntries) {
     if (entry.type === 'agent_call' && entry.message.startsWith('Routed to Agent:')) {
       const agentName = entry.message.replace('Routed to Agent: ', '').trim()
